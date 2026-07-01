@@ -844,6 +844,117 @@ export function registerGmailTools(
   );
 
   server.registerTool(
+    "gmail_create_label",
+    {
+      title: "Create label",
+      description:
+        "Create a new Gmail label. Returns the created label's id which can then be used in gmail_modify_labels. " +
+        "Tip: call gmail_list_labels first to check if a label with the same name already exists.",
+      inputSchema: {
+        account,
+        name: z.string().describe("Label name, e.g. 'Work/Projects'. Use / for nesting."),
+        labelListVisibility: z
+          .enum(["labelShow", "labelShowIfUnread", "labelHide"])
+          .default("labelShow")
+          .optional()
+          .describe("Visibility in the label list sidebar."),
+        messageListVisibility: z
+          .enum(["show", "hide"])
+          .default("show")
+          .optional()
+          .describe("Visibility in the message list."),
+        backgroundColor: z
+          .string()
+          .optional()
+          .describe("Background color hex, e.g. '#16a766'. Must be one of Gmail's allowed colors."),
+        textColor: z
+          .string()
+          .optional()
+          .describe("Text color hex, e.g. '#ffffff'."),
+      },
+    },
+    guard(async ({ account, name, labelListVisibility, messageListVisibility, backgroundColor, textColor }) => {
+      const g = clients.resolve(account);
+      const res = await g.gmail.users.labels.create({
+        userId: "me",
+        requestBody: {
+          name,
+          labelListVisibility: labelListVisibility ?? "labelShow",
+          messageListVisibility: messageListVisibility ?? "show",
+          color: backgroundColor || textColor
+            ? { backgroundColor, textColor }
+            : undefined,
+        },
+      });
+      return ok({
+        summary: `🏷️ Created label "${res.data.name}" (id: ${res.data.id})`,
+        id: res.data.id,
+        name: res.data.name,
+        labelListVisibility: res.data.labelListVisibility,
+        messageListVisibility: res.data.messageListVisibility,
+        color: res.data.color,
+      });
+    }),
+  );
+
+  server.registerTool(
+    "gmail_update_label",
+    {
+      title: "Update label",
+      description: "Rename a label or change its visibility/color. Only provided fields are changed.",
+      inputSchema: {
+        account,
+        labelId: z.string().describe("Label ID (from gmail_list_labels or gmail_create_label)."),
+        name: z.string().optional().describe("New label name."),
+        labelListVisibility: z.enum(["labelShow", "labelShowIfUnread", "labelHide"]).optional(),
+        messageListVisibility: z.enum(["show", "hide"]).optional(),
+        backgroundColor: z.string().optional(),
+        textColor: z.string().optional(),
+      },
+    },
+    guard(async ({ account, labelId, name, labelListVisibility, messageListVisibility, backgroundColor, textColor }) => {
+      const g = clients.resolve(account);
+      const patch: Record<string, unknown> = {};
+      if (name) patch.name = name;
+      if (labelListVisibility) patch.labelListVisibility = labelListVisibility;
+      if (messageListVisibility) patch.messageListVisibility = messageListVisibility;
+      if (backgroundColor || textColor) patch.color = { backgroundColor, textColor };
+
+      const res = await g.gmail.users.labels.patch({
+        userId: "me",
+        id: labelId,
+        requestBody: patch,
+      });
+      return ok({
+        summary: `✏️ Updated label "${res.data.name}"`,
+        id: res.data.id,
+        name: res.data.name,
+        color: res.data.color,
+      });
+    }),
+  );
+
+  server.registerTool(
+    "gmail_delete_label",
+    {
+      title: "Delete label",
+      description:
+        "Permanently delete a user-created Gmail label. " +
+        "The label is removed from all messages (messages themselves are NOT deleted). " +
+        "System labels (INBOX, SENT, etc.) cannot be deleted.",
+      inputSchema: {
+        account,
+        labelId: z.string().describe("Label ID (from gmail_list_labels)."),
+      },
+    },
+    guard(async ({ account, labelId }) => {
+      const g = clients.resolve(account);
+      await g.gmail.users.labels.delete({ userId: "me", id: labelId });
+      return ok({ summary: `🗑️ Deleted label ${labelId}` });
+    }),
+  );
+
+  server.registerTool(
     "gmail_get_attachment",
     {
       title: "Download an email attachment",
