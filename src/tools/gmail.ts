@@ -1,5 +1,6 @@
 /**
  * Gmail tools: read / analyse / send / reply / archive / trash / labels.
+ * Array-first: every item-based tool accepts arrays; batch_ duplicates removed.
  */
 import { z } from "zod";
 import { Readable } from "node:stream";
@@ -66,7 +67,6 @@ function extractBody(payload?: gmail_v1.Schema$MessagePart): string {
     }
     return null;
   };
-  // Prefer text/plain; fall back to flattened HTML; finally the raw body.
   return (
     walk(payload, false) ??
     walk(payload, true) ??
@@ -138,7 +138,7 @@ export function buildRawEmail(opts: {
       bodyB64,
     );
     for (const att of opts.attachments) {
-      const wrapped = att.base64.replace(/(.{76})/g, "$1\r\n"); // RFC line length
+      const wrapped = att.base64.replace(/(.{76})/g, "$1\r\n");
       parts.push(
         `--${boundary}`,
         `Content-Type: ${att.mimeType}; name="${att.filename}"`,
@@ -246,6 +246,8 @@ export function registerGmailTools(
         "or {filename, contentBase64, mimeType} (inline).",
     );
 
+  // ---- gmail_search (unchanged) --------------------------------------------
+
   server.registerTool(
     "gmail_search",
     {
@@ -269,8 +271,6 @@ export function registerGmailTools(
     },
     guard(async ({ account, query, maxResults, pageToken }) => {
       const g = clients.resolve(account);
-      // AND the account's configured base filter (e.g. a specific mailbox/alias)
-      // into the query, so a named account can be scoped to one address.
       const base = clients.baseGmailQuery(account);
       const q = [base, query].map((s) => (s ?? "").trim()).filter(Boolean).join(" ");
       const list = await g.gmail.users.messages.list({
@@ -300,6 +300,8 @@ export function registerGmailTools(
     }),
   );
 
+  // ---- gmail_count (unchanged) ---------------------------------------------
+
   server.registerTool(
     "gmail_count",
     {
@@ -319,7 +321,7 @@ export function registerGmailTools(
       const base = clients.baseGmailQuery(account);
       const q = [base, query].map((s) => (s ?? "").trim()).filter(Boolean).join(" ");
       const countThreads = unit === "threads";
-      const MAX_PAGES = 200; // 200 * 500 = up to 100k items
+      const MAX_PAGES = 200;
       let count = 0;
       let pageToken: string | undefined;
       let pages = 0;
@@ -355,473 +357,669 @@ export function registerGmailTools(
     }),
   );
 
+  // ---- gmail_get_message (array) -------------------------------------------
+
   server.registerTool(
     "gmail_get_message",
     {
-      title: "Read an email",
-      description: "Get one email fully: headers plus the decoded plain-text body, for reading/analysis.",
-      inputSchema: { account, id: z.string().describe("Message id.") },
+      title: "Read emails",
+      description: "Get one or more emails fully: headers plus the decoded plain-text body.",
+      inputSchema: {
+        account,
+        messageIds: z.array(z.string()).min(1).describe("Message id(s) to fetch."),
+      },
     },
-    guard(async ({ account, id }) => {
+    guard(async ({ account, messageIds }) => {
       const g = clients.resolve(account);
-      const res = await g.gmail.users.messages.get({ userId: "me", id, format: "full" });
-      const s = summarise(res.data);
-      const body = extractBody(res.data.payload);
-      const attachments = collectAttachments(res.data.payload);
+      const results = await Promise.all(
+        messageIds.map(async (id) => {
+          try {
+            const res = await g.gmail.users.messages.get({ userId: "me", id, format: "full" });
+            const s = summarise(res.data);
+            const body = extractBody(res.data.payload);
+            const attachments = collectAttachments(res.data.payload);
+            return { ...s, body, attachments };
+          } catch (e) {
+            return { id, error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_ = results.filter((r) => !("error" in r));
+      const err_ = results.filter((r) => "error" in r);
       return ok({
-        summary: `📧 From ${s.from} · "${s.subject}" · ${s.date}${attachments.length ? ` · ${attachments.length} attachment(s)` : ""}`,
-        ...s,
-        body,
-        attachments,
+        summary: `📧 Fetched ${ok_.length}/${messageIds.length} message(s)${err_.length ? ` (${err_.length} error(s))` : ""}`,
+        results,
       });
     }),
   );
+
+  // ---- gmail_get_thread (array) --------------------------------------------
 
   server.registerTool(
     "gmail_get_thread",
     {
-      title: "Read a thread",
-      description: "Get every message in a conversation thread (decoded), for analysing the whole exchange.",
-      inputSchema: { account, threadId: z.string() },
+      title: "Read threads",
+      description: "Get every message in one or more conversation threads (decoded).",
+      inputSchema: {
+        account,
+        threadIds: z.array(z.string()).min(1).describe("Thread id(s) to fetch."),
+      },
     },
-    guard(async ({ account, threadId }) => {
+    guard(async ({ account, threadIds }) => {
       const g = clients.resolve(account);
-      const res = await g.gmail.users.threads.get({ userId: "me", id: threadId, format: "full" });
-      const msgs = (res.data.messages ?? []).map((m) => ({
-        ...summarise(m),
-        body: extractBody(m.payload),
-        attachments: collectAttachments(m.payload),
-      }));
-      const participants = [...new Set(msgs.map((m) => m.from).filter(Boolean))].join(", ");
+      const results = await Promise.all(
+        threadIds.map(async (threadId) => {
+          try {
+            const res = await g.gmail.users.threads.get({ userId: "me", id: threadId, format: "full" });
+            const messages = (res.data.messages ?? []).map((m) => ({
+              ...summarise(m),
+              body: extractBody(m.payload),
+              attachments: collectAttachments(m.payload),
+            }));
+            return { id: threadId, messages };
+          } catch (e) {
+            return { id: threadId, error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_ = results.filter((r) => !("error" in r));
       return ok({
-        summary: `📧 Thread — ${msgs.length} message(s)${participants ? ` · participants: ${participants}` : ""}`,
-        threadId,
-        messages: msgs,
+        summary: `📧 Fetched ${ok_.length}/${threadIds.length} thread(s)`,
+        results,
       });
     }),
   );
+
+  // ---- gmail_send (array) --------------------------------------------------
 
   server.registerTool(
     "gmail_send",
     {
-      title: "Send an email",
-      description: "Send a new email (optionally with attachments). `to`/`cc`/`bcc` may be comma-separated lists.",
+      title: "Send emails",
+      description: "Send one or more new emails (optionally with attachments). `to`/`cc`/`bcc` may be comma-separated lists.",
       inputSchema: {
         account,
-        to: z.string().describe("Recipient(s), comma-separated."),
-        subject: z.string(),
-        body: z.string(),
-        cc: z.string().optional(),
-        bcc: z.string().optional(),
-        attachments: attachmentsField,
+        messages: z
+          .array(
+            z.object({
+              to: z.string().describe("Recipient(s), comma-separated."),
+              subject: z.string(),
+              body: z.string(),
+              cc: z.string().optional(),
+              bcc: z.string().optional(),
+              attachments: attachmentsField,
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, to, subject, body, cc, bcc, attachments }) => {
+    guard(async ({ account, messages }) => {
       const g = clients.resolve(account);
-      const atts = attachments?.length ? await resolveAttachments(g, attachments) : undefined;
-      const raw = buildRawEmail({ to, subject, body, cc, bcc, attachments: atts });
-      const res = await g.gmail.users.messages.send({ userId: "me", requestBody: { raw } });
+      const results = await Promise.all(
+        messages.map(async (msg) => {
+          try {
+            const atts = msg.attachments?.length ? await resolveAttachments(g, msg.attachments) : undefined;
+            const raw = buildRawEmail({ to: msg.to, subject: msg.subject, body: msg.body, cc: msg.cc, bcc: msg.bcc, attachments: atts });
+            const res = await g.gmail.users.messages.send({ userId: "me", requestBody: { raw } });
+            return { messageId: res.data.id, threadId: res.data.threadId };
+          } catch (e) {
+            return { error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_ = results.filter((r) => !("error" in r));
       return ok({
-        summary: `✉️ Sent to ${to}${cc ? ` (cc ${cc})` : ""} — "${subject}"${atts?.length ? ` · ${atts.length} attachment(s)` : ""}`,
-        to,
-        cc: cc ?? null,
-        bcc: bcc ?? null,
-        subject,
-        attachments: atts?.length ?? 0,
-        id: res.data.id,
-        threadId: res.data.threadId,
-        labelIds: res.data.labelIds,
+        summary: `✉️ Sent ${ok_.length}/${messages.length} message(s)`,
+        results,
       });
     }),
   );
+
+  // ---- gmail_reply (array) -------------------------------------------------
 
   server.registerTool(
     "gmail_reply",
     {
-      title: "Reply to an email",
-      description:
-        "Reply within the same thread of an existing message. Keeps subject (adds 'Re:') and threading headers.",
+      title: "Reply to emails",
+      description: "Reply within the same thread of one or more existing messages.",
       inputSchema: {
         account,
-        messageId: z.string().describe("Id of the message being replied to."),
-        body: z.string(),
-        replyAll: z.boolean().default(false).optional().describe("Also reply to Cc recipients."),
-        attachments: attachmentsField,
+        replies: z
+          .array(
+            z.object({
+              messageId: z.string().describe("Id of the message being replied to."),
+              body: z.string(),
+              replyAll: z.boolean().default(false).optional().describe("Also reply to Cc recipients."),
+              attachments: attachmentsField,
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, messageId, body, replyAll, attachments }) => {
+    guard(async ({ account, replies }) => {
       const g = clients.resolve(account);
-      const orig = await g.gmail.users.messages.get({
-        userId: "me",
-        id: messageId,
-        format: "metadata",
-        metadataHeaders: ["From", "To", "Cc", "Subject", "Message-ID", "References"],
-      });
-      const h = orig.data.payload?.headers;
-      const fromAddr = header(h, "From");
-      const messageIdHeader = header(h, "Message-ID");
-      const references = [header(h, "References"), messageIdHeader].filter(Boolean).join(" ");
-      let subject = header(h, "Subject");
-      if (!/^re:/i.test(subject)) subject = "Re: " + subject;
-      const cc = replyAll ? header(h, "Cc") || undefined : undefined;
-      const atts = attachments?.length ? await resolveAttachments(g, attachments) : undefined;
-
-      const raw = buildRawEmail({
-        to: fromAddr,
-        cc,
-        subject,
-        body,
-        inReplyTo: messageIdHeader || undefined,
-        references: references || undefined,
-        attachments: atts,
-      });
-      const threadId = orig.data.threadId ?? undefined;
-      // drafts.create + drafts.send guarantees threadId is respected by Gmail.
-      // messages.send ignores threadId in requestBody in some cases, creating a new thread.
-      const draft = await g.gmail.users.drafts.create({
-        userId: "me",
-        requestBody: { message: { raw, threadId } },
-      });
-      const res = await g.gmail.users.drafts.send({
-        userId: "me",
-        requestBody: { id: draft.data.id! },
-      });
+      const results = await Promise.all(
+        replies.map(async (item) => {
+          try {
+            const orig = await g.gmail.users.messages.get({
+              userId: "me",
+              id: item.messageId,
+              format: "metadata",
+              metadataHeaders: ["From", "To", "Cc", "Subject", "Message-ID", "References"],
+            });
+            const h = orig.data.payload?.headers;
+            const fromAddr = header(h, "From");
+            const messageIdHeader = header(h, "Message-ID");
+            const references = [header(h, "References"), messageIdHeader].filter(Boolean).join(" ");
+            let subject = header(h, "Subject");
+            if (!/^re:/i.test(subject)) subject = "Re: " + subject;
+            const cc = item.replyAll ? header(h, "Cc") || undefined : undefined;
+            const atts = item.attachments?.length ? await resolveAttachments(g, item.attachments) : undefined;
+            const raw = buildRawEmail({
+              to: fromAddr,
+              cc,
+              subject,
+              body: item.body,
+              inReplyTo: messageIdHeader || undefined,
+              references: references || undefined,
+              attachments: atts,
+            });
+            const threadId = orig.data.threadId ?? undefined;
+            const draft = await g.gmail.users.drafts.create({
+              userId: "me",
+              requestBody: { message: { raw, threadId } },
+            });
+            const res = await g.gmail.users.drafts.send({
+              userId: "me",
+              requestBody: { id: draft.data.id! },
+            });
+            return { messageId: res.data.id };
+          } catch (e) {
+            return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_ = results.filter((r) => !("error" in r));
       return ok({
-        summary: `↩️ Replied to ${fromAddr} — "${subject}"${atts?.length ? ` · ${atts.length} attachment(s)` : ""}`,
-        to: fromAddr,
-        cc: cc ?? null,
-        subject,
-        attachments: atts?.length ?? 0,
-        id: res.data.id,
-        threadId: res.data.threadId,
+        summary: `↩️ Replied to ${ok_.length}/${replies.length} message(s)`,
+        results,
       });
     }),
   );
+
+  // ---- gmail_forward (array) -----------------------------------------------
 
   server.registerTool(
     "gmail_forward",
     {
-      title: "Forward an email",
-      description:
-        "Forward an existing message (including its attachments) to new recipients, with an optional note.",
+      title: "Forward emails",
+      description: "Forward one or more existing messages (including their attachments) to new recipients.",
       inputSchema: {
         account,
-        messageId: z.string().describe("Id of the message to forward."),
-        to: z.string().describe("Recipient(s), comma-separated."),
-        cc: z.string().optional(),
-        bcc: z.string().optional(),
-        note: z.string().optional().describe("Optional text to add above the forwarded content."),
-        attachments: attachmentsField,
+        items: z
+          .array(
+            z.object({
+              messageId: z.string().describe("Id of the message to forward."),
+              to: z.string().describe("Recipient(s), comma-separated."),
+              body: z.string().optional().describe("Optional text to add above the forwarded content."),
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, messageId, to, cc, bcc, note, attachments }) => {
+    guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      const orig = await g.gmail.users.messages.get({ userId: "me", id: messageId, format: "full" });
-      const h = orig.data.payload?.headers;
-      let subject = header(h, "Subject");
-      if (!/^fwd:/i.test(subject)) subject = "Fwd: " + subject;
-      const forwardedHeader =
-        "---------- Forwarded message ----------\r\n" +
-        `From: ${header(h, "From")}\r\n` +
-        `Date: ${header(h, "Date")}\r\n` +
-        `Subject: ${header(h, "Subject")}\r\n` +
-        `To: ${header(h, "To")}\r\n\r\n`;
-      const body = (note ? note + "\r\n\r\n" : "") + forwardedHeader + extractBody(orig.data.payload);
-
-      // Re-download the original attachments.
-      const atts: MailAttachment[] = [];
-      for (const a of collectAttachments(orig.data.payload)) {
-        const att = await g.gmail.users.messages.attachments.get({
-          userId: "me",
-          messageId,
-          id: a.attachmentId,
-        });
-        atts.push({
-          filename: a.filename,
-          mimeType: a.mimeType,
-          base64: Buffer.from(att.data.data ?? "", "base64url").toString("base64"),
-        });
-      }
-
-      // Add extra attachments supplied by the caller.
-      if (attachments?.length) {
-        const extra = await resolveAttachments(g, attachments);
-        atts.push(...extra);
-      }
-
-      const raw = buildRawEmail({ to, cc, bcc, subject, body, attachments: atts.length ? atts : undefined });
-      const res = await g.gmail.users.messages.send({ userId: "me", requestBody: { raw } });
+      const results = await Promise.all(
+        items.map(async (item) => {
+          try {
+            const orig = await g.gmail.users.messages.get({ userId: "me", id: item.messageId, format: "full" });
+            const h = orig.data.payload?.headers;
+            let subject = header(h, "Subject");
+            if (!/^fwd:/i.test(subject)) subject = "Fwd: " + subject;
+            const forwardedHeader =
+              "---------- Forwarded message ----------\r\n" +
+              `From: ${header(h, "From")}\r\n` +
+              `Date: ${header(h, "Date")}\r\n` +
+              `Subject: ${header(h, "Subject")}\r\n` +
+              `To: ${header(h, "To")}\r\n\r\n`;
+            const body = (item.body ? item.body + "\r\n\r\n" : "") + forwardedHeader + extractBody(orig.data.payload);
+            const atts: MailAttachment[] = [];
+            for (const a of collectAttachments(orig.data.payload)) {
+              const att = await g.gmail.users.messages.attachments.get({
+                userId: "me",
+                messageId: item.messageId,
+                id: a.attachmentId,
+              });
+              atts.push({
+                filename: a.filename,
+                mimeType: a.mimeType,
+                base64: Buffer.from(att.data.data ?? "", "base64url").toString("base64"),
+              });
+            }
+            const raw = buildRawEmail({ to: item.to, subject, body, attachments: atts.length ? atts : undefined });
+            const res = await g.gmail.users.messages.send({ userId: "me", requestBody: { raw } });
+            return { messageId: res.data.id };
+          } catch (e) {
+            return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_ = results.filter((r) => !("error" in r));
       return ok({
-        summary: `➡️ Forwarded to ${to}${cc ? ` (cc ${cc})` : ""} — "${subject}"${atts.length ? ` · ${atts.length} attachment(s)` : ""}`,
-        to,
-        cc: cc ?? null,
-        bcc: bcc ?? null,
-        subject,
-        forwardedAttachments: atts.length,
-        id: res.data.id,
-        threadId: res.data.threadId,
+        summary: `➡️ Forwarded ${ok_.length}/${items.length} message(s)`,
+        results,
       });
     }),
   );
+
+  // ---- gmail_create_draft (array) ------------------------------------------
 
   server.registerTool(
     "gmail_create_draft",
     {
-      title: "Create a draft",
-      description: "Create a draft email (not sent) for the user to review/send later.",
+      title: "Create drafts",
+      description: "Create one or more draft emails (not sent) for the user to review/send later.",
       inputSchema: {
         account,
-        to: z.string(),
-        subject: z.string(),
-        body: z.string(),
-        cc: z.string().optional(),
-        bcc: z.string().optional(),
-        attachments: attachmentsField,
+        drafts: z
+          .array(
+            z.object({
+              to: z.string(),
+              subject: z.string(),
+              body: z.string(),
+              cc: z.string().optional(),
+              bcc: z.string().optional(),
+              attachments: attachmentsField,
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, to, subject, body, cc, bcc, attachments }) => {
+    guard(async ({ account, drafts }) => {
       const g = clients.resolve(account);
-      const atts = attachments?.length ? await resolveAttachments(g, attachments) : undefined;
-      const raw = buildRawEmail({ to, subject, body, cc, bcc, attachments: atts });
-      const res = await g.gmail.users.drafts.create({
-        userId: "me",
-        requestBody: { message: { raw } },
-      });
+      const results = await Promise.all(
+        drafts.map(async (d) => {
+          try {
+            const atts = d.attachments?.length ? await resolveAttachments(g, d.attachments) : undefined;
+            const raw = buildRawEmail({ to: d.to, subject: d.subject, body: d.body, cc: d.cc, bcc: d.bcc, attachments: atts });
+            const res = await g.gmail.users.drafts.create({
+              userId: "me",
+              requestBody: { message: { raw } },
+            });
+            return { draftId: res.data.id };
+          } catch (e) {
+            return { error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_ = results.filter((r) => !("error" in r));
       return ok({
-        summary: `📝 Draft saved — to ${to}${cc ? ` (cc ${cc})` : ""} · "${subject}"${atts?.length ? ` · ${atts.length} attachment(s)` : ""}`,
-        draftId: res.data.id,
-        message: res.data.message,
+        summary: `📝 Created ${ok_.length}/${drafts.length} draft(s)`,
+        results,
       });
     }),
   );
+
+  // ---- gmail_archive (array, absorbs batch_archive) ------------------------
 
   server.registerTool(
     "gmail_archive",
     {
-      title: "Archive an email",
+      title: "Archive emails",
       description:
-        "Archive a message by removing it from the Inbox (it stays searchable). " +
-        "Returns the message's from/subject/date and a text preview so it's clear what was archived. " +
-        "Pass `_from` and `_subject` if already known — they appear in the approval dialog.",
+        "Archive one or more messages by removing them from the Inbox (they stay searchable). " +
+        "Pass an array of message ids.",
       inputSchema: {
         account,
-        id: z.string(),
-        _from: z.string().optional().describe("Sender address (for the approval dialog — fill from context if known)."),
-        _subject: z.string().optional().describe("Email subject (for the approval dialog — fill from context if known)."),
+        messageIds: z.array(z.string()).min(1).describe("Message id(s) to archive."),
       },
     },
-    guard(async ({ account, id, _from, _subject }) => {
+    guard(async ({ account, messageIds }) => {
       const g = clients.resolve(account);
-      let msgSummary: ReturnType<typeof summarise> | null = null;
-      let preview = "";
-      try {
-        const msg = await g.gmail.users.messages.get({ userId: "me", id, format: "full" });
-        msgSummary = summarise(msg.data);
-        preview = extractBody(msg.data.payload).replace(/\s+/g, " ").trim().slice(0, 400);
-      } catch {
-        // Use hint fields as fallback if the read fails.
-        if (_from || _subject) msgSummary = { id, threadId: null, from: _from ?? "", to: "", subject: _subject ?? "", date: "", snippet: "", labelIds: [] };
-      }
-      const res = await g.gmail.users.messages.modify({
-        userId: "me",
-        id,
-        requestBody: { removeLabelIds: ["INBOX"] },
-      });
+      const results = await Promise.all(
+        messageIds.map(async (id) => {
+          try {
+            await g.gmail.users.messages.modify({
+              userId: "me",
+              id,
+              requestBody: { removeLabelIds: ["INBOX"] },
+            });
+            return { id };
+          } catch (e) {
+            return { id, error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_ = results.filter((r) => !("error" in r));
       return ok({
-        summary: msgSummary
-          ? `📥 Archived — from ${msgSummary.from} · "${msgSummary.subject}" · ${msgSummary.date}`
-          : `📥 Archived message ${id}`,
-        from: msgSummary?.from ?? null,
-        subject: msgSummary?.subject ?? null,
-        date: msgSummary?.date ?? null,
-        preview,
-        id: res.data.id,
-        labelIds: res.data.labelIds,
-        archived: true,
+        summary: `📥 Archived ${ok_.length}/${messageIds.length} message(s)`,
+        results,
       });
     }),
   );
 
+  // ---- gmail_trash (array, absorbs batch_trash) ----------------------------
+
   server.registerTool(
     "gmail_trash",
     {
-      title: "Delete an email (to Trash)",
+      title: "Delete emails (to Trash)",
       description:
-        "Move a message to Trash (reversible; auto-purges after ~30 days). This is the standard 'delete'. " +
-        "Returns the deleted message's from/subject/date and a text preview so it's clear what was removed. " +
-        "Pass `_from` and `_subject` if already known — they appear in the approval dialog.",
+        "Move one or more messages to Trash (reversible; auto-purges after ~30 days). " +
+        "Pass an array of message ids.",
       inputSchema: {
         account,
-        id: z.string(),
-        _from: z.string().optional().describe("Sender address (for the approval dialog — fill from context if known)."),
-        _subject: z.string().optional().describe("Email subject (for the approval dialog — fill from context if known)."),
+        messageIds: z.array(z.string()).min(1).describe("Message id(s) to trash."),
       },
+      annotations: { destructiveHint: true },
     },
-    guard(async ({ account, id, _from, _subject }) => {
+    guard(async ({ account, messageIds }) => {
       const g = clients.resolve(account);
-      let deleted: ReturnType<typeof summarise> | null = null;
-      let preview = "";
-      try {
-        const msg = await g.gmail.users.messages.get({ userId: "me", id, format: "full" });
-        deleted = summarise(msg.data);
-        preview = extractBody(msg.data.payload).replace(/\s+/g, " ").trim().slice(0, 400);
-      } catch {
-        // Use hint fields as fallback if the read fails.
-        if (_from || _subject) deleted = { id, threadId: null, from: _from ?? "", to: "", subject: _subject ?? "", date: "", snippet: "", labelIds: [] };
-      }
-      const res = await g.gmail.users.messages.trash({ userId: "me", id });
+      const results = await Promise.all(
+        messageIds.map(async (id) => {
+          try {
+            await g.gmail.users.messages.trash({ userId: "me", id });
+            return { id };
+          } catch (e) {
+            return { id, error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_ = results.filter((r) => !("error" in r));
       return ok({
-        summary: deleted
-          ? `🗑 Trashed — from ${deleted.from} · "${deleted.subject}" · ${deleted.date}`
-          : `🗑 Trashed message ${id}`,
-        from: deleted?.from ?? null,
-        subject: deleted?.subject ?? null,
-        date: deleted?.date ?? null,
-        preview,
-        id: res.data.id,
-        labelIds: res.data.labelIds,
-        trashed: true,
+        summary: `🗑 Trashed ${ok_.length}/${messageIds.length} message(s)`,
+        results,
       });
     }),
   );
+
+  // ---- gmail_modify_labels (array, absorbs batch_modify_labels) ------------
 
   server.registerTool(
     "gmail_modify_labels",
     {
       title: "Modify labels (read/unread/star/...)",
       description:
-        "Add and/or remove labels on a message. System labels include UNREAD, STARRED, IMPORTANT, INBOX, SPAM. " +
-        "Mark as read = remove UNREAD; star = add STARRED. Use gmail_list_labels for custom label ids.",
+        "Add and/or remove labels on one or more messages. System labels include UNREAD, STARRED, IMPORTANT, INBOX, SPAM. " +
+        "Mark as read = remove UNREAD; star = add STARRED. Use gmail_list_labels for custom label ids. " +
+        "Pass an array of {messageId, addLabelIds?, removeLabelIds?} items.",
       inputSchema: {
         account,
-        id: z.string(),
-        addLabelIds: z.array(z.string()).optional(),
-        removeLabelIds: z.array(z.string()).optional(),
-        _subject: z.string().optional().describe("Email subject (for the approval dialog — fill from context if known)."),
+        items: z
+          .array(
+            z.object({
+              messageId: z.string(),
+              addLabelIds: z.array(z.string()).optional(),
+              removeLabelIds: z.array(z.string()).optional(),
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, id, addLabelIds, removeLabelIds, _subject }) => {
+    guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      let msgMeta: { from: string; subject: string } | null =
-        _subject ? { from: "", subject: _subject } : null;
-      try {
-        const msg = await g.gmail.users.messages.get({
-          userId: "me",
-          id,
-          format: "metadata",
-          metadataHeaders: ["From", "Subject"],
-        });
-        const h = msg.data.payload?.headers;
-        msgMeta = { from: header(h, "From"), subject: header(h, "Subject") };
-      } catch {}
-      const res = await g.gmail.users.messages.modify({
-        userId: "me",
-        id,
-        requestBody: { addLabelIds, removeLabelIds },
-      });
-      const addStr = addLabelIds?.length ? `+[${addLabelIds.join(", ")}]` : "";
-      const rmStr = removeLabelIds?.length ? `-[${removeLabelIds.join(", ")}]` : "";
+      const results = await Promise.all(
+        items.map(async (item) => {
+          try {
+            await g.gmail.users.messages.modify({
+              userId: "me",
+              id: item.messageId,
+              requestBody: { addLabelIds: item.addLabelIds, removeLabelIds: item.removeLabelIds },
+            });
+            return { id: item.messageId };
+          } catch (e) {
+            return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_ = results.filter((r) => !("error" in r));
       return ok({
-        summary: msgMeta
-          ? `🏷️ Labels ${[addStr, rmStr].filter(Boolean).join(" ")} on "${msgMeta.subject}" from ${msgMeta.from}`
-          : `🏷️ Labels ${[addStr, rmStr].filter(Boolean).join(" ")} on message ${id}`,
-        id: res.data.id,
-        labelIds: res.data.labelIds,
+        summary: `🏷️ Modified labels on ${ok_.length}/${items.length} message(s)`,
+        results,
       });
     }),
   );
 
+  // ---- gmail_snooze (array) ------------------------------------------------
+
   server.registerTool(
-    "gmail_batch_archive",
+    "gmail_snooze",
     {
-      title: "Archive multiple emails",
+      title: "Snooze emails",
       description:
-        "Archive up to 1000 messages at once by removing INBOX label. " +
-        "Pass an array of message ids (from gmail_search). " +
-        "This uses the native Gmail batchModify API — one round-trip for all messages.",
+        "Archive one or more messages now and automatically return them to the Inbox at a specified time " +
+        "(requires DATABASE_URL — Railway Postgres). Without Postgres the messages are still archived " +
+        "but auto-restore is unavailable. " +
+        "Pass `unsnoozeAt` as an ISO 8601 datetime, e.g. '2024-01-15T09:00:00'.",
       inputSchema: {
         account,
-        ids: z.array(z.string()).min(1).max(1000).describe("Array of message ids to archive."),
+        items: z
+          .array(
+            z.object({
+              messageId: z.string().describe("Message id to snooze."),
+              unsnoozeAt: z
+                .string()
+                .describe("ISO 8601 datetime when to wake up. Must be in the future."),
+            }),
+          )
+          .min(1),
       },
-      annotations: { destructiveHint: false },
     },
-    guard(async ({ account, ids }) => {
+    guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      await g.gmail.users.messages.batchModify({
-        userId: "me",
-        requestBody: { ids, removeLabelIds: ["INBOX"] },
-      });
+      const results = await Promise.all(
+        items.map(async (item) => {
+          try {
+            const unsnoozeAt = new Date(item.unsnoozeAt);
+            if (isNaN(unsnoozeAt.getTime())) {
+              return { id: item.messageId, error: `Cannot parse date "${item.unsnoozeAt}". Use ISO 8601.` };
+            }
+            if (unsnoozeAt <= new Date()) {
+              return { id: item.messageId, error: `Snooze time "${item.unsnoozeAt}" is already in the past.` };
+            }
+            await g.gmail.users.messages.modify({
+              userId: "me",
+              id: item.messageId,
+              requestBody: { removeLabelIds: ["INBOX"] },
+            });
+            const { store, userToken } = snoozeCtx;
+            if (store && userToken) {
+              const accountName = account ?? clients.defaultName;
+              await store.addSnooze({
+                userToken,
+                accountName,
+                messageId: item.messageId,
+                unsnoozeAt,
+              });
+            }
+            return { id: item.messageId, unsnoozeAt: unsnoozeAt.toISOString() };
+          } catch (e) {
+            return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_ = results.filter((r) => !("error" in r));
       return ok({
-        summary: `📥 Archived ${ids.length} message(s)`,
-        count: ids.length,
-        ids,
+        summary: `⏰ Snoozed ${ok_.length}/${items.length} message(s)`,
+        results,
       });
     }),
   );
 
+  // ---- gmail_get_attachment (array) ----------------------------------------
+
   server.registerTool(
-    "gmail_batch_trash",
+    "gmail_get_attachment",
     {
-      title: "Trash multiple emails",
+      title: "Download email attachments",
       description:
-        "Move up to 1000 messages to Trash at once (reversible; auto-purges after ~30 days). " +
-        "Pass an array of message ids (from gmail_search). " +
-        "Uses batchModify to add TRASH + remove INBOX in one API call.",
+        "Download one or more attachments' content. Get `attachmentId` from gmail_get_message's `attachments`. " +
+        "Text attachments return as text; binaries as base64.",
       inputSchema: {
         account,
-        ids: z.array(z.string()).min(1).max(1000).describe("Array of message ids to trash."),
+        items: z
+          .array(
+            z.object({
+              messageId: z.string(),
+              attachmentId: z.string(),
+              mimeType: z.string().optional().describe("Attachment MIME type (from gmail_get_message)."),
+              filename: z.string().optional(),
+              maxBytes: z.number().int().min(1).max(8_000_000).default(750_000).optional(),
+            }),
+          )
+          .min(1),
       },
-      annotations: { destructiveHint: true },
     },
-    guard(async ({ account, ids }) => {
+    guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      await g.gmail.users.messages.batchModify({
-        userId: "me",
-        requestBody: { ids, addLabelIds: ["TRASH"], removeLabelIds: ["INBOX"] },
-      });
+      const results = await Promise.all(
+        items.map(async (item) => {
+          try {
+            const res = await g.gmail.users.messages.attachments.get({
+              userId: "me",
+              messageId: item.messageId,
+              id: item.attachmentId,
+            });
+            const buf = Buffer.from(res.data.data ?? "", "base64url");
+            const base = { messageId: item.messageId, attachmentId: item.attachmentId, filename: item.filename ?? null, mimeType: item.mimeType ?? null, bytes: buf.length };
+            if (item.mimeType && isTextual(item.mimeType)) {
+              return { ...base, text: buf.toString("utf8"), encoding: "text" };
+            }
+            const limit = item.maxBytes ?? 750_000;
+            if (buf.length > limit) {
+              return { ...base, error: `Attachment is ${buf.length} bytes — too large to inline. Raise maxBytes (max 8MB) or use gmail_save_attachment_to_drive.` };
+            }
+            return { ...base, content: buf.toString("base64"), encoding: "base64" };
+          } catch (e) {
+            return { messageId: item.messageId, attachmentId: item.attachmentId, error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_ = results.filter((r) => !("error" in r));
       return ok({
-        summary: `🗑 Trashed ${ids.length} message(s)`,
-        count: ids.length,
-        ids,
+        summary: `📎 Fetched ${ok_.length}/${items.length} attachment(s)`,
+        results,
       });
     }),
   );
 
+  // ---- gmail_get_attachment_text (array) -----------------------------------
+
   server.registerTool(
-    "gmail_batch_modify_labels",
+    "gmail_get_attachment_text",
     {
-      title: "Modify labels on multiple emails",
+      title: "Read attachments as text (OCR)",
       description:
-        "Add and/or remove labels on up to 1000 messages at once. " +
-        "Common uses: mark as read (removeLabelIds: [UNREAD]), star (addLabelIds: [STARRED]), " +
-        "mark as spam (addLabelIds: [SPAM]), move to a custom label. " +
-        "Uses the native Gmail batchModify API — one round-trip for all messages.",
+        "Extract the TEXT of one or more email attachments (PDF, scan, image) using Google Drive's built-in OCR. " +
+        "Use this to actually READ invoices/receipt PDFs.",
       inputSchema: {
         account,
-        ids: z.array(z.string()).min(1).max(1000).describe("Array of message ids."),
-        addLabelIds: z.array(z.string()).optional().describe("Labels to add, e.g. [STARRED], [UNREAD], or custom label ids."),
-        removeLabelIds: z.array(z.string()).optional().describe("Labels to remove, e.g. [UNREAD] to mark as read."),
+        items: z
+          .array(
+            z.object({
+              messageId: z.string(),
+              attachmentId: z.string(),
+              mimeType: z.string().optional().describe("Source MIME type, e.g. 'application/pdf'. Defaults to application/pdf."),
+              ocrLanguage: z.string().optional().describe("Optional language hint, e.g. 'en', 'ru'."),
+            }),
+          )
+          .min(1),
       },
-      annotations: { destructiveHint: false },
     },
-    guard(async ({ account, ids, addLabelIds, removeLabelIds }) => {
-      if (!addLabelIds?.length && !removeLabelIds?.length) {
-        return fail("Provide at least one of addLabelIds or removeLabelIds.");
-      }
+    guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      await g.gmail.users.messages.batchModify({
-        userId: "me",
-        requestBody: { ids, addLabelIds, removeLabelIds },
-      });
-      const addStr = addLabelIds?.length ? `+[${addLabelIds.join(", ")}]` : "";
-      const rmStr = removeLabelIds?.length ? `-[${removeLabelIds.join(", ")}]` : "";
+      const results = await Promise.all(
+        items.map(async (item) => {
+          try {
+            const att = await g.gmail.users.messages.attachments.get({
+              userId: "me",
+              messageId: item.messageId,
+              id: item.attachmentId,
+            });
+            const buffer = Buffer.from(att.data.data ?? "", "base64url");
+            const created = await g.drive.files.create({
+              requestBody: { name: "gmcp-ocr-tmp", mimeType: GOOGLE_DOC_MIME },
+              media: { mimeType: item.mimeType ?? "application/pdf", body: Readable.from(buffer) },
+              ocrLanguage: item.ocrLanguage,
+              fields: "id",
+            });
+            const docId = created.data.id!;
+            try {
+              const doc = await g.docs.documents.get({ documentId: docId });
+              const text = documentToPlainText(doc.data);
+              return { messageId: item.messageId, attachmentId: item.attachmentId, text };
+            } finally {
+              await g.drive.files.delete({ fileId: docId }).catch(() => {});
+            }
+          } catch (e) {
+            return { messageId: item.messageId, attachmentId: item.attachmentId, error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_ = results.filter((r) => !("error" in r));
       return ok({
-        summary: `🏷️ Labels ${[addStr, rmStr].filter(Boolean).join(" ")} on ${ids.length} message(s)`,
-        count: ids.length,
-        ids,
+        summary: `📄 Extracted text from ${ok_.length}/${items.length} attachment(s)`,
+        results,
       });
     }),
   );
+
+  // ---- gmail_save_attachment_to_drive (array) ------------------------------
+
+  server.registerTool(
+    "gmail_save_attachment_to_drive",
+    {
+      title: "Save email attachments to Drive",
+      description:
+        "Download one or more attachments and upload them straight to Google Drive (cloud-to-cloud, no size limit). " +
+        "Get `attachmentId`/`filename` from gmail_get_message.",
+      inputSchema: {
+        account,
+        items: z
+          .array(
+            z.object({
+              messageId: z.string(),
+              attachmentId: z.string(),
+              fileName: z.string().optional().describe("Name to save as in Drive."),
+              folderId: z.string().optional().describe("Destination Drive folder id."),
+              mimeType: z.string().optional(),
+            }),
+          )
+          .min(1),
+      },
+    },
+    guard(async ({ account, items }) => {
+      const g = clients.resolve(account);
+      const results = await Promise.all(
+        items.map(async (item) => {
+          try {
+            const att = await g.gmail.users.messages.attachments.get({
+              userId: "me",
+              messageId: item.messageId,
+              id: item.attachmentId,
+            });
+            const buffer = Buffer.from(att.data.data ?? "", "base64url");
+            const filename = item.fileName ?? "attachment";
+            const res = await g.drive.files.create({
+              requestBody: { name: filename, parents: item.folderId ? [item.folderId] : undefined },
+              media: { mimeType: item.mimeType ?? "application/octet-stream", body: Readable.from(buffer) },
+              fields: "id,name,mimeType,size,webViewLink",
+            });
+            return { fileId: res.data.id, fileName: res.data.name };
+          } catch (e) {
+            return { messageId: item.messageId, attachmentId: item.attachmentId, error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_ = results.filter((r) => !("error" in r));
+      return ok({
+        summary: `💾 Saved ${ok_.length}/${items.length} attachment(s) to Drive`,
+        results,
+      });
+    }),
+  );
+
+  // ---- gmail_list_labels (unchanged) ---------------------------------------
 
   server.registerTool(
     "gmail_list_labels",
@@ -843,337 +1041,146 @@ export function registerGmailTools(
     }),
   );
 
+  // ---- gmail_create_label (array) ------------------------------------------
+
   server.registerTool(
     "gmail_create_label",
     {
-      title: "Create label",
+      title: "Create labels",
       description:
-        "Create a new Gmail label. Returns the created label's id which can then be used in gmail_modify_labels. " +
+        "Create one or more new Gmail labels. Returns each created label's id. " +
         "Tip: call gmail_list_labels first to check if a label with the same name already exists.",
       inputSchema: {
         account,
-        name: z.string().describe("Label name, e.g. 'Work/Projects'. Use / for nesting."),
-        labelListVisibility: z
-          .enum(["labelShow", "labelShowIfUnread", "labelHide"])
-          .default("labelShow")
-          .optional()
-          .describe("Visibility in the label list sidebar."),
-        messageListVisibility: z
-          .enum(["show", "hide"])
-          .default("show")
-          .optional()
-          .describe("Visibility in the message list."),
-        backgroundColor: z
-          .string()
-          .optional()
-          .describe("Background color hex, e.g. '#16a766'. Must be one of Gmail's allowed colors."),
-        textColor: z
-          .string()
-          .optional()
-          .describe("Text color hex, e.g. '#ffffff'."),
+        labels: z
+          .array(
+            z.object({
+              name: z.string().describe("Label name, e.g. 'Work/Projects'. Use / for nesting."),
+              labelListVisibility: z
+                .enum(["labelShow", "labelShowIfUnread", "labelHide"])
+                .default("labelShow")
+                .optional(),
+              messageListVisibility: z.enum(["show", "hide"]).default("show").optional(),
+              backgroundColor: z.string().optional(),
+              textColor: z.string().optional(),
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, name, labelListVisibility, messageListVisibility, backgroundColor, textColor }) => {
+    guard(async ({ account, labels }) => {
       const g = clients.resolve(account);
-      const res = await g.gmail.users.labels.create({
-        userId: "me",
-        requestBody: {
-          name,
-          labelListVisibility: labelListVisibility ?? "labelShow",
-          messageListVisibility: messageListVisibility ?? "show",
-          color: backgroundColor || textColor
-            ? { backgroundColor, textColor }
-            : undefined,
-        },
-      });
+      const results = await Promise.all(
+        labels.map(async (l) => {
+          try {
+            const res = await g.gmail.users.labels.create({
+              userId: "me",
+              requestBody: {
+                name: l.name,
+                labelListVisibility: l.labelListVisibility ?? "labelShow",
+                messageListVisibility: l.messageListVisibility ?? "show",
+                color: l.backgroundColor || l.textColor
+                  ? { backgroundColor: l.backgroundColor, textColor: l.textColor }
+                  : undefined,
+              },
+            });
+            return { id: res.data.id, name: res.data.name };
+          } catch (e) {
+            return { error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_ = results.filter((r) => !("error" in r));
       return ok({
-        summary: `🏷️ Created label "${res.data.name}" (id: ${res.data.id})`,
-        id: res.data.id,
-        name: res.data.name,
-        labelListVisibility: res.data.labelListVisibility,
-        messageListVisibility: res.data.messageListVisibility,
-        color: res.data.color,
+        summary: `🏷️ Created ${ok_.length}/${labels.length} label(s)`,
+        results,
       });
     }),
   );
+
+  // ---- gmail_update_label (array) ------------------------------------------
 
   server.registerTool(
     "gmail_update_label",
     {
-      title: "Update label",
-      description: "Rename a label or change its visibility/color. Only provided fields are changed.",
+      title: "Update labels",
+      description: "Rename one or more labels or change their visibility/color.",
       inputSchema: {
         account,
-        labelId: z.string().describe("Label ID (from gmail_list_labels or gmail_create_label)."),
-        name: z.string().optional().describe("New label name."),
-        labelListVisibility: z.enum(["labelShow", "labelShowIfUnread", "labelHide"]).optional(),
-        messageListVisibility: z.enum(["show", "hide"]).optional(),
-        backgroundColor: z.string().optional(),
-        textColor: z.string().optional(),
+        items: z
+          .array(
+            z.object({
+              labelId: z.string().describe("Label ID (from gmail_list_labels or gmail_create_label)."),
+              name: z.string().optional(),
+              labelListVisibility: z.enum(["labelShow", "labelShowIfUnread", "labelHide"]).optional(),
+              messageListVisibility: z.enum(["show", "hide"]).optional(),
+              backgroundColor: z.string().optional(),
+              textColor: z.string().optional(),
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, labelId, name, labelListVisibility, messageListVisibility, backgroundColor, textColor }) => {
+    guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      const patch: Record<string, unknown> = {};
-      if (name) patch.name = name;
-      if (labelListVisibility) patch.labelListVisibility = labelListVisibility;
-      if (messageListVisibility) patch.messageListVisibility = messageListVisibility;
-      if (backgroundColor || textColor) patch.color = { backgroundColor, textColor };
-
-      const res = await g.gmail.users.labels.patch({
-        userId: "me",
-        id: labelId,
-        requestBody: patch,
-      });
+      const results = await Promise.all(
+        items.map(async (item) => {
+          try {
+            const patch: Record<string, unknown> = {};
+            if (item.name) patch.name = item.name;
+            if (item.labelListVisibility) patch.labelListVisibility = item.labelListVisibility;
+            if (item.messageListVisibility) patch.messageListVisibility = item.messageListVisibility;
+            if (item.backgroundColor || item.textColor) patch.color = { backgroundColor: item.backgroundColor, textColor: item.textColor };
+            const res = await g.gmail.users.labels.patch({
+              userId: "me",
+              id: item.labelId,
+              requestBody: patch,
+            });
+            return { id: res.data.id, name: res.data.name };
+          } catch (e) {
+            return { id: item.labelId, error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_ = results.filter((r) => !("error" in r));
       return ok({
-        summary: `✏️ Updated label "${res.data.name}"`,
-        id: res.data.id,
-        name: res.data.name,
-        color: res.data.color,
+        summary: `✏️ Updated ${ok_.length}/${items.length} label(s)`,
+        results,
       });
     }),
   );
+
+  // ---- gmail_delete_label (array) ------------------------------------------
 
   server.registerTool(
     "gmail_delete_label",
     {
-      title: "Delete label",
+      title: "Delete labels",
       description:
-        "Permanently delete a user-created Gmail label. " +
-        "The label is removed from all messages (messages themselves are NOT deleted). " +
+        "Permanently delete one or more user-created Gmail labels. " +
+        "The labels are removed from all messages (messages themselves are NOT deleted). " +
         "System labels (INBOX, SENT, etc.) cannot be deleted.",
       inputSchema: {
         account,
-        labelId: z.string().describe("Label ID (from gmail_list_labels)."),
+        labelIds: z.array(z.string()).min(1).describe("Label ID(s) to delete."),
       },
     },
-    guard(async ({ account, labelId }) => {
+    guard(async ({ account, labelIds }) => {
       const g = clients.resolve(account);
-      await g.gmail.users.labels.delete({ userId: "me", id: labelId });
-      return ok({ summary: `🗑️ Deleted label ${labelId}` });
-    }),
-  );
-
-  server.registerTool(
-    "gmail_get_attachment",
-    {
-      title: "Download an email attachment",
-      description:
-        "Download an attachment's content. Get `attachmentId` from gmail_get_message's `attachments`. " +
-        "Text attachments return as text; binaries as base64 (size-limited — for big files use gmail_save_attachment_to_drive).",
-      inputSchema: {
-        account,
-        messageId: z.string(),
-        attachmentId: z.string(),
-        mimeType: z.string().optional().describe("Attachment MIME type (from gmail_get_message), used to decide text vs base64."),
-        filename: z.string().optional(),
-        maxBytes: z.number().int().min(1).max(8_000_000).default(750_000).optional(),
-      },
-    },
-    guard(async ({ account, messageId, attachmentId, mimeType, filename, maxBytes }) => {
-      const g = clients.resolve(account);
-      const res = await g.gmail.users.messages.attachments.get({
-        userId: "me",
-        messageId,
-        id: attachmentId,
-      });
-      const buf = Buffer.from(res.data.data ?? "", "base64url");
-      const base = { filename: filename ?? null, mimeType: mimeType ?? null, bytes: buf.length };
-      if (mimeType && isTextual(mimeType)) {
-        return ok({
-          summary: `📎 Attachment "${filename ?? "?"}" (${mimeType}, ${buf.length} bytes) — text content`,
-          ...base,
-          text: buf.toString("utf8"),
-        });
-      }
-      const limit = maxBytes ?? 750_000;
-      if (buf.length > limit) {
-        return fail(
-          `Attachment is ${buf.length} bytes — too large to inline. Raise maxBytes (max 8MB) ` +
-            `or use gmail_save_attachment_to_drive.`,
-        );
-      }
+      const results = await Promise.all(
+        labelIds.map(async (id) => {
+          try {
+            await g.gmail.users.labels.delete({ userId: "me", id });
+            return { id };
+          } catch (e) {
+            return { id, error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_ = results.filter((r) => !("error" in r));
       return ok({
-        summary: `📎 Attachment "${filename ?? "?"}" (${mimeType ?? "binary"}, ${buf.length} bytes) — base64`,
-        ...base,
-        base64: buf.toString("base64"),
-      });
-    }),
-  );
-
-  server.registerTool(
-    "gmail_save_attachment_to_drive",
-    {
-      title: "Save an email attachment to Drive",
-      description:
-        "Download an attachment and upload it straight to Google Drive (cloud-to-cloud, no size limit). " +
-        "Get `attachmentId`/`filename` from gmail_get_message.",
-      inputSchema: {
-        account,
-        messageId: z.string(),
-        attachmentId: z.string(),
-        filename: z.string().describe("Name to save as in Drive."),
-        mimeType: z.string().optional(),
-        parentId: z.string().optional().describe("Destination Drive folder id."),
-      },
-    },
-    guard(async ({ account, messageId, attachmentId, filename, mimeType, parentId }) => {
-      const g = clients.resolve(account);
-      const att = await g.gmail.users.messages.attachments.get({
-        userId: "me",
-        messageId,
-        id: attachmentId,
-      });
-      const buffer = Buffer.from(att.data.data ?? "", "base64url");
-      const res = await g.drive.files.create({
-        requestBody: { name: filename, parents: parentId ? [parentId] : undefined },
-        media: { mimeType: mimeType ?? "application/octet-stream", body: Readable.from(buffer) },
-        fields: "id,name,mimeType,size,webViewLink",
-      });
-      return ok({
-        summary: `💾 Saved "${filename}" (${buffer.length} bytes) to Drive`,
-        savedToDrive: res.data,
-        sourceBytes: buffer.length,
-      });
-    }),
-  );
-
-  server.registerTool(
-    "gmail_get_attachment_text",
-    {
-      title: "Read an attachment as text (OCR)",
-      description:
-        "Extract the TEXT of an email attachment (PDF, scan, image) using Google Drive's built-in OCR. " +
-        "Downloads the attachment, OCR-converts it via Drive, returns plain text, and cleans up the temp file. " +
-        "Use this to actually READ an invoice/receipt PDF (base64 is not readable by the model).",
-      inputSchema: {
-        account,
-        messageId: z.string(),
-        attachmentId: z.string(),
-        mimeType: z
-          .string()
-          .optional()
-          .describe("Source MIME type, e.g. 'application/pdf', 'image/png'. Defaults to application/pdf."),
-        ocrLanguage: z.string().optional().describe("Optional language hint, e.g. 'en', 'ru'."),
-      },
-    },
-    guard(async ({ account, messageId, attachmentId, mimeType, ocrLanguage }) => {
-      const g = clients.resolve(account);
-      const att = await g.gmail.users.messages.attachments.get({
-        userId: "me",
-        messageId,
-        id: attachmentId,
-      });
-      const buffer = Buffer.from(att.data.data ?? "", "base64url");
-      // Upload + OCR-convert to a temporary Google Doc, read text, then delete it.
-      const created = await g.drive.files.create({
-        requestBody: { name: "gmcp-ocr-tmp", mimeType: GOOGLE_DOC_MIME },
-        media: { mimeType: mimeType ?? "application/pdf", body: Readable.from(buffer) },
-        ocrLanguage,
-        fields: "id",
-      });
-      const docId = created.data.id!;
-      try {
-        const doc = await g.docs.documents.get({ documentId: docId });
-        const text = documentToPlainText(doc.data);
-        return ok({
-          summary: `📄 Extracted text from attachment via OCR (${buffer.length} bytes) — ${text.length} char(s)`,
-          bytes: buffer.length,
-          text,
-        });
-      } finally {
-        await g.drive.files.delete({ fileId: docId }).catch(() => {});
-      }
-    }),
-  );
-
-  server.registerTool(
-    "gmail_snooze",
-    {
-      title: "Snooze an email",
-      description:
-        "Archive a message now and automatically return it to the Inbox at a specified time " +
-        "(requires DATABASE_URL — Railway Postgres). Without Postgres the message is still archived " +
-        "but auto-restore is unavailable. " +
-        "Pass `until` as an ISO 8601 datetime, e.g. '2024-01-15T09:00:00'. " +
-        "Compute the target time from relative expressions: 'in 2 hours', 'tomorrow 9am', 'Monday morning'.",
-      inputSchema: {
-        account,
-        id: z.string().describe("Message id to snooze."),
-        until: z
-          .string()
-          .describe(
-            "ISO 8601 datetime when to wake up, e.g. '2025-01-15T09:00:00'. " +
-              "Must be in the future.",
-          ),
-        _from: z.string().optional().describe("Sender address (for the approval dialog — fill from context if known)."),
-        _subject: z.string().optional().describe("Email subject (for the approval dialog — fill from context if known)."),
-      },
-    },
-    guard(async ({ account, id, until, _from, _subject }) => {
-      const g = clients.resolve(account);
-
-      const unsnoozeAt = new Date(until);
-      if (isNaN(unsnoozeAt.getTime())) {
-        return fail(`Cannot parse date "${until}". Use ISO 8601, e.g. "2025-01-15T09:00:00".`);
-      }
-      if (unsnoozeAt <= new Date()) {
-        return fail(`Snooze time "${until}" is already in the past.`);
-      }
-
-      // Read message context before archiving.
-      let msgInfo: { from: string; subject: string; date: string } | null =
-        _from || _subject ? { from: _from ?? "", subject: _subject ?? "", date: "" } : null;
-      try {
-        const msg = await g.gmail.users.messages.get({
-          userId: "me",
-          id,
-          format: "metadata",
-          metadataHeaders: ["From", "Subject", "Date"],
-        });
-        const h = msg.data.payload?.headers;
-        msgInfo = {
-          from: header(h, "From"),
-          subject: header(h, "Subject"),
-          date: header(h, "Date"),
-        };
-      } catch {}
-
-      // Archive: remove INBOX label.
-      await g.gmail.users.messages.modify({
-        userId: "me",
-        id,
-        requestBody: { removeLabelIds: ["INBOX"] },
-      });
-
-      // Persist snooze for auto-restore.
-      const { store, userToken } = snoozeCtx;
-      let autoRestore = false;
-      if (store && userToken) {
-        const accountName = account ?? clients.defaultName;
-        await store.addSnooze({
-          userToken,
-          accountName,
-          messageId: id,
-          subject: msgInfo?.subject,
-          unsnoozeAt,
-        });
-        autoRestore = true;
-      }
-
-      return ok({
-        summary: msgInfo
-          ? `⏰ Snoozed — from ${msgInfo.from} · "${msgInfo.subject}" · returns at ${unsnoozeAt.toISOString()}`
-          : `⏰ Snoozed message ${id} — returns at ${unsnoozeAt.toISOString()}`,
-        id,
-        from: msgInfo?.from ?? null,
-        subject: msgInfo?.subject ?? null,
-        originalDate: msgInfo?.date ?? null,
-        unsnoozeAt: unsnoozeAt.toISOString(),
-        autoRestore,
-        note: autoRestore
-          ? "Message will automatically return to Inbox at the specified time."
-          : "No DATABASE_URL configured — message archived but will NOT auto-restore. Add it to Gmail manually.",
+        summary: `🗑️ Deleted ${ok_.length}/${labelIds.length} label(s)`,
+        results,
       });
     }),
   );
