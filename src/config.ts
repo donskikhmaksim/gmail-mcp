@@ -43,13 +43,13 @@ export interface User {
 }
 
 /**
- * Self-service onboarding (Telegram bot + OAuth). Enabled only when every
- * required piece is present; otherwise the server runs env-users only.
+ * Self-service onboarding: native MCP OAuth (RFC 8414/9728) that federates
+ * login to Google. Enabled only when every required piece is present;
+ * otherwise the server runs env-users only.
  */
 export interface OnboardingConfig {
   enabled: boolean;
   databaseUrl?: string;
-  telegramBotToken?: string;
   /** Public base URL of this server, e.g. https://app.up.railway.app (no trailing slash). */
   publicBaseUrl?: string;
   /** Shared OAuth client used for everyone's consent flow. */
@@ -68,8 +68,11 @@ export interface Config {
 
 function loadOnboarding(): OnboardingConfig {
   const databaseUrl = process.env.DATABASE_URL?.trim();
-  const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
-  const publicBaseUrl = process.env.PUBLIC_BASE_URL?.trim();
+  // Railway injects RAILWAY_PUBLIC_DOMAIN automatically once public networking
+  // is on, so PUBLIC_BASE_URL only needs to be set manually off-Railway.
+  const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN?.trim();
+  const publicBaseUrl =
+    process.env.PUBLIC_BASE_URL?.trim() || (railwayDomain ? `https://${railwayDomain}` : undefined);
   const googleClientId =
     process.env.ONBOARDING_GOOGLE_CLIENT_ID?.trim() || process.env.GOOGLE_OAUTH_CLIENT_ID?.trim();
   const googleClientSecret =
@@ -79,7 +82,6 @@ function loadOnboarding(): OnboardingConfig {
 
   const enabled = !!(
     databaseUrl &&
-    telegramBotToken &&
     publicBaseUrl &&
     googleClientId &&
     googleClientSecret &&
@@ -88,7 +90,6 @@ function loadOnboarding(): OnboardingConfig {
   return {
     enabled,
     databaseUrl,
-    telegramBotToken,
     publicBaseUrl,
     googleClientId,
     googleClientSecret,

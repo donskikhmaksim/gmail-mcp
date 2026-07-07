@@ -10,7 +10,7 @@ import { ok, fail, guard, isTextual } from "../util.js";
 import { accountField, type UserClients } from "../accounts.js";
 import type { GoogleClients } from "../google.js";
 import { documentToPlainText } from "./docs.js";
-import type { PgStore } from "../store.js";
+interface PgStore { addSnooze(args: { userToken: string; accountName: string; messageId: string; subject?: string; unsnoozeAt: Date }): Promise<void>; }
 
 const GOOGLE_DOC_MIME = "application/vnd.google-apps.document";
 
