@@ -1,12 +1,19 @@
 import express, { type Request, type Response } from "express";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
-import type { Config, User } from "./config.js";
+import type { Account, Config, User } from "./config.js";
 import { buildMcpServer } from "./server.js";
 import { GoogleFederatedProvider } from "./oauthProvider.js";
-import { getGoogleAccount } from "./store.js";
+import {
+  getGoogleAccounts,
+  listGoogleAccounts,
+  removeGoogleAccount,
+  setDefaultAccount,
+  renameAccount,
+} from "./store.js";
+import { renderDashboard } from "./dashboard.js";
 
 const JSONRPC_UNAUTHORIZED = {
   jsonrpc: "2.0" as const,
@@ -41,20 +48,29 @@ function resolveLegacyUser(req: Request, config: Config): User | null {
   return null;
 }
 
-/** Builds the single-tenant User from the Google account stored via OAuth onboarding. */
-async function userFromGoogleAccount(config: Config): Promise<User | null> {
-  const account = await getGoogleAccount();
-  if (!account) return null;
+/** Builds the User from ALL Google accounts linked to this instance via onboarding. */
+async function userFromGoogleAccounts(config: Config): Promise<User | null> {
+  const accounts = await getGoogleAccounts();
+  if (!accounts.length) return null;
   const clientId = config.onboarding.googleClientId!;
   const clientSecret = config.onboarding.googleClientSecret!;
+  const mapped: Account[] = accounts.map((a) => ({
+    name: a.label,
+    auth: { mode: "oauth", clientId, clientSecret, refreshToken: a.refreshToken },
+  }));
+  const def = accounts.find((a) => a.isDefault) ?? accounts[0];
   return {
-    name: account.email,
-    accounts: [{
-      name: "default",
-      auth: { mode: "oauth", clientId, clientSecret, refreshToken: account.refreshToken },
-    }],
-    defaultAccount: "default",
+    name: def.email,
+    accounts: mapped,
+    defaultAccount: def.label,
   };
+}
+
+/** Constant-time compare for the dashboard path secret. */
+function secretMatches(provided: string, expected: string): boolean {
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 export async function startHttpServer(config: Config): Promise<void> {
@@ -64,6 +80,8 @@ export async function startHttpServer(config: Config): Promise<void> {
   // keys correctly per real client IP instead of the proxy's.
   app.set("trust proxy", 1);
   app.use(express.json({ limit: "10mb" }));
+  // Dashboard forms POST application/x-www-form-urlencoded.
+  app.use(express.urlencoded({ extended: false }));
 
   app.get("/", (_req, res) => {
     res.json({ status: "ok", endpoint: "/mcp" });
@@ -78,6 +96,8 @@ export async function startHttpServer(config: Config): Promise<void> {
       googleClientId: config.onboarding.googleClientId!,
       googleClientSecret: config.onboarding.googleClientSecret!,
       baseUrl,
+      relayUrl: config.onboarding.relayUrl,
+      relaySecret: config.onboarding.relaySecret,
     });
 
     const issuerUrl = new URL(baseUrl);
@@ -90,7 +110,7 @@ export async function startHttpServer(config: Config): Promise<void> {
       scopesSupported: ["sheets", "drive", "docs", "gmail", "calendar"],
     }));
 
-    // Google redirects here after the user grants consent.
+    // Google (via the relay) redirects here after the user grants consent.
     app.get("/oauth/google/callback", async (req: Request, res: Response) => {
       const { code, state, error } = req.query as Record<string, string>;
       if (error) {
@@ -102,13 +122,63 @@ export async function startHttpServer(config: Config): Promise<void> {
         return;
       }
       try {
-        const { redirectUrl } = await provider!.handleGoogleCallback(code, state);
-        res.redirect(redirectUrl);
+        const result = await provider!.handleGoogleCallback(code, state);
+        res.redirect(result.redirectUrl);
       } catch (err) {
         console.error("Google callback error:", err);
         res.status(400).send((err as Error).message);
       }
     });
+
+    // ---- Account-management dashboard (guarded by an unguessable path secret) ----
+    const dashSecret = config.onboarding.dashboardSecret;
+    if (dashSecret) {
+      const base = `/dashboard/${dashSecret}`;
+      const guard = (req: Request, res: Response): boolean => {
+        if (secretMatches(String(req.params.secret ?? ""), dashSecret)) return true;
+        res.status(403).send("Forbidden");
+        return false;
+      };
+
+      app.get("/dashboard/:secret", async (req: Request, res: Response) => {
+        if (!guard(req, res)) return;
+        const accounts = await listGoogleAccounts();
+        const msg = typeof req.query.msg === "string" ? req.query.msg : undefined;
+        res.type("html").send(renderDashboard(base, accounts, msg));
+      });
+
+      // Start "add another account" — bounce to Google via the relay.
+      app.get("/dashboard/:secret/add", async (req: Request, res: Response) => {
+        if (!guard(req, res)) return;
+        try {
+          const url = await provider!.startAddAccount(baseUrl);
+          res.redirect(url);
+        } catch (err) {
+          console.error("add-account error:", err);
+          res.status(400).send((err as Error).message);
+        }
+      });
+
+      app.post("/dashboard/:secret/remove", async (req: Request, res: Response) => {
+        if (!guard(req, res)) return;
+        await removeGoogleAccount(String(req.body?.email ?? ""));
+        res.redirect(`${base}?msg=removed`);
+      });
+
+      app.post("/dashboard/:secret/default", async (req: Request, res: Response) => {
+        if (!guard(req, res)) return;
+        await setDefaultAccount(String(req.body?.email ?? ""));
+        res.redirect(`${base}?msg=default`);
+      });
+
+      app.post("/dashboard/:secret/rename", async (req: Request, res: Response) => {
+        if (!guard(req, res)) return;
+        const ok = await renameAccount(String(req.body?.email ?? ""), String(req.body?.label ?? ""));
+        res.redirect(`${base}?msg=${ok ? "renamed" : "rename_failed"}`);
+      });
+
+      console.error(`Account dashboard at ${baseUrl}${base}`);
+    }
 
     console.error(`Native MCP OAuth enabled — clients connect and authorize directly at ${baseUrl}/mcp`);
   }
@@ -124,8 +194,8 @@ export async function startHttpServer(config: Config): Promise<void> {
     let user: User | null = null;
 
     if (req.auth) {
-      // Bearer token validated by requireBearerAuth; resolve the underlying Google account.
-      user = await userFromGoogleAccount(config);
+      // Bearer token validated by requireBearerAuth; resolve the linked Google accounts.
+      user = await userFromGoogleAccounts(config);
     } else if (!config.requireAuth) {
       user = config.users[0] ?? null;
     } else {

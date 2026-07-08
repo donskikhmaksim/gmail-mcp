@@ -17,7 +17,8 @@ function getPool(): pg.Pool {
 
 export async function ensureSchema(): Promise<void> {
   const p = getPool();
-  // Single-tenant: one Google account per deployed instance.
+  // Legacy single-account table (one row, id=1). Kept only so existing
+  // deployments can migrate their row into google_accounts below.
   await p.query(`
     CREATE TABLE IF NOT EXISTS google_account (
       id          INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -25,6 +26,25 @@ export async function ensureSchema(): Promise<void> {
       ref_enc     TEXT NOT NULL,
       updated_at  TIMESTAMPTZ DEFAULT NOW()
     )
+  `);
+  // Multi-account: the owner of this instance can link several Google accounts
+  // (personal / work / ...), each selected per tool-call via the `account` arg.
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS google_accounts (
+      email       TEXT PRIMARY KEY,
+      label       TEXT NOT NULL,
+      ref_enc     TEXT NOT NULL,
+      is_default  BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      updated_at  TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  // One-time migration: fold a legacy single account into the new table.
+  await p.query(`
+    INSERT INTO google_accounts (email, label, ref_enc, is_default)
+    SELECT email, 'default', ref_enc, TRUE FROM google_account
+    WHERE NOT EXISTS (SELECT 1 FROM google_accounts)
+    ON CONFLICT (email) DO NOTHING
   `);
   // MCP OAuth: dynamically registered clients (Claude, etc).
   await p.query(`
@@ -37,6 +57,8 @@ export async function ensureSchema(): Promise<void> {
     )
   `);
   // MCP OAuth: authorization requests waiting on the Google redirect round-trip.
+  // `mode` is 'mcp' for the Claude connect flow (mint an MCP code afterwards) or
+  // 'dashboard' for the add-another-account flow (just store the account).
   await p.query(`
     CREATE TABLE IF NOT EXISTS oauth_pending (
       nonce         TEXT PRIMARY KEY,
@@ -46,9 +68,12 @@ export async function ensureSchema(): Promise<void> {
       scopes        TEXT NOT NULL,
       state         TEXT,
       resource      TEXT,
+      mode          TEXT NOT NULL DEFAULT 'mcp',
       created_at    TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  // Older deployments created oauth_pending without `mode`; add it if missing.
+  await p.query(`ALTER TABLE oauth_pending ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'mcp'`);
   // MCP OAuth: issued authorization codes (single use, short-lived).
   await p.query(`
     CREATE TABLE IF NOT EXISTS oauth_codes (
@@ -76,31 +101,112 @@ export async function ensureSchema(): Promise<void> {
   `);
 }
 
-// ---- Google account (single-tenant) ----
+// ---- Google accounts (multi-account, one owner per instance) ----
 
 export interface GoogleAccount {
   email: string;
+  label: string;
+  isDefault: boolean;
   refreshToken: string;
 }
 
-/** Upsert the single Google account for this instance. Overwrites any previous account. */
-export async function setGoogleAccount(email: string, refreshToken: string): Promise<void> {
-  const p = getPool();
-  const enc = encrypt(refreshToken, encKey);
-  await p.query(
-    `INSERT INTO google_account (id, email, ref_enc, updated_at) VALUES (1, $1, $2, NOW())
-     ON CONFLICT (id) DO UPDATE SET email = $1, ref_enc = $2, updated_at = NOW()`,
-    [email, enc],
-  );
+export interface GoogleAccountMeta {
+  email: string;
+  label: string;
+  isDefault: boolean;
 }
 
-export async function getGoogleAccount(): Promise<GoogleAccount | null> {
-  if (!pool) return null;
+/** Derive a starting label from an email (local-part), deduped against existing labels. */
+function deriveLabel(email: string, taken: Set<string>): string {
+  const base = (email.split("@")[0] || "account").replace(/[^a-zA-Z0-9._-]/g, "") || "account";
+  if (!taken.has(base)) return base;
+  for (let i = 2; ; i++) {
+    const cand = `${base}${i}`;
+    if (!taken.has(cand)) return cand;
+  }
+}
+
+/**
+ * Link (or re-link) a Google account for this instance. Keyed by verified email:
+ * re-authorizing the same account refreshes its token and keeps its label. The
+ * first account ever added becomes the default.
+ */
+export async function addGoogleAccount(email: string, refreshToken: string): Promise<GoogleAccountMeta> {
   const p = getPool();
-  const res = await p.query(`SELECT email, ref_enc FROM google_account WHERE id = 1`);
-  if (!res.rows.length) return null;
-  const row = res.rows[0];
-  return { email: row.email, refreshToken: decrypt(row.ref_enc, encKey) };
+  const enc = encrypt(refreshToken, encKey);
+  const existing = await p.query(`SELECT label, is_default FROM google_accounts WHERE email = $1`, [email]);
+  if (existing.rows.length) {
+    await p.query(`UPDATE google_accounts SET ref_enc = $2, updated_at = NOW() WHERE email = $1`, [email, enc]);
+    return { email, label: existing.rows[0].label, isDefault: existing.rows[0].is_default };
+  }
+  const all = await p.query(`SELECT label FROM google_accounts`);
+  const taken = new Set<string>(all.rows.map((r) => r.label));
+  const label = deriveLabel(email, taken);
+  const isDefault = all.rows.length === 0;
+  await p.query(
+    `INSERT INTO google_accounts (email, label, ref_enc, is_default) VALUES ($1, $2, $3, $4)`,
+    [email, label, enc, isDefault],
+  );
+  return { email, label, isDefault };
+}
+
+/** All accounts (metadata only — no secrets), default first then by creation. */
+export async function listGoogleAccounts(): Promise<GoogleAccountMeta[]> {
+  if (!pool) return [];
+  const p = getPool();
+  const res = await p.query(
+    `SELECT email, label, is_default FROM google_accounts ORDER BY is_default DESC, created_at ASC`,
+  );
+  return res.rows.map((r) => ({ email: r.email, label: r.label, isDefault: r.is_default }));
+}
+
+/** All accounts including decrypted refresh tokens — for building Google clients. */
+export async function getGoogleAccounts(): Promise<GoogleAccount[]> {
+  if (!pool) return [];
+  const p = getPool();
+  const res = await p.query(
+    `SELECT email, label, is_default, ref_enc FROM google_accounts ORDER BY is_default DESC, created_at ASC`,
+  );
+  return res.rows.map((r) => ({
+    email: r.email,
+    label: r.label,
+    isDefault: r.is_default,
+    refreshToken: decrypt(r.ref_enc, encKey),
+  }));
+}
+
+/** Remove an account. If it was the default, promote the oldest remaining one. */
+export async function removeGoogleAccount(email: string): Promise<boolean> {
+  const p = getPool();
+  const del = await p.query(`DELETE FROM google_accounts WHERE email = $1 RETURNING is_default`, [email]);
+  if (!del.rows.length) return false;
+  if (del.rows[0].is_default) {
+    await p.query(
+      `UPDATE google_accounts SET is_default = TRUE
+       WHERE email = (SELECT email FROM google_accounts ORDER BY created_at ASC LIMIT 1)`,
+    );
+  }
+  return true;
+}
+
+/** Make `email` the sole default. */
+export async function setDefaultAccount(email: string): Promise<boolean> {
+  const p = getPool();
+  const hit = await p.query(`SELECT 1 FROM google_accounts WHERE email = $1`, [email]);
+  if (!hit.rows.length) return false;
+  await p.query(`UPDATE google_accounts SET is_default = (email = $1)`, [email]);
+  return true;
+}
+
+/** Rename an account's label (must stay unique). */
+export async function renameAccount(email: string, label: string): Promise<boolean> {
+  const p = getPool();
+  const clean = label.trim().replace(/[^a-zA-Z0-9._-]/g, "");
+  if (!clean) return false;
+  const clash = await p.query(`SELECT 1 FROM google_accounts WHERE label = $1 AND email <> $2`, [clean, email]);
+  if (clash.rows.length) return false;
+  const res = await p.query(`UPDATE google_accounts SET label = $2, updated_at = NOW() WHERE email = $1`, [email, clean]);
+  return (res.rowCount ?? 0) > 0;
 }
 
 // ---- OAuth clients (RFC 7591 dynamic client registration) ----
@@ -132,6 +238,8 @@ export async function getClient(clientId: string): Promise<StoredClient | undefi
 
 // ---- Pending authorization (waiting on Google redirect) ----
 
+export type PendingMode = "mcp" | "dashboard";
+
 export interface PendingAuth {
   nonce: string;
   clientId: string;
@@ -140,14 +248,15 @@ export interface PendingAuth {
   scopes: string[];
   state?: string;
   resource?: string;
+  mode: PendingMode;
 }
 
 export async function savePendingAuth(p1: PendingAuth): Promise<void> {
   const p = getPool();
   await p.query(
-    `INSERT INTO oauth_pending (nonce, client_id, redirect_uri, code_challenge, scopes, state, resource)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [p1.nonce, p1.clientId, p1.redirectUri, p1.codeChallenge, p1.scopes.join(" "), p1.state ?? null, p1.resource ?? null],
+    `INSERT INTO oauth_pending (nonce, client_id, redirect_uri, code_challenge, scopes, state, resource, mode)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [p1.nonce, p1.clientId, p1.redirectUri, p1.codeChallenge, p1.scopes.join(" "), p1.state ?? null, p1.resource ?? null, p1.mode],
   );
 }
 
@@ -164,6 +273,7 @@ export async function takePendingAuth(nonce: string): Promise<PendingAuth | null
     scopes: row.scopes.split(" ").filter(Boolean),
     state: row.state ?? undefined,
     resource: row.resource ?? undefined,
+    mode: (row.mode as PendingMode) ?? "mcp",
   };
 }
 

@@ -55,6 +55,23 @@ export interface OnboardingConfig {
   /** Shared OAuth client used for everyone's consent flow. */
   googleClientId?: string;
   googleClientSecret?: string;
+  /**
+   * Optional token-blind OAuth relay. When set, Google's redirect_uri points at
+   * `${relayUrl}/relay/callback` (a single pre-registered URI shared by everyone)
+   * instead of this server's own callback — so a person's random Railway domain
+   * never has to be registered in the Google console. The relay forwards the
+   * one-time code back here; this server exchanges it. Requires relaySecret.
+   * When unset, the server federates to Google using its own callback (needs
+   * its own domain registered — the legacy behaviour).
+   */
+  relayUrl?: string;
+  /** Shared HMAC secret used to sign the OAuth `state` the relay verifies. */
+  relaySecret?: string;
+  /**
+   * Unguessable path segment protecting the account-management dashboard at
+   * `/dashboard/<secret>`. When unset, the dashboard is disabled.
+   */
+  dashboardSecret?: string;
 }
 
 export interface Config {
@@ -79,6 +96,9 @@ function loadOnboarding(): OnboardingConfig {
     process.env.ONBOARDING_GOOGLE_CLIENT_SECRET?.trim() ||
     process.env.GOOGLE_OAUTH_CLIENT_SECRET?.trim();
   const hasEncKey = !!process.env.TOKEN_ENC_KEY?.trim();
+  const relayUrl = process.env.OAUTH_RELAY_URL?.trim().replace(/\/+$/, "") || undefined;
+  const relaySecret = process.env.OAUTH_RELAY_SECRET?.trim() || undefined;
+  const dashboardSecret = process.env.DASHBOARD_SECRET?.trim() || undefined;
 
   const enabled = !!(
     databaseUrl &&
@@ -93,6 +113,11 @@ function loadOnboarding(): OnboardingConfig {
     publicBaseUrl,
     googleClientId,
     googleClientSecret,
+    // A relay without its shared secret is unusable — ignore it so we fall back
+    // to the direct self-callback rather than signing with an empty key.
+    relayUrl: relayUrl && relaySecret ? relayUrl : undefined,
+    relaySecret: relayUrl && relaySecret ? relaySecret : undefined,
+    dashboardSecret,
   };
 }
 

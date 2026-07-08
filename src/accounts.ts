@@ -3,6 +3,7 @@
  * each tool call picks one via the optional `account` argument.
  */
 import { z } from "zod";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { User } from "./config.js";
 import { createGoogleClients, type GoogleClients } from "./google.js";
 
@@ -53,4 +54,37 @@ export function accountField(clients: UserClients) {
       `Defaults to "${clients.defaultName}" if omitted.`
     : `Google account to use (only "${clients.defaultName}" is configured).`;
   return z.string().optional().describe(desc);
+}
+
+/**
+ * Registers a read-only `list_accounts` tool so the model (and user) can see
+ * which Google accounts are available and which is the default before choosing
+ * an `account` for other tools.
+ */
+export function registerAccountTools(server: McpServer, clients: UserClients): void {
+  server.registerTool(
+    "list_accounts",
+    {
+      description:
+        "List the Google accounts available to this server. Use the returned name " +
+        "as the `account` argument on other tools to act on a specific account.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true },
+    },
+    async () => {
+      const lines = clients.names.map(
+        (n) => `- ${n}${n === clients.defaultName ? " (default)" : ""}`,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              (lines.length ? lines.join("\n") : "No accounts configured.") +
+              `\n\nPass \`account\` with one of these names to pick an account; omitted uses "${clients.defaultName}".`,
+          },
+        ],
+      };
+    },
+  );
 }

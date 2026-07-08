@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { User } from "./config.js";
-import { buildUserClients } from "./accounts.js";
+import { buildUserClients, registerAccountTools } from "./accounts.js";
 import { registerGmailTools } from "./tools/gmail.js";
 
 export function buildMcpServer(user: User): McpServer {
@@ -13,6 +13,7 @@ export function buildMcpServer(user: User): McpServer {
     { name: "gmail-mcp", version: "1.0.0" },
     { instructions: "Tools to manage Gmail: read, search, send, reply, archive, delete, labels. " + accountsHint },
   );
+  registerAccountTools(server, clients);
   registerGmailTools(server, clients, { store: null, userToken: user.token ?? null });
   return server;
 }
