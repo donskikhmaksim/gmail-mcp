@@ -224,6 +224,44 @@ export interface GmailSnoozeContext {
   userToken: string | null;
 }
 
+/** Reads a single header value out of a raw RFC 822 message (handles folding). */
+function headerFromRaw(raw: string, name: string): string {
+  const headerBlock = raw.split(/\r?\n\r?\n/, 1)[0] ?? raw;
+  const re = new RegExp(`^${name}:[ \\t]*(.*(?:\\r?\\n[ \\t].*)*)`, "im");
+  const m = headerBlock.match(re);
+  if (!m) return "";
+  return m[1].replace(/\r?\n[ \t]+/g, " ").trim();
+}
+
+/** Filesystem/Drive-safe file name fragment. */
+function sanitizeName(s: string): string {
+  return (s || "untitled")
+    .replace(/[\/\\:*?"<>|\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120) || "untitled";
+}
+
+/** YYYY-MM-DD from an RFC 822 Date header, or "" if unparseable. */
+function dateStamp(dateHeader: string): string {
+  if (!dateHeader) return "";
+  const d = new Date(dateHeader);
+  return isNaN(d.getTime()) ? "" : d.toISOString().slice(0, 10);
+}
+
+/** mbox "From " separator line for one message (date is informational only). */
+function mboxFromLine(raw: string): string {
+  const d = new Date(headerFromRaw(raw, "Date"));
+  const when = isNaN(d.getTime()) ? "Thu Jan  1 00:00:00 2000" : d.toUTCString();
+  const from = headerFromRaw(raw, "From").replace(/[<>]/g, "").split(/\s+/).find((t) => t.includes("@")) || "unknown@localhost";
+  return `From ${from} ${when}\n`;
+}
+
+/** mbox body escaping: lines beginning "From " must be quoted ">From ". */
+function escapeMboxFrom(buf: Buffer): Buffer {
+  return Buffer.from(buf.toString("latin1").replace(/\nFrom /g, "\n>From "), "latin1");
+}
+
 export function registerGmailTools(
   server: McpServer,
   clients: UserClients,
@@ -1181,6 +1219,111 @@ export function registerGmailTools(
       return ok({
         summary: `🗑️ Deleted ${ok_.length}/${labelIds.length} label(s)`,
         results,
+      });
+    }),
+  );
+
+  // ---- gmail_export_thread_eml ---------------------------------------------
+
+  server.registerTool(
+    "gmail_export_thread_eml",
+    {
+      title: "Export a thread as .eml originals",
+      description:
+        "Export every message in a Gmail thread as a TRUE, unmodified RFC 822 .eml file " +
+        "(via Gmail API format=raw) and save them to Google Drive — the legally-clean original " +
+        "with all headers intact, not a reconstruction. Optionally combine the whole thread into " +
+        "one .mbox archive. Get threadId from gmail_search or gmail_get_thread.",
+      inputSchema: {
+        account,
+        threadId: z.string().describe("Gmail thread id to export (also accepts a single message's threadId)."),
+        folderId: z.string().optional().describe("Destination Drive folder id (defaults to Drive root)."),
+        folderName: z
+          .string()
+          .optional()
+          .describe("If set, create a new Drive subfolder with this name and save the export into it."),
+        format: z
+          .enum(["eml_files", "mbox"])
+          .default("eml_files")
+          .optional()
+          .describe(
+            "'eml_files' = one standalone .eml per message (each a self-contained original); " +
+              "'mbox' = one combined .mbox archive of the whole thread.",
+          ),
+      },
+    },
+    guard(async ({ account, threadId, folderId, folderName, format }) => {
+      const g = clients.resolve(account);
+      // format=raw returns each message's full RFC 822 source (base64url) — the
+      // real bytes Google received, headers and all. This is what makes the
+      // export a genuine original rather than a re-serialised reconstruction.
+      const thread = await g.gmail.users.threads.get({ userId: "me", id: threadId, format: "raw" });
+      const messages = thread.data.messages ?? [];
+      if (!messages.length) return fail(`Thread ${threadId} has no messages (check the threadId).`);
+
+      // Optionally drop everything into a fresh Drive subfolder.
+      let parentId = folderId;
+      if (folderName) {
+        const folder = await g.drive.files.create({
+          requestBody: {
+            name: folderName,
+            mimeType: "application/vnd.google-apps.folder",
+            parents: folderId ? [folderId] : undefined,
+          },
+          fields: "id",
+        });
+        parentId = folder.data.id ?? folderId;
+      }
+
+      const rawBuf = (m: gmail_v1.Schema$Message) => Buffer.from(m.raw ?? "", "base64url");
+
+      if (format === "mbox") {
+        const parts: Buffer[] = [];
+        for (const m of messages) {
+          const raw = rawBuf(m);
+          parts.push(Buffer.from(mboxFromLine(raw.toString("latin1")), "latin1"));
+          parts.push(escapeMboxFrom(raw));
+          parts.push(Buffer.from("\n", "latin1"));
+        }
+        const mbox = Buffer.concat(parts);
+        const subj = headerFromRaw(rawBuf(messages[0]).toString("latin1"), "Subject") || threadId;
+        const res = await g.drive.files.create({
+          requestBody: { name: `${sanitizeName(subj)}.mbox`, parents: parentId ? [parentId] : undefined },
+          media: { mimeType: "application/mbox", body: Readable.from(mbox) },
+          fields: "id,name,webViewLink,size",
+        });
+        return ok({
+          summary: `📧 Exported thread ${threadId} (${messages.length} message(s)) as one .mbox to Drive`,
+          folderId: parentId ?? null,
+          file: { id: res.data.id, name: res.data.name, link: res.data.webViewLink, bytes: res.data.size },
+        });
+      }
+
+      // eml_files: one standalone .eml per message.
+      const files = await Promise.all(
+        messages.map(async (m, i) => {
+          try {
+            const buf = rawBuf(m);
+            const raw = buf.toString("latin1");
+            const stamp = dateStamp(headerFromRaw(raw, "Date"));
+            const subj = headerFromRaw(raw, "Subject") || "no-subject";
+            const name = `${String(i + 1).padStart(2, "0")}${stamp ? "_" + stamp : ""}_${sanitizeName(subj)}.eml`;
+            const res = await g.drive.files.create({
+              requestBody: { name, parents: parentId ? [parentId] : undefined },
+              media: { mimeType: "message/rfc822", body: Readable.from(buf) },
+              fields: "id,name,webViewLink,size",
+            });
+            return { messageId: m.id, name: res.data.name, id: res.data.id, link: res.data.webViewLink, bytes: res.data.size };
+          } catch (e) {
+            return { messageId: m.id, error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const good = files.filter((f) => !("error" in f));
+      return ok({
+        summary: `📧 Exported ${good.length}/${messages.length} message(s) of thread ${threadId} as .eml originals to Drive`,
+        folderId: parentId ?? null,
+        files,
       });
     }),
   );
