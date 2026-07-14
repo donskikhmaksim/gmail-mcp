@@ -233,6 +233,30 @@ function headerFromRaw(raw: string, name: string): string {
   return m[1].replace(/\r?\n[ \t]+/g, " ").trim();
 }
 
+/** Decodes RFC 2047 encoded-words (=?charset?B/Q?...?=) e.g. in Subject headers. */
+function decodeMimeWords(s: string): string {
+  if (!s) return s;
+  return s.replace(
+    /=\?([^?]+)\?([BbQq])\?([^?]*)\?=(?:\s+(?==\?))?/g,
+    (_m, charset: string, enc: string, text: string) => {
+      try {
+        const cs = charset.toLowerCase() === "windows-1251" ? "win1251" : charset;
+        let buf: Buffer;
+        if (enc.toUpperCase() === "B") {
+          buf = Buffer.from(text, "base64");
+        } else {
+          // Q-encoding: '_' is a space, =XX is a hex-escaped byte.
+          const q = text.replace(/_/g, " ").replace(/=([0-9A-Fa-f]{2})/g, (_x, h) => String.fromCharCode(parseInt(h, 16)));
+          buf = Buffer.from(q, "latin1");
+        }
+        return new TextDecoder(cs as string).decode(buf);
+      } catch {
+        return text;
+      }
+    },
+  );
+}
+
 /** Filesystem/Drive-safe file name fragment. */
 function sanitizeName(s: string): string {
   return (s || "untitled")
@@ -1293,7 +1317,7 @@ export function registerGmailTools(
           parts.push(Buffer.from("\n", "latin1"));
         }
         const mbox = Buffer.concat(parts);
-        const subj = headerFromRaw(rawBuf(messages[0]).toString("latin1"), "Subject") || threadId;
+        const subj = decodeMimeWords(headerFromRaw(rawBuf(messages[0]).toString("latin1"), "Subject")) || threadId;
         const res = await g.drive.files.create({
           requestBody: { name: `${sanitizeName(subj)}.mbox`, parents: parentId ? [parentId] : undefined },
           media: { mimeType: "application/mbox", body: Readable.from(mbox) },
@@ -1313,7 +1337,7 @@ export function registerGmailTools(
             const buf = rawBuf(m);
             const raw = buf.toString("latin1");
             const stamp = dateStamp(headerFromRaw(raw, "Date"));
-            const subj = headerFromRaw(raw, "Subject") || "no-subject";
+            const subj = decodeMimeWords(headerFromRaw(raw, "Subject")) || "no-subject";
             const name = `${String(i + 1).padStart(2, "0")}${stamp ? "_" + stamp : ""}_${sanitizeName(subj)}.eml`;
             const res = await g.drive.files.create({
               requestBody: { name, parents: parentId ? [parentId] : undefined },
