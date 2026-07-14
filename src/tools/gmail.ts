@@ -1254,12 +1254,19 @@ export function registerGmailTools(
     },
     guard(async ({ account, threadId, folderId, folderName, format }) => {
       const g = clients.resolve(account);
-      // format=raw returns each message's full RFC 822 source (base64url) — the
-      // real bytes Google received, headers and all. This is what makes the
-      // export a genuine original rather than a re-serialised reconstruction.
-      const thread = await g.gmail.users.threads.get({ userId: "me", id: threadId, format: "raw" });
-      const messages = thread.data.messages ?? [];
-      if (!messages.length) return fail(`Thread ${threadId} has no messages (check the threadId).`);
+      // threads.get does NOT support format=raw (only messages.get does), so do
+      // it in two steps: list the thread's message ids, then pull each message
+      // with format=raw. That raw field is the full RFC 822 source (base64url) —
+      // the real bytes Google received, headers and all — which is what makes
+      // the export a genuine original rather than a re-serialised reconstruction.
+      const stub = await g.gmail.users.threads.get({ userId: "me", id: threadId, format: "minimal" });
+      const ids = (stub.data.messages ?? []).map((m) => m.id).filter((x): x is string => !!x);
+      if (!ids.length) return fail(`Thread ${threadId} has no messages (check the threadId).`);
+      const messages = await Promise.all(
+        ids.map((id) =>
+          g.gmail.users.messages.get({ userId: "me", id, format: "raw" }).then((r) => r.data),
+        ),
+      );
 
       // Optionally drop everything into a fresh Drive subfolder.
       let parentId = folderId;
