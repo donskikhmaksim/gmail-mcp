@@ -175,6 +175,15 @@ export async function getGoogleAccounts(): Promise<GoogleAccount[]> {
   }));
 }
 
+/** The stored refresh token for one email, or undefined when not linked yet. */
+export async function getRefreshTokenByEmail(email: string): Promise<string | undefined> {
+  if (!pool) return undefined;
+  const p = getPool();
+  const res = await p.query(`SELECT ref_enc FROM google_accounts WHERE email = $1`, [email]);
+  if (!res.rows.length) return undefined;
+  return decrypt(res.rows[0].ref_enc, encKey);
+}
+
 /** Remove an account. If it was the default, promote the oldest remaining one. */
 export async function removeGoogleAccount(email: string): Promise<boolean> {
   const p = getPool();

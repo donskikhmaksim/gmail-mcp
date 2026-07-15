@@ -107,10 +107,29 @@ export class GoogleFederatedProvider implements OAuthServerProvider {
     return `${payload}.${sig}`;
   }
 
-  private buildGoogleAuthUrl(nonce: string): string {
+  /**
+   * The two flows want opposite things from Google's `prompt`:
+   *   - Connecting an MCP client, account already linked: omit `prompt` and pass
+   *     `loginHint`. Google then skips both the account chooser and the consent
+   *     screen, so linking the 2nd..Nth server is a silent redirect. Without the
+   *     hint Google cannot tell which signed-in account to use and asks anyway,
+   *     which defeats the point. It still round-trips through Google, so the
+   *     caller keeps proving who they are — only the clicks go away. Google only
+   *     returns a refresh token on the *first* grant, so handleGoogleCallback
+   *     falls back to the stored one.
+   *   - Nothing linked yet, or adding another account from the dashboard: force
+   *     `select_account consent`. The chooser is the only way to reach an
+   *     account we have not seen, and `consent` is what guarantees the refresh
+   *     token that account still needs.
+   */
+  private buildGoogleAuthUrl(
+    nonce: string,
+    opts: { forceConsent: boolean; loginHint?: string },
+  ): string {
     return this.googleClient().generateAuthUrl({
       access_type: "offline",
-      prompt: "consent",
+      ...(opts.forceConsent ? { prompt: "select_account consent" } : {}),
+      ...(opts.loginHint ? { login_hint: opts.loginHint } : {}),
       scope: GOOGLE_SCOPES,
       state: this.buildState(nonce),
     });
@@ -129,7 +148,14 @@ export class GoogleFederatedProvider implements OAuthServerProvider {
       resource: params.resource?.toString(),
       mode: "mcp",
     });
-    res.redirect(this.buildGoogleAuthUrl(nonce));
+    // Hint the account we already hold a token for, so Google can skip straight
+    // through. With nothing linked yet there is nothing to hint and the user has
+    // to pick and consent for real.
+    const linked = await store.listGoogleAccounts();
+    const primary = linked[0];
+    res.redirect(
+      this.buildGoogleAuthUrl(nonce, { forceConsent: !primary, loginHint: primary?.email }),
+    );
   }
 
   /**
@@ -149,7 +175,7 @@ export class GoogleFederatedProvider implements OAuthServerProvider {
       resource: undefined,
       mode: "dashboard",
     });
-    return this.buildGoogleAuthUrl(nonce);
+    return this.buildGoogleAuthUrl(nonce, { forceConsent: true });
   }
 
   /** Step 2: Google (via the relay) redirects to /oauth/google/callback -> here. */
@@ -159,15 +185,25 @@ export class GoogleFederatedProvider implements OAuthServerProvider {
 
     const oauth = this.googleClient();
     const { tokens } = await oauth.getToken(code);
-    if (!tokens.refresh_token) {
-      throw new Error(
-        "Google did not return a refresh token. Revoke this app's access at https://myaccount.google.com/permissions and try again.",
-      );
-    }
     oauth.setCredentials(tokens);
     const oauth2 = google.oauth2({ version: "v2", auth: oauth });
     const { data } = await oauth2.userinfo.get();
-    const account = await store.addGoogleAccount(data.email ?? "unknown", tokens.refresh_token);
+    const email = data.email ?? "unknown";
+
+    // Google only issues a refresh token on the first grant, and the MCP connect
+    // flow deliberately no longer forces a re-consent. Reuse the stored token for
+    // this email: userinfo above came from a token Google just minted, so the
+    // account is verified — we are not handing out anything the caller has not
+    // just proved they own.
+    let refreshToken = tokens.refresh_token ?? undefined;
+    if (!refreshToken) refreshToken = await store.getRefreshTokenByEmail(email);
+    if (!refreshToken) {
+      throw new Error(
+        `Google did not return a refresh token for ${email} and none is stored. ` +
+          "Revoke this app's access at https://myaccount.google.com/permissions and try again.",
+      );
+    }
+    const account = await store.addGoogleAccount(email, refreshToken);
 
     // Add-account flow: return straight to the dashboard, no MCP code minted.
     if (pending.mode === "dashboard") {
