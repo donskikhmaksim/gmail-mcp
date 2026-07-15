@@ -125,6 +125,8 @@ export const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/spreadsheets",
   "https://www.googleapis.com/auth/documents",
   "https://www.googleapis.com/auth/drive",
+  // Calendar: list calendars, read/write events, free-busy.
+  "https://www.googleapis.com/auth/calendar",
   // Gmail: read, send, modify labels, archive, trash (move to Trash).
   "https://www.googleapis.com/auth/gmail.modify",
   "https://www.googleapis.com/auth/gmail.send",
