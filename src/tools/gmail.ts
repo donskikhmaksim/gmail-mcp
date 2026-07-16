@@ -1274,9 +1274,18 @@ export function registerGmailTools(
             "'eml_files' = one standalone .eml per message (each a self-contained original); " +
               "'mbox' = one combined .mbox archive of the whole thread.",
           ),
+        scope: z
+          .enum(["all", "last", "first"])
+          .default("all")
+          .optional()
+          .describe(
+            "Which messages of the thread to export: 'all' = every message (default); " +
+              "'last' = only the most recent message; 'first' = only the original message. " +
+              "With 'last'/'first' a single .eml is written, named without the NN_ prefix.",
+          ),
       },
     },
-    guard(async ({ account, threadId, folderId, folderName, format }) => {
+    guard(async ({ account, threadId, folderId, folderName, format, scope }) => {
       const g = clients.resolve(account);
       // threads.get does NOT support format=raw (only messages.get does), so do
       // it in two steps: list the thread's message ids, then pull each message
@@ -1286,11 +1295,19 @@ export function registerGmailTools(
       const stub = await g.gmail.users.threads.get({ userId: "me", id: threadId, format: "minimal" });
       const ids = (stub.data.messages ?? []).map((m) => m.id).filter((x): x is string => !!x);
       if (!ids.length) return fail(`Thread ${threadId} has no messages (check the threadId).`);
-      const messages = await Promise.all(
+      const allMessages = await Promise.all(
         ids.map((id) =>
           g.gmail.users.messages.get({ userId: "me", id, format: "raw" }).then((r) => r.data),
         ),
       );
+      // threads.get returns messages oldest-first, so [0] is the original and
+      // the last element is the most recent.
+      const messages =
+        scope === "last"
+          ? [allMessages[allMessages.length - 1]]
+          : scope === "first"
+            ? [allMessages[0]]
+            : allMessages;
 
       // Optionally drop everything into a fresh Drive subfolder.
       let parentId = folderId;
@@ -1338,7 +1355,10 @@ export function registerGmailTools(
             const raw = buf.toString("latin1");
             const stamp = dateStamp(headerFromRaw(raw, "Date"));
             const subj = decodeMimeWords(headerFromRaw(raw, "Subject")) || "no-subject";
-            const name = `${String(i + 1).padStart(2, "0")}${stamp ? "_" + stamp : ""}_${sanitizeName(subj)}.eml`;
+            // Single-message export (scope last/first, or a one-message thread):
+            // no NN_ index prefix, so there's no lone "01_" on a single file.
+            const prefix = messages.length > 1 ? `${String(i + 1).padStart(2, "0")}_` : "";
+            const name = `${prefix}${stamp ? stamp + "_" : ""}${sanitizeName(subj)}.eml`;
             const res = await g.drive.files.create({
               requestBody: { name, parents: parentId ? [parentId] : undefined },
               media: { mimeType: "message/rfc822", body: Readable.from(buf) },
