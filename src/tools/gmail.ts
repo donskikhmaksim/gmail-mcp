@@ -170,10 +170,14 @@ export function buildRawEmail(opts: {
 
 export interface AttachmentInput {
   driveFileId?: string;
+  url?: string;
   contentBase64?: string;
   filename?: string;
   mimeType?: string;
 }
+
+/** Gmail caps a whole message (body + attachments) at 25 MB. */
+const ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
 
 /** Resolves attachment inputs (Drive file ids or inline base64) into mail attachments. */
 async function resolveAttachments(
@@ -204,6 +208,24 @@ async function resolveAttachments(
         buf = Buffer.from(r.data as ArrayBuffer);
       }
       out.push({ filename, mimeType, base64: buf.toString("base64") });
+    } else if (item.url) {
+      const resp = await fetch(item.url);
+      if (!resp.ok) {
+        throw new Error(`Could not download attachment from ${item.url}: ${resp.status} ${resp.statusText}`);
+      }
+      const buf = Buffer.from(await resp.arrayBuffer());
+      if (buf.byteLength > ATTACHMENT_MAX_BYTES) {
+        throw new Error(
+          `Attachment from ${item.url} is ${Math.round(buf.byteLength / (1024 * 1024))} MB; Gmail caps a message at 25 MB.`,
+        );
+      }
+      const urlName = item.url.split("?")[0].replace(/\/+$/, "").split("/").pop() || "attachment";
+      out.push({
+        filename: item.filename ?? urlName,
+        mimeType:
+          item.mimeType ?? resp.headers.get("content-type")?.split(";")[0] ?? "application/octet-stream",
+        base64: buf.toString("base64"),
+      });
     } else if (item.contentBase64) {
       out.push({
         filename: item.filename ?? "attachment",
@@ -211,7 +233,7 @@ async function resolveAttachments(
         base64: item.contentBase64,
       });
     } else {
-      throw new Error("Each attachment needs either driveFileId or contentBase64.");
+      throw new Error("Each attachment needs one of: driveFileId, url, or contentBase64.");
     }
   }
   return out;
@@ -297,6 +319,7 @@ export function registerGmailTools(
     .array(
       z.object({
         driveFileId: z.string().optional().describe("Attach this Google Drive file."),
+        url: z.string().optional().describe("Download the file from this public/direct URL and attach it."),
         contentBase64: z.string().optional().describe("Inline file bytes as base64."),
         filename: z.string().optional(),
         mimeType: z.string().optional(),
@@ -304,8 +327,8 @@ export function registerGmailTools(
     )
     .optional()
     .describe(
-      "Files to attach. Each item is either {driveFileId} (a Drive file, Google Docs/Sheets export to PDF) " +
-        "or {filename, contentBase64, mimeType} (inline).",
+      "Files to attach. Each item is one of: {driveFileId} (a Drive file, Google Docs/Sheets export to PDF), " +
+        "{url} (the server downloads the file from the link), or {filename, contentBase64, mimeType} (inline).",
     );
 
   // ---- gmail_search (unchanged) --------------------------------------------
