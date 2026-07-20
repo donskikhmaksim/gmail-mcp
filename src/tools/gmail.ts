@@ -6,7 +6,7 @@ import { z } from "zod";
 import { Readable } from "node:stream";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { gmail_v1 } from "googleapis";
-import { ok, fail, guard, isTextual } from "../util.js";
+import { ok, fail, guard, isTextual, mapWithLimit } from "../util.js";
 import { accountField, type UserClients } from "../accounts.js";
 import type { GoogleClients } from "../google.js";
 import { documentToPlainText } from "./docs.js";
@@ -87,6 +87,51 @@ function summarise(msg: gmail_v1.Schema$Message) {
     snippet: msg.snippet ?? "",
     labelIds: msg.labelIds ?? [],
   };
+}
+
+interface MsgMeta {
+  subject?: string;
+  from?: string;
+  snippet?: string;
+}
+
+/**
+ * Best-effort subject/from/snippet for a batch of message ids, so mutating
+ * tools can report "what" was touched, not just bare ids. Metadata failures
+ * are swallowed — a missing subject must never fail the mutation itself.
+ */
+async function fetchMeta(
+  g: GoogleClients,
+  messageIds: string[],
+): Promise<Map<string, MsgMeta>> {
+  const meta = new Map<string, MsgMeta>();
+  await mapWithLimit(messageIds, async (id) => {
+    try {
+      const r = await g.gmail.users.messages.get({
+        userId: "me",
+        id,
+        format: "metadata",
+        metadataHeaders: ["From", "Subject"],
+      });
+      const s = summarise(r.data);
+      meta.set(id, { subject: s.subject, from: s.from, snippet: s.snippet });
+    } catch {
+      /* best-effort */
+    }
+  });
+  return meta;
+}
+
+/** One human line per result: «Subject» — From: snippet (or the error). */
+function describeLines(
+  results: Array<{ id?: string | null; error?: string } & MsgMeta>,
+  icon: string,
+): string[] {
+  return results.map((r) =>
+    r.error
+      ? `⚠️ ${r.id}: ${r.error}`
+      : `${icon} «${r.subject || "(без темы)"}» — ${r.from || "?"}${r.snippet ? `: ${r.snippet.slice(0, 140)}` : ""}`,
+  );
 }
 
 /** RFC 2822 + base64url encoding for sending. Exported for testing. */
@@ -365,16 +410,13 @@ export function registerGmailTools(
         pageToken,
       });
       const ids = (list.data.messages ?? []).map((m) => m.id!).filter(Boolean);
-      const messages = await Promise.all(
-        ids.map((id) =>
+      const messages = await mapWithLimit(ids, (id) =>
           g.gmail.users.messages.get({
             userId: "me",
             id,
             format: "metadata",
             metadataHeaders: ["From", "To", "Subject", "Date"],
-          }),
-        ),
-      );
+          }),);
       const msgs = messages.map((r) => summarise(r.data));
       return ok({
         summary: `🔍 Gmail search "${q || "(all)"}" — ${msgs.length} message(s)${list.data.nextPageToken ? " (has next page)" : ""}`,
@@ -456,8 +498,7 @@ export function registerGmailTools(
     },
     guard(async ({ account, messageIds }) => {
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        messageIds.map(async (id) => {
+      const results = await mapWithLimit(messageIds, async (id) => {
           try {
             const res = await g.gmail.users.messages.get({ userId: "me", id, format: "full" });
             const s = summarise(res.data);
@@ -467,8 +508,7 @@ export function registerGmailTools(
           } catch (e) {
             return { id, error: String(e instanceof Error ? e.message : e) };
           }
-        }),
-      );
+        });
       const ok_ = results.filter((r) => !("error" in r));
       const err_ = results.filter((r) => "error" in r);
       return ok({
@@ -492,8 +532,7 @@ export function registerGmailTools(
     },
     guard(async ({ account, threadIds }) => {
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        threadIds.map(async (threadId) => {
+      const results = await mapWithLimit(threadIds, async (threadId) => {
           try {
             const res = await g.gmail.users.threads.get({ userId: "me", id: threadId, format: "full" });
             const messages = (res.data.messages ?? []).map((m) => ({
@@ -505,8 +544,7 @@ export function registerGmailTools(
           } catch (e) {
             return { id: threadId, error: String(e instanceof Error ? e.message : e) };
           }
-        }),
-      );
+        });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
         summary: `📧 Fetched ${ok_.length}/${threadIds.length} thread(s)`,
@@ -540,8 +578,7 @@ export function registerGmailTools(
     },
     guard(async ({ account, messages }) => {
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        messages.map(async (msg) => {
+      const results = await mapWithLimit(messages, async (msg) => {
           try {
             const atts = msg.attachments?.length ? await resolveAttachments(g, msg.attachments) : undefined;
             const raw = buildRawEmail({ to: msg.to, subject: msg.subject, body: msg.body, cc: msg.cc, bcc: msg.bcc, attachments: atts });
@@ -550,8 +587,7 @@ export function registerGmailTools(
           } catch (e) {
             return { error: String(e instanceof Error ? e.message : e) };
           }
-        }),
-      );
+        });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
         summary: `✉️ Sent ${ok_.length}/${messages.length} message(s)`,
@@ -583,8 +619,7 @@ export function registerGmailTools(
     },
     guard(async ({ account, replies }) => {
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        replies.map(async (item) => {
+      const results = await mapWithLimit(replies, async (item) => {
           try {
             const orig = await g.gmail.users.messages.get({
               userId: "me",
@@ -622,8 +657,7 @@ export function registerGmailTools(
           } catch (e) {
             return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
           }
-        }),
-      );
+        });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
         summary: `↩️ Replied to ${ok_.length}/${replies.length} message(s)`,
@@ -654,8 +688,7 @@ export function registerGmailTools(
     },
     guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        items.map(async (item) => {
+      const results = await mapWithLimit(items, async (item) => {
           try {
             const orig = await g.gmail.users.messages.get({ userId: "me", id: item.messageId, format: "full" });
             const h = orig.data.payload?.headers;
@@ -687,8 +720,7 @@ export function registerGmailTools(
           } catch (e) {
             return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
           }
-        }),
-      );
+        });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
         summary: `➡️ Forwarded ${ok_.length}/${items.length} message(s)`,
@@ -722,8 +754,7 @@ export function registerGmailTools(
     },
     guard(async ({ account, drafts }) => {
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        drafts.map(async (d) => {
+      const results = await mapWithLimit(drafts, async (d) => {
           try {
             const atts = d.attachments?.length ? await resolveAttachments(g, d.attachments) : undefined;
             const raw = buildRawEmail({ to: d.to, subject: d.subject, body: d.body, cc: d.cc, bcc: d.bcc, attachments: atts });
@@ -735,8 +766,7 @@ export function registerGmailTools(
           } catch (e) {
             return { error: String(e instanceof Error ? e.message : e) };
           }
-        }),
-      );
+        });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
         summary: `📝 Created ${ok_.length}/${drafts.length} draft(s)`,
@@ -761,23 +791,23 @@ export function registerGmailTools(
     },
     guard(async ({ account, messageIds }) => {
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        messageIds.map(async (id) => {
+      const meta = await fetchMeta(g, messageIds);
+      const results = await mapWithLimit(messageIds, async (id) => {
           try {
             await g.gmail.users.messages.modify({
               userId: "me",
               id,
               requestBody: { removeLabelIds: ["INBOX"] },
             });
-            return { id };
+            return { id, ...(meta.get(id) ?? {}) };
           } catch (e) {
             return { id, error: String(e instanceof Error ? e.message : e) };
           }
-        }),
-      );
+        });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
         summary: `📥 Archived ${ok_.length}/${messageIds.length} message(s)`,
+        archived: describeLines(results, "📥"),
         results,
       });
     }),
@@ -800,19 +830,19 @@ export function registerGmailTools(
     },
     guard(async ({ account, messageIds }) => {
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        messageIds.map(async (id) => {
+      const meta = await fetchMeta(g, messageIds);
+      const results = await mapWithLimit(messageIds, async (id) => {
           try {
             await g.gmail.users.messages.trash({ userId: "me", id });
-            return { id };
+            return { id, ...(meta.get(id) ?? {}) };
           } catch (e) {
             return { id, error: String(e instanceof Error ? e.message : e) };
           }
-        }),
-      );
+        });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
         summary: `🗑 Trashed ${ok_.length}/${messageIds.length} message(s)`,
+        deleted: describeLines(results, "🗑"),
         results,
       });
     }),
@@ -843,23 +873,23 @@ export function registerGmailTools(
     },
     guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        items.map(async (item) => {
+      const meta = await fetchMeta(g, items.map((i) => i.messageId));
+      const results = await mapWithLimit(items, async (item) => {
           try {
             await g.gmail.users.messages.modify({
               userId: "me",
               id: item.messageId,
               requestBody: { addLabelIds: item.addLabelIds, removeLabelIds: item.removeLabelIds },
             });
-            return { id: item.messageId };
+            return { id: item.messageId, ...(meta.get(item.messageId) ?? {}) };
           } catch (e) {
             return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
           }
-        }),
-      );
+        });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
         summary: `🏷️ Modified labels on ${ok_.length}/${items.length} message(s)`,
+        modified: describeLines(results, "🏷️"),
         results,
       });
     }),
@@ -892,8 +922,7 @@ export function registerGmailTools(
     },
     guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        items.map(async (item) => {
+      const results = await mapWithLimit(items, async (item) => {
           try {
             const unsnoozeAt = new Date(item.unsnoozeAt);
             if (isNaN(unsnoozeAt.getTime())) {
@@ -921,8 +950,7 @@ export function registerGmailTools(
           } catch (e) {
             return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
           }
-        }),
-      );
+        });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
         summary: `⏰ Snoozed ${ok_.length}/${items.length} message(s)`,
@@ -957,8 +985,7 @@ export function registerGmailTools(
     },
     guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        items.map(async (item) => {
+      const results = await mapWithLimit(items, async (item) => {
           try {
             const res = await g.gmail.users.messages.attachments.get({
               userId: "me",
@@ -978,8 +1005,7 @@ export function registerGmailTools(
           } catch (e) {
             return { messageId: item.messageId, attachmentId: item.attachmentId, error: String(e instanceof Error ? e.message : e) };
           }
-        }),
-      );
+        });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
         summary: `📎 Fetched ${ok_.length}/${items.length} attachment(s)`,
@@ -1013,8 +1039,7 @@ export function registerGmailTools(
     },
     guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        items.map(async (item) => {
+      const results = await mapWithLimit(items, async (item) => {
           try {
             const att = await g.gmail.users.messages.attachments.get({
               userId: "me",
@@ -1039,8 +1064,7 @@ export function registerGmailTools(
           } catch (e) {
             return { messageId: item.messageId, attachmentId: item.attachmentId, error: String(e instanceof Error ? e.message : e) };
           }
-        }),
-      );
+        });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
         summary: `📄 Extracted text from ${ok_.length}/${items.length} attachment(s)`,
@@ -1075,8 +1099,7 @@ export function registerGmailTools(
     },
     guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        items.map(async (item) => {
+      const results = await mapWithLimit(items, async (item) => {
           try {
             const att = await g.gmail.users.messages.attachments.get({
               userId: "me",
@@ -1094,8 +1117,7 @@ export function registerGmailTools(
           } catch (e) {
             return { messageId: item.messageId, attachmentId: item.attachmentId, error: String(e instanceof Error ? e.message : e) };
           }
-        }),
-      );
+        });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
         summary: `💾 Saved ${ok_.length}/${items.length} attachment(s) to Drive`,
@@ -1155,8 +1177,7 @@ export function registerGmailTools(
     },
     guard(async ({ account, labels }) => {
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        labels.map(async (l) => {
+      const results = await mapWithLimit(labels, async (l) => {
           try {
             const res = await g.gmail.users.labels.create({
               userId: "me",
@@ -1173,8 +1194,7 @@ export function registerGmailTools(
           } catch (e) {
             return { error: String(e instanceof Error ? e.message : e) };
           }
-        }),
-      );
+        });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
         summary: `🏷️ Created ${ok_.length}/${labels.length} label(s)`,
@@ -1208,8 +1228,7 @@ export function registerGmailTools(
     },
     guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        items.map(async (item) => {
+      const results = await mapWithLimit(items, async (item) => {
           try {
             const patch: Record<string, unknown> = {};
             if (item.name) patch.name = item.name;
@@ -1225,8 +1244,7 @@ export function registerGmailTools(
           } catch (e) {
             return { id: item.labelId, error: String(e instanceof Error ? e.message : e) };
           }
-        }),
-      );
+        });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
         summary: `✏️ Updated ${ok_.length}/${items.length} label(s)`,
@@ -1252,16 +1270,14 @@ export function registerGmailTools(
     },
     guard(async ({ account, labelIds }) => {
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        labelIds.map(async (id) => {
+      const results = await mapWithLimit(labelIds, async (id) => {
           try {
             await g.gmail.users.labels.delete({ userId: "me", id });
             return { id };
           } catch (e) {
             return { id, error: String(e instanceof Error ? e.message : e) };
           }
-        }),
-      );
+        });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
         summary: `🗑️ Deleted ${ok_.length}/${labelIds.length} label(s)`,
@@ -1318,11 +1334,8 @@ export function registerGmailTools(
       const stub = await g.gmail.users.threads.get({ userId: "me", id: threadId, format: "minimal" });
       const ids = (stub.data.messages ?? []).map((m) => m.id).filter((x): x is string => !!x);
       if (!ids.length) return fail(`Thread ${threadId} has no messages (check the threadId).`);
-      const allMessages = await Promise.all(
-        ids.map((id) =>
-          g.gmail.users.messages.get({ userId: "me", id, format: "raw" }).then((r) => r.data),
-        ),
-      );
+      const allMessages = await mapWithLimit(ids, (id) =>
+          g.gmail.users.messages.get({ userId: "me", id, format: "raw" }).then((r) => r.data),);
       // threads.get returns messages oldest-first, so [0] is the original and
       // the last element is the most recent.
       const messages =
@@ -1371,8 +1384,7 @@ export function registerGmailTools(
       }
 
       // eml_files: one standalone .eml per message.
-      const files = await Promise.all(
-        messages.map(async (m, i) => {
+      const files = await mapWithLimit(messages, async (m, i) => {
           try {
             const buf = rawBuf(m);
             const raw = buf.toString("latin1");
@@ -1391,8 +1403,7 @@ export function registerGmailTools(
           } catch (e) {
             return { messageId: m.id, error: String(e instanceof Error ? e.message : e) };
           }
-        }),
-      );
+        });
       const good = files.filter((f) => !("error" in f));
       return ok({
         summary: `📧 Exported ${good.length}/${messages.length} message(s) of thread ${threadId} as .eml originals to Drive`,

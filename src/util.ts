@@ -33,6 +33,56 @@ export function guard<A>(
   };
 }
 
+/**
+ * Run `fn` over `items` with at most `limit` calls in flight, retrying each
+ * call on 429/5xx with exponential backoff. Google enforces a per-user cap on
+ * concurrent requests (~50 across ALL clients); unbounded Promise.all over a
+ * 30+ item batch trips "429 Too many concurrent requests for user". Results
+ * keep input order. `fn` errors are NOT swallowed here — callers keep their
+ * own per-item try/catch so one failure doesn't kill the batch.
+ */
+export async function mapWithLimit<T, R>(
+  items: T[],
+  fn: (item: T, index: number) => Promise<R>,
+  limit = 8,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await withRetry(() => fn(items[i], i));
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker),
+  );
+  return results;
+}
+
+/** Retry on 429/rate-limit/5xx with exponential backoff (1s, 2s, 4s). */
+async function withRetry<R>(fn: () => Promise<R>, attempts = 3): Promise<R> {
+  let lastErr: unknown;
+  for (let a = 0; a < attempts; a++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const e = err as { code?: number | string; message?: string };
+      const code = Number(e?.code);
+      const msg = String(e?.message ?? "");
+      const retriable =
+        code === 429 ||
+        code === 500 ||
+        code === 503 ||
+        /rate ?limit|too many concurrent|quota/i.test(msg);
+      if (!retriable || a === attempts - 1) throw err;
+      await new Promise((r) => setTimeout(r, 1000 * 2 ** a));
+    }
+  }
+  throw lastErr;
+}
+
 /** True for MIME types whose bytes are safe to return inline as UTF-8 text. */
 export function isTextual(mime: string): boolean {
   return (
