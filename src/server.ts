@@ -14,6 +14,6 @@ export function buildMcpServer(user: User): McpServer {
     { instructions: "Tools to manage Gmail: read, search, send, reply, archive, delete, labels. " + accountsHint },
   );
   registerAccountTools(server, clients);
-  registerGmailTools(server, clients, { store: null, userToken: user.token ?? null });
+  registerGmailTools(server, clients, { store: null, userToken: null });
   return server;
 }

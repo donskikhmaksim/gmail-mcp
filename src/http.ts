@@ -1,8 +1,6 @@
 import express, { type Request, type Response } from "express";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
-import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import type { Account, Config, User } from "./config.js";
 import { buildMcpServer } from "./server.js";
 import { GoogleFederatedProvider } from "./oauthProvider.js";
@@ -28,6 +26,7 @@ function tokensEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
+/** Pulls the presented bearer from Authorization / x-api-key / ?key= / ?token=. */
 function extractLegacyToken(req: Request): string {
   const header = req.header("authorization") ?? "";
   const match = /^Bearer\s+(.+)$/i.exec(header);
@@ -39,17 +38,14 @@ function extractLegacyToken(req: Request): string {
   return "";
 }
 
-function resolveLegacyUser(req: Request, config: Config): User | null {
-  const provided = extractLegacyToken(req);
-  if (!provided) return null;
-  for (const user of config.users) {
-    if (user.token && tokensEqual(provided, user.token)) return user;
-  }
-  return null;
-}
-
-/** Builds the User from ALL Google accounts linked to this instance via onboarding. */
-async function userFromGoogleAccounts(config: Config): Promise<User | null> {
+/**
+ * Builds the owner User from ALL Google accounts the owner has linked through the
+ * browser dashboard (Postgres google_accounts). Single-tenant: there is exactly
+ * one owner, so this returns every stored account — no per-token selection.
+ * Returns null when onboarding/store is inactive or no accounts are linked yet.
+ */
+async function ownerFromStore(config: Config): Promise<User | null> {
+  if (!config.onboarding.enabled) return null;
   const accounts = await getGoogleAccounts();
   if (!accounts.length) return null;
   const clientId = config.onboarding.googleClientId!;
@@ -74,10 +70,20 @@ function secretMatches(provided: string, expected: string): boolean {
 }
 
 export async function startHttpServer(config: Config): Promise<void> {
+  // Fail CLOSED: an HTTP deployment without a gate would expose the owner's
+  // Google accounts to the whole internet. Refuse to start rather than run open.
+  if (!config.mcpSecret) {
+    throw new Error(
+      "Refusing to start in HTTP mode without a gate: set MCP_SECRET (or the legacy " +
+        "MCP_AUTH_TOKEN) to a long random string. Every POST /mcp must send it as " +
+        "`Authorization: Bearer <secret>`.",
+    );
+  }
+  const mcpSecret = config.mcpSecret;
+
   const app = express();
   // Railway (and most PaaS) terminate TLS behind a reverse proxy; trust its
-  // X-Forwarded-For so express-rate-limit (used by the SDK's auth handlers)
-  // keys correctly per real client IP instead of the proxy's.
+  // X-Forwarded-For so per-IP logic keys on the real client, not the proxy.
   app.set("trust proxy", 1);
   app.use(express.json({ limit: "10mb" }));
   // Dashboard forms POST application/x-www-form-urlencoded.
@@ -100,17 +106,8 @@ export async function startHttpServer(config: Config): Promise<void> {
       relaySecret: config.onboarding.relaySecret,
     });
 
-    const issuerUrl = new URL(baseUrl);
-    const resourceServerUrl = new URL(`${baseUrl}/mcp`);
-
-    app.use(mcpAuthRouter({
-      provider,
-      issuerUrl,
-      resourceServerUrl,
-      scopesSupported: ["sheets", "drive", "docs", "gmail", "calendar"],
-    }));
-
-    // Google (via the relay) redirects here after the user grants consent.
+    // Google (via the relay) redirects here after the owner grants consent for
+    // an account added from the dashboard.
     app.get("/oauth/google/callback", async (req: Request, res: Response) => {
       const { code, state, error } = req.query as Record<string, string>;
       if (error) {
@@ -179,34 +176,21 @@ export async function startHttpServer(config: Config): Promise<void> {
 
       console.error(`Account dashboard at ${baseUrl}${base}`);
     }
-
-    console.error(`Native MCP OAuth enabled — clients connect and authorize directly at ${baseUrl}/mcp`);
   }
 
-  const bearerMiddleware = provider
-    ? requireBearerAuth({
-        verifier: provider,
-        resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(new URL(`${config.onboarding.publicBaseUrl}/mcp`)),
-      })
-    : null;
-
   const handleMcp = async (req: Request, res: Response) => {
-    let user: User | null = null;
-
-    if (req.auth) {
-      // Bearer token validated by requireBearerAuth; resolve the linked Google accounts.
-      user = await userFromGoogleAccounts(config);
-    } else if (!config.requireAuth) {
-      user = config.users[0] ?? null;
-    } else {
-      user = resolveLegacyUser(req, config);
-    }
-
-    if (!user) {
+    // Single static gate: every /mcp request must present the shared secret.
+    const provided = extractLegacyToken(req);
+    if (!provided || !tokensEqual(provided, mcpSecret)) {
       res.status(401).json(JSONRPC_UNAUTHORIZED);
       return;
     }
-    const server = buildMcpServer(user);
+
+    // Serve the owner's accounts: browser-linked ones (Postgres) if any, else the
+    // env-configured owner.
+    const owner = (await ownerFromStore(config)) ?? config.owner;
+
+    const server = buildMcpServer(owner);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => { transport.close(); server.close(); });
     try {
@@ -220,19 +204,7 @@ export async function startHttpServer(config: Config): Promise<void> {
     }
   };
 
-  if (bearerMiddleware) {
-    // Legacy ?key=/x-api-key links (from before native OAuth) keep working by
-    // resolving directly against the static env-configured users. Everything
-    // else — including requests with NO Authorization header at all — goes
-    // through requireBearerAuth, so first-contact discovery requests get a
-    // proper 401 + WWW-Authenticate pointing at the protected-resource metadata.
-    app.post("/mcp", (req, res, next) => {
-      if (resolveLegacyUser(req, config)) return next();
-      return bearerMiddleware(req, res, next);
-    }, handleMcp);
-  } else {
-    app.post("/mcp", handleMcp);
-  }
+  app.post("/mcp", handleMcp);
 
   const methodNotAllowed = (_req: Request, res: Response) => {
     res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null });
@@ -242,8 +214,7 @@ export async function startHttpServer(config: Config): Promise<void> {
 
   await new Promise<void>((resolve) => {
     app.listen(config.port, () => {
-      console.error(`MCP listening on :${config.port}  auth=${config.requireAuth ? "on" : "OFF"}  instance=${randomUUID().slice(0, 8)}`);
-      if (!config.requireAuth && !config.onboarding.enabled) console.error("WARNING: no MCP_AUTH_TOKEN — endpoint is PUBLIC");
+      console.error(`MCP listening on :${config.port}  auth=on (static secret)  instance=${randomUUID().slice(0, 8)}`);
       resolve();
     });
   });
