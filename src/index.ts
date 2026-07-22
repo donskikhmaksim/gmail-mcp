@@ -13,8 +13,7 @@ async function main() {
   }
 
   if (config.transport === "stdio") {
-    const user = config.users[0];
-    const server = buildMcpServer(user);
+    const server = buildMcpServer(config.owner);
     const transport = new StdioServerTransport();
     await server.connect(transport);
     return;

@@ -1,18 +1,15 @@
 /**
- * MCP OAuth 2.1 authorization server that federates login to Google.
+ * Google account-linking helper for the browser dashboard.
  *
- * This server issues its OWN opaque access/refresh tokens to MCP clients
- * (Claude, etc). The Google refresh token never leaves this server — it is
- * fetched once during the /oauth/google/callback round trip and stored
- * server-side (single-tenant: one Google account per deployed instance).
+ * Design B (single-tenant): this server does NOT run a native MCP OAuth
+ * authorization server anymore. Its only job here is the "add another of MY
+ * Google accounts" flow driven from /dashboard/<secret>: bounce the browser to
+ * Google, then on the callback exchange the code, verify the email, and store
+ * the encrypted refresh token in Postgres (google_accounts). /mcp itself is
+ * gated by a single static secret (see http.ts), not by tokens minted here.
  */
-import { randomUUID, randomBytes, createHmac } from "node:crypto";
-import type { Response } from "express";
+import { randomBytes, createHmac } from "node:crypto";
 import { google } from "googleapis";
-import type { OAuthServerProvider, AuthorizationParams } from "@modelcontextprotocol/sdk/server/auth/provider.js";
-import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
-import type { OAuthClientInformationFull, OAuthTokens, OAuthTokenRevocationRequest } from "@modelcontextprotocol/sdk/shared/auth.js";
-import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import * as store from "./store.js";
 
 const GOOGLE_SCOPES = [
@@ -29,7 +26,7 @@ const GOOGLE_SCOPES = [
 export interface FederatedProviderOptions {
   googleClientId: string;
   googleClientSecret: string;
-  baseUrl: string; // e.g. https://sheets-mcp-production.up.railway.app (no trailing slash)
+  baseUrl: string; // e.g. https://gmail-mcp-production.up.railway.app (no trailing slash)
   /** When set, Google redirects to `${relayUrl}/relay/callback` instead of our own. */
   relayUrl?: string;
   /** Shared HMAC secret the relay uses to verify the `state` we sign. */
@@ -40,40 +37,15 @@ function b64url(input: Buffer): string {
   return input.toString("base64url");
 }
 
-/** Outcome of the Google redirect round-trip. */
+/** Outcome of the Google redirect round-trip (dashboard add-account flow). */
 export interface GoogleCallbackResult {
-  mode: store.PendingMode;
-  /** Where to send the browser next (MCP client redirect, or the dashboard). */
+  /** Where to send the browser next (back to the dashboard). */
   redirectUrl: string;
   /** The account that was just linked. */
   account: store.GoogleAccountMeta;
 }
 
-class PgClientsStore implements OAuthRegisteredClientsStore {
-  async getClient(clientId: string): Promise<OAuthClientInformationFull | undefined> {
-    const c = await store.getClient(clientId);
-    return c as unknown as OAuthClientInformationFull | undefined;
-  }
-
-  async registerClient(
-    client: Omit<OAuthClientInformationFull, "client_id" | "client_id_issued_at">,
-  ): Promise<OAuthClientInformationFull> {
-    const isPublicClient = client.token_endpoint_auth_method === "none";
-    const client_id = randomUUID();
-    const client_secret = isPublicClient ? undefined : randomBytes(32).toString("hex");
-    const client_id_issued_at = Math.floor(Date.now() / 1000);
-    // No expiry: registered clients (Claude) should stay valid indefinitely.
-    const client_secret_expires_at = 0;
-    const full = { ...client, client_id, client_secret, client_id_issued_at, client_secret_expires_at } as OAuthClientInformationFull;
-    await store.saveClient(full as unknown as store.StoredClient);
-    return full;
-  }
-}
-
-export class GoogleFederatedProvider implements OAuthServerProvider {
-  readonly clientsStore = new PgClientsStore();
-  readonly skipLocalPkceValidation = false;
-
+export class GoogleFederatedProvider {
   private opts: FederatedProviderOptions;
 
   constructor(opts: FederatedProviderOptions) {
@@ -107,78 +79,29 @@ export class GoogleFederatedProvider implements OAuthServerProvider {
     return `${payload}.${sig}`;
   }
 
-  /**
-   * The two flows want opposite things from Google's `prompt`:
-   *   - Connecting an MCP client, account already linked: omit `prompt` and pass
-   *     `loginHint`. Google then skips both the account chooser and the consent
-   *     screen, so linking the 2nd..Nth server is a silent redirect. Without the
-   *     hint Google cannot tell which signed-in account to use and asks anyway,
-   *     which defeats the point. It still round-trips through Google, so the
-   *     caller keeps proving who they are — only the clicks go away. Google only
-   *     returns a refresh token on the *first* grant, so handleGoogleCallback
-   *     falls back to the stored one.
-   *   - Nothing linked yet, or adding another account from the dashboard: force
-   *     `select_account consent`. The chooser is the only way to reach an
-   *     account we have not seen, and `consent` is what guarantees the refresh
-   *     token that account still needs.
-   */
-  private buildGoogleAuthUrl(
-    nonce: string,
-    opts: { forceConsent: boolean; loginHint?: string },
-  ): string {
+  private buildGoogleAuthUrl(nonce: string): string {
     return this.googleClient().generateAuthUrl({
       access_type: "offline",
-      ...(opts.forceConsent ? { prompt: "select_account consent" } : {}),
-      ...(opts.loginHint ? { login_hint: opts.loginHint } : {}),
+      // Adding an account always forces the chooser + consent: the chooser is the
+      // only way to reach an account we have not seen, and `consent` guarantees
+      // the refresh token that account still needs.
+      prompt: "select_account consent",
       scope: GOOGLE_SCOPES,
       state: this.buildState(nonce),
     });
   }
 
-  /** Step 1: MCP client hits /authorize on us. We stash the request and bounce to Google. */
-  async authorize(client: OAuthClientInformationFull, params: AuthorizationParams, res: Response): Promise<void> {
-    const nonce = b64url(randomBytes(24));
-    await store.savePendingAuth({
-      nonce,
-      clientId: client.client_id,
-      redirectUri: params.redirectUri,
-      codeChallenge: params.codeChallenge,
-      scopes: params.scopes ?? GOOGLE_SCOPES,
-      state: params.state,
-      resource: params.resource?.toString(),
-      mode: "mcp",
-    });
-    // Hint the account we already hold a token for, so Google can skip straight
-    // through. With nothing linked yet there is nothing to hint and the user has
-    // to pick and consent for real.
-    const linked = await store.listGoogleAccounts();
-    const primary = linked[0];
-    res.redirect(
-      this.buildGoogleAuthUrl(nonce, { forceConsent: !primary, loginHint: primary?.email }),
-    );
-  }
-
   /**
-   * Dashboard "add another account" flow. Not tied to an MCP client — just
-   * links a Google account to this instance, then returns the browser to the
-   * dashboard. Returns the Google consent URL to redirect the browser to.
+   * Dashboard "add another account" flow. Stashes the return URL keyed by a
+   * nonce, then returns the Google consent URL to redirect the browser to.
    */
   async startAddAccount(returnTo: string): Promise<string> {
     const nonce = b64url(randomBytes(24));
-    await store.savePendingAuth({
-      nonce,
-      clientId: "dashboard",
-      redirectUri: returnTo,
-      codeChallenge: "",
-      scopes: GOOGLE_SCOPES,
-      state: undefined,
-      resource: undefined,
-      mode: "dashboard",
-    });
-    return this.buildGoogleAuthUrl(nonce, { forceConsent: true });
+    await store.savePendingAuth({ nonce, redirectUri: returnTo });
+    return this.buildGoogleAuthUrl(nonce);
   }
 
-  /** Step 2: Google (via the relay) redirects to /oauth/google/callback -> here. */
+  /** Google (via the relay) redirects to /oauth/google/callback -> here. */
   async handleGoogleCallback(code: string, nonce: string): Promise<GoogleCallbackResult> {
     const pending = await store.takePendingAuth(nonce);
     if (!pending) throw new Error("Expired or unknown authorization request. Please try connecting again.");
@@ -190,11 +113,9 @@ export class GoogleFederatedProvider implements OAuthServerProvider {
     const { data } = await oauth2.userinfo.get();
     const email = data.email ?? "unknown";
 
-    // Google only issues a refresh token on the first grant, and the MCP connect
-    // flow deliberately no longer forces a re-consent. Reuse the stored token for
-    // this email: userinfo above came from a token Google just minted, so the
-    // account is verified — we are not handing out anything the caller has not
-    // just proved they own.
+    // Google only issues a refresh token on the first grant. Reuse the stored
+    // token for this email if none came back: userinfo above came from a token
+    // Google just minted, so the account is verified.
     let refreshToken = tokens.refresh_token ?? undefined;
     if (!refreshToken) refreshToken = await store.getRefreshTokenByEmail(email);
     if (!refreshToken) {
@@ -204,90 +125,6 @@ export class GoogleFederatedProvider implements OAuthServerProvider {
       );
     }
     const account = await store.addGoogleAccount(email, refreshToken);
-
-    // Add-account flow: return straight to the dashboard, no MCP code minted.
-    if (pending.mode === "dashboard") {
-      return { mode: "dashboard", redirectUrl: pending.redirectUri, account };
-    }
-
-    // MCP connect flow: mint our authorization code for the waiting client.
-    const mcpCode = await store.issueCode({
-      clientId: pending.clientId,
-      redirectUri: pending.redirectUri,
-      codeChallenge: pending.codeChallenge,
-      scopes: pending.scopes,
-      resource: pending.resource,
-    });
-    const redirect = new URL(pending.redirectUri);
-    redirect.searchParams.set("code", mcpCode);
-    if (pending.state) redirect.searchParams.set("state", pending.state);
-    return { mode: "mcp", redirectUrl: redirect.toString(), account };
-  }
-
-  async challengeForAuthorizationCode(_client: OAuthClientInformationFull, authorizationCode: string): Promise<string> {
-    const challenge = await store.peekCodeChallenge(authorizationCode);
-    if (!challenge) throw new Error("Invalid or expired authorization code");
-    return challenge;
-  }
-
-  async exchangeAuthorizationCode(
-    client: OAuthClientInformationFull,
-    authorizationCode: string,
-    _codeVerifier?: string,
-    redirectUri?: string,
-    resource?: URL,
-  ): Promise<OAuthTokens> {
-    const issued = await store.consumeCode(authorizationCode);
-    if (!issued) throw new Error("Invalid, expired, or already-used authorization code");
-    if (issued.clientId !== client.client_id) throw new Error("Authorization code was issued to a different client");
-    if (redirectUri && issued.redirectUri !== redirectUri) throw new Error("redirect_uri mismatch");
-
-    const tokens = await store.issueTokens(client.client_id, issued.scopes, resource?.toString() ?? issued.resource);
-    return {
-      access_token: tokens.accessToken,
-      refresh_token: tokens.refreshToken,
-      token_type: "Bearer",
-      expires_in: tokens.expiresAt - Math.floor(Date.now() / 1000),
-      scope: tokens.scopes.join(" "),
-    };
-  }
-
-  async exchangeRefreshToken(
-    client: OAuthClientInformationFull,
-    refreshToken: string,
-    scopes?: string[],
-    resource?: URL,
-  ): Promise<OAuthTokens> {
-    const existing = await store.findByRefreshToken(refreshToken);
-    if (!existing) throw new Error("Invalid refresh token");
-    if (existing.clientId !== client.client_id) throw new Error("Refresh token was issued to a different client");
-
-    await store.deleteTokenByRefresh(refreshToken);
-    const tokens = await store.issueTokens(client.client_id, scopes ?? existing.scopes, resource?.toString() ?? existing.resource);
-    return {
-      access_token: tokens.accessToken,
-      refresh_token: tokens.refreshToken,
-      token_type: "Bearer",
-      expires_in: tokens.expiresAt - Math.floor(Date.now() / 1000),
-      scope: tokens.scopes.join(" "),
-    };
-  }
-
-  async verifyAccessToken(token: string): Promise<AuthInfo> {
-    const issued = await store.findByAccessToken(token);
-    if (!issued) throw new Error("Invalid access token");
-    if (issued.expiresAt < Math.floor(Date.now() / 1000)) throw new Error("Access token expired");
-    return {
-      token,
-      clientId: issued.clientId,
-      scopes: issued.scopes,
-      expiresAt: issued.expiresAt,
-      resource: issued.resource ? new URL(issued.resource) : undefined,
-    };
-  }
-
-  async revokeToken(_client: OAuthClientInformationFull, request: OAuthTokenRevocationRequest): Promise<void> {
-    await store.deleteTokenByAccess(request.token);
-    await store.deleteTokenByRefresh(request.token);
+    return { redirectUrl: pending.redirectUri, account };
   }
 }

@@ -2,14 +2,17 @@
  * Centralised configuration. Reads everything from environment variables so the
  * server can be deployed to Railway (or anywhere) by just setting env vars.
  *
- * Model: the server has one or more USERS (selected by bearer token), and each
- * user has one or more named ACCOUNTS (selected per tool-call via the `account`
- * argument — e.g. "work" / "personal").
+ * Model: SINGLE-TENANT. One person deploys their own instance. That person may
+ * have SEVERAL of their OWN Google accounts, each selected per tool-call via the
+ * `account` argument (e.g. "work" / "personal").
  *
  * Configuration modes:
- *   - Single user, single account : GOOGLE_OAUTH_* / GOOGLE_SERVICE_ACCOUNT_*.
- *   - Single user, many accounts  : GOOGLE_ACCOUNTS = JSON object {name: creds}.
- *   - Many users (each many accts): MCP_USERS = JSON array.
+ *   - Single account : GOOGLE_OAUTH_* / GOOGLE_SERVICE_ACCOUNT_*.
+ *   - Many accounts  : GOOGLE_ACCOUNTS = JSON object {name: creds}.
+ *   - Browser flow   : accounts added via /dashboard/<secret> land in Postgres
+ *                      (google_accounts) and are served alongside any env ones.
+ *
+ * /mcp is gated by a single static secret (MCP_SECRET, or legacy MCP_AUTH_TOKEN).
  */
 
 export interface OAuthConfig {
@@ -33,26 +36,29 @@ export interface Account {
   gmailQuery?: string;
 }
 
+/**
+ * The single owner of this instance and the Google account(s) they've linked.
+ * No per-user token — access to /mcp is gated by one static MCP_SECRET instead.
+ */
 export interface User {
   /** Human-friendly label (logs only). */
   name?: string;
-  /** Bearer token that selects this user. undefined => no auth (single-user only). */
-  token?: string;
   accounts: Account[];
   defaultAccount: string;
 }
 
 /**
- * Self-service onboarding: native MCP OAuth (RFC 8414/9728) that federates
- * login to Google. Enabled only when every required piece is present;
- * otherwise the server runs env-users only.
+ * Self-service onboarding: the browser page (/dashboard/<secret>) that lets the
+ * owner link several of their own Google accounts, federating consent to Google.
+ * Enabled only when every required piece is present; otherwise the server runs
+ * env-configured accounts only.
  */
 export interface OnboardingConfig {
   enabled: boolean;
   databaseUrl?: string;
   /** Public base URL of this server, e.g. https://app.up.railway.app (no trailing slash). */
   publicBaseUrl?: string;
-  /** Shared OAuth client used for everyone's consent flow. */
+  /** Shared OAuth client used for the owner's consent flow. */
   googleClientId?: string;
   googleClientSecret?: string;
   /**
@@ -77,9 +83,14 @@ export interface OnboardingConfig {
 export interface Config {
   transport: "http" | "stdio";
   port: number;
-  /** When true, every /mcp request must carry a matching bearer token. */
-  requireAuth: boolean;
-  users: User[];
+  /**
+   * Static bearer that every /mcp request must carry (Authorization: Bearer ...).
+   * In HTTP mode this MUST be set — the server refuses to start without it. In
+   * stdio mode it is irrelevant (the transport is a local pipe).
+   */
+  mcpSecret?: string;
+  /** The single owner of this instance and their linked Google account(s). */
+  owner: User;
   onboarding: OnboardingConfig;
 }
 
@@ -178,7 +189,7 @@ function authFromFields(src: Record<string, unknown>, where: string): GoogleAuth
 }
 
 /**
- * Parses the account(s) for one user/server from a record that either:
+ * Parses the account(s) for the owner from a record that either:
  *   - has an `accounts` object: { "work": {creds}, "personal": {creds} }, or
  *   - carries a single set of credential fields inline (=> one "default" account).
  */
@@ -223,39 +234,9 @@ function parseAccounts(
   };
 }
 
-function loadMultiUser(json: string): User[] {
-  let arr: unknown;
-  try {
-    arr = JSON.parse(json);
-  } catch (err) {
-    throw new Error("MCP_USERS is not valid JSON: " + (err as Error).message);
-  }
-  if (!Array.isArray(arr) || arr.length === 0) {
-    throw new Error("MCP_USERS must be a non-empty JSON array.");
-  }
-  const users: User[] = arr.map((raw, i) => {
-    if (typeof raw !== "object" || raw === null) {
-      throw new Error(`MCP_USERS[${i}] must be an object.`);
-    }
-    const obj = raw as Record<string, unknown>;
-    const token = typeof obj.token === "string" ? obj.token.trim() : "";
-    if (!token) throw new Error(`MCP_USERS[${i}] is missing a non-empty "token".`);
-    const name = typeof obj.name === "string" ? obj.name : `user${i + 1}`;
-    const { accounts, defaultAccount } = parseAccounts(obj, `MCP_USERS[${i}] (${name})`);
-    return { name, token, accounts, defaultAccount };
-  });
-
-  const tokens = new Set(users.map((u) => u.token));
-  if (tokens.size !== users.length) {
-    throw new Error("MCP_USERS contains duplicate tokens; each user needs a unique token.");
-  }
-  return users;
-}
-
-function loadSingleUser(): User {
-  const token = process.env.MCP_AUTH_TOKEN?.trim() || undefined;
-
-  // Single user with several accounts via GOOGLE_ACCOUNTS = {name: creds}.
+/** Builds the owner (their several Google accounts) from environment variables. */
+function loadOwner(): User {
+  // Several accounts via GOOGLE_ACCOUNTS = {name: creds}.
   const accountsJson = process.env.GOOGLE_ACCOUNTS?.trim();
   if (accountsJson) {
     let parsed: unknown;
@@ -272,7 +253,7 @@ function loadSingleUser(): User {
       },
       "GOOGLE_ACCOUNTS",
     );
-    return { name: "default", token, accounts, defaultAccount };
+    return { name: "owner", accounts, defaultAccount };
   }
 
   // Legacy single account from individual env vars.
@@ -287,7 +268,7 @@ function loadSingleUser(): User {
     },
     "the server",
   );
-  return { name: "default", token, accounts, defaultAccount };
+  return { name: "owner", accounts, defaultAccount };
 }
 
 export function loadConfig(): Config {
@@ -297,30 +278,29 @@ export function loadConfig(): Config {
   const port = Number(process.env.PORT ?? 3000);
 
   const onboarding = loadOnboarding();
+  const mcpSecret = process.env.MCP_SECRET?.trim() || process.env.MCP_AUTH_TOKEN?.trim() || undefined;
 
-  let users: User[];
+  let owner: User;
   try {
-    if (process.env.MCP_USERS && process.env.MCP_USERS.trim()) {
-      users = loadMultiUser(process.env.MCP_USERS.trim());
-    } else {
-      users = [loadSingleUser()];
-    }
+    owner = loadOwner();
   } catch (err) {
-    // With onboarding enabled, env users are optional — everyone comes from the
-    // database instead, so an absence of env credentials is fine.
+    // With onboarding enabled, env accounts are optional — the owner links their
+    // Google accounts through the browser dashboard instead, so an absence of env
+    // credentials is fine (accounts come from Postgres at request time).
     if (onboarding.enabled) {
-      users = [];
+      owner = { name: "owner", accounts: [], defaultAccount: "" };
     } else {
       throw new Error(
         (err as Error).message +
           "\n\nSet ONE of:\n" +
-          "  Single account : GOOGLE_OAUTH_CLIENT_ID / _SECRET / _REFRESH_TOKEN (+ optional MCP_AUTH_TOKEN)\n" +
-          '  Many accounts  : GOOGLE_ACCOUNTS={"work":{...},"personal":{...}} (+ optional MCP_AUTH_TOKEN)\n' +
-          '  Many users     : MCP_USERS=[{"token":"...","accounts":{"work":{...},"personal":{...}}}, ...]',
+          "  Single account : GOOGLE_OAUTH_CLIENT_ID / _SECRET / _REFRESH_TOKEN\n" +
+          '  Many accounts  : GOOGLE_ACCOUNTS={"work":{...},"personal":{...}}\n' +
+          "  Browser flow   : enable onboarding (DATABASE_URL + PUBLIC_BASE_URL +\n" +
+          "                   ONBOARDING_GOOGLE_CLIENT_ID/_SECRET + TOKEN_ENC_KEY +\n" +
+          "                   DASHBOARD_SECRET) and add accounts at /dashboard/<secret>.",
       );
     }
   }
 
-  const requireAuth = onboarding.enabled || users.length > 1 || users.some((u) => !!u.token);
-  return { transport, port, requireAuth, users, onboarding };
+  return { transport, port, mcpSecret, owner, onboarding };
 }
