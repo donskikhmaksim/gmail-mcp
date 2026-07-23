@@ -1,0 +1,49 @@
+name: Sync from upstream
+
+# Keeps a self-hoster's FORK current with the maintainer's repo, so their
+# Railway instance auto-redeploys whenever the maintainer ships. The maintainer
+# pushes once to their prod; within ~5 min every fork fast-forwards and Railway
+# (watching each fork's branch with "Deploy on push") rebuilds it.
+#
+# Runs in forks ONLY (guarded below) and never touches your data or secrets —
+# it only fast-forwards code. If a fork has local commits that diverge from
+# upstream, it skips (never force-overwrites your changes).
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"    # every 5 minutes
+  workflow_dispatch: {}        # manual "Sync now" button in the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    # Do nothing in the upstream repo itself; only forks need syncing.
+    if: github.repository != 'donskikhmaksim/gmail-mcp'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fast-forward from upstream
+        run: |
+          set -euo pipefail
+          UPSTREAM="https://github.com/donskikhmaksim/gmail-mcp.git"
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM"
+          git fetch --quiet upstream "$BRANCH"
+          if git merge-base --is-ancestor "upstream/$BRANCH" HEAD; then
+            echo "Already up to date with upstream/$BRANCH."
+            exit 0
+          fi
+          if git merge --ff-only "upstream/$BRANCH"; then
+            git push origin "$BRANCH"
+            echo "Synced $BRANCH from upstream — Railway will redeploy."
+          else
+            echo "::warning::This fork has diverged from upstream (local commits); \
+skipping auto-sync. Resolve manually to resume automatic updates."
+          fi
