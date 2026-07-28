@@ -12,6 +12,12 @@ export interface GoogleClients {
   gmail: gmail_v1.Gmail;
   drive: drive_v3.Drive;
   docs: docs_v1.Docs;
+  /**
+   * A fresh OAuth access token for raw REST calls the googleapis client cannot
+   * make on our behalf — currently the resumable upload handshake, which has to
+   * be issued by hand so the client can send the bytes itself.
+   */
+  accessToken(): Promise<string>;
 }
 
 function buildAuthClient(auth: GoogleAuthConfig) {
@@ -32,5 +38,12 @@ export function createGoogleClients(authConfig: GoogleAuthConfig): GoogleClients
     gmail: google.gmail({ version: "v1", auth }),
     drive: google.drive({ version: "v3", auth }),
     docs: google.docs({ version: "v1", auth }),
+    async accessToken(): Promise<string> {
+      // OAuth2Client resolves to { token }, GoogleAuth to a plain string.
+      const t = await auth.getAccessToken();
+      const token = typeof t === "string" ? t : t?.token;
+      if (!token) throw new Error("Could not obtain a Google access token for this account.");
+      return token;
+    },
   };
 }

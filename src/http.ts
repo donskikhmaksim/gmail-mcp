@@ -14,6 +14,8 @@ import {
   renameAccount,
 } from "./store.js";
 import { renderDashboard } from "./dashboard.js";
+import { initDownloads, resolveDownloadLink } from "./downloads.js";
+import { buildUserClients } from "./accounts.js";
 
 const JSONRPC_UNAUTHORIZED = {
   jsonrpc: "2.0" as const,
@@ -66,6 +68,15 @@ async function userFromGoogleAccounts(config: Config): Promise<User | null> {
   };
 }
 
+/**
+ * Content-Disposition that survives non-ASCII names: a sanitised fallback for
+ * old clients plus the RFC 5987 UTF-8 form modern ones prefer.
+ */
+function contentDisposition(name: string): string {
+  const ascii = name.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+
 /** Constant-time compare for the dashboard path secret. */
 function secretMatches(provided: string, expected: string): boolean {
   const a = Buffer.from(provided);
@@ -87,6 +98,48 @@ export async function startHttpServer(config: Config): Promise<void> {
     res.json({ status: "ok", endpoint: "/mcp" });
   });
   app.get("/health", (_req, res) => res.json({ status: "ok" }));
+
+  initDownloads(config.onboarding.publicBaseUrl);
+
+  // ---- Temporary attachment links minted by gmail_get_download_url ----
+  // Deliberately unauthenticated: the unguessable, expiring token in the path
+  // IS the credential, and it authorises exactly one attachment. See downloads.ts.
+  app.get("/dl/:token", async (req: Request, res: Response) => {
+    const target = await resolveDownloadLink(String(req.params.token));
+    if (!target) {
+      res.status(404).type("text/plain").send("This download link is invalid or has expired.");
+      return;
+    }
+    const user = (await userFromGoogleAccounts(config)) ?? config.users[0] ?? null;
+    if (!user) {
+      res.status(503).type("text/plain").send("No Google account is linked to this server any more.");
+      return;
+    }
+    try {
+      const g = buildUserClients(user).resolve(target.account);
+      // Gmail has no streaming download — the API hands back base64 in JSON,
+      // so the whole attachment necessarily passes through memory here.
+      const att = await g.gmail.users.messages.attachments.get({
+        userId: "me",
+        messageId: target.messageId,
+        id: target.attachmentId,
+      });
+      const buf = Buffer.from(att.data.data ?? "", "base64url");
+      res.setHeader("Content-Type", target.mimeType);
+      res.setHeader("Content-Disposition", contentDisposition(target.name));
+      res.setHeader("Content-Length", String(buf.length));
+      // The link is a secret; keep proxies and shared caches out of it.
+      res.setHeader("Cache-Control", "private, no-store");
+      res.end(buf);
+    } catch (err) {
+      console.error("Attachment download error:", err);
+      if (!res.headersSent) {
+        res.status(502).type("text/plain").send("Could not fetch this attachment from Gmail.");
+      } else {
+        res.destroy();
+      }
+    }
+  });
 
   let provider: GoogleFederatedProvider | null = null;
 

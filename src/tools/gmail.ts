@@ -10,9 +10,38 @@ import { ok, fail, guard, isTextual, mapWithLimit } from "../util.js";
 import { accountField, type UserClients } from "../accounts.js";
 import type { GoogleClients } from "../google.js";
 import { documentToPlainText } from "./docs.js";
+import {
+  issueDownloadLink,
+  downloadsAvailable,
+  DEFAULT_TTL_MINUTES,
+  MAX_TTL_MINUTES,
+} from "../downloads.js";
 interface PgStore { addSnooze(args: { userToken: string; accountName: string; messageId: string; subject?: string; unsnoozeAt: Date }): Promise<void>; }
 
 const GOOGLE_DOC_MIME = "application/vnd.google-apps.document";
+
+/** Drive's upload host — a big attachment is staged there before it is mailed. */
+const DRIVE_UPLOAD_ENDPOINT = "https://www.googleapis.com/upload/drive/v3/files";
+
+/** Where client-uploaded attachments are staged, so they are easy to find and clean up. */
+const UPLOAD_FOLDER_NAME = "Gmail uploads (staged)";
+
+/** Finds (or creates) the staging folder for client-side attachment uploads. */
+async function ensureUploadFolder(g: GoogleClients): Promise<string> {
+  const found = await g.drive.files.list({
+    q: `name='${UPLOAD_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+    fields: "files(id)",
+    pageSize: 1,
+  });
+  const existing = found.data.files?.[0]?.id;
+  if (existing) return existing;
+  const created = await g.drive.files.create({
+    requestBody: { name: UPLOAD_FOLDER_NAME, mimeType: "application/vnd.google-apps.folder" },
+    fields: "id",
+  });
+  if (!created.data.id) throw new Error(`Could not create the "${UPLOAD_FOLDER_NAME}" folder in Drive.`);
+  return created.data.id;
+}
 
 /** Lists attachment parts (filename + id + size) in a message payload. */
 function collectAttachments(
@@ -1409,6 +1438,291 @@ export function registerGmailTools(
         summary: `📧 Exported ${good.length}/${messages.length} message(s) of thread ${threadId} as .eml originals to Drive`,
         folderId: parentId ?? null,
         files,
+      });
+    }),
+  );
+
+  // ---- gmail_get_download_url (array) --------------------------------------
+
+  server.registerTool(
+    "gmail_get_download_url",
+    {
+      title: "Get a temporary link to an attachment",
+      description:
+        "Return a temporary download link per attachment so the client (phone, browser, script) can fetch the " +
+        "bytes directly, instead of gmail_get_attachment inlining them into this conversation. Use it for anything " +
+        "large or binary, or whenever the user wants to keep the file rather than read its content here. " +
+        "Get `attachmentId` from gmail_get_message; filename and type are looked up automatically when omitted. " +
+        "The link IS the credential: anyone holding it can fetch that one attachment until it expires " +
+        `(default ${DEFAULT_TTL_MINUTES} minutes, max ${MAX_TTL_MINUTES / 60} hours), so pass it only to the person who ` +
+        "asked. It grants access to that single attachment — not to the message, and not to the mailbox.",
+      inputSchema: {
+        account,
+        items: z
+          .array(
+            z.object({
+              messageId: z.string(),
+              attachmentId: z.string(),
+              filename: z.string().optional().describe("Overrides the name the file is saved under."),
+              mimeType: z.string().optional(),
+            }),
+          )
+          .min(1),
+        ttlMinutes: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_TTL_MINUTES)
+          .optional()
+          .describe(`How long each link stays valid. Default ${DEFAULT_TTL_MINUTES} minutes.`),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    guard(async ({ account, items, ttlMinutes }) => {
+      if (!downloadsAvailable()) {
+        return fail(
+          "Download links are unavailable: this server does not know its own public URL. " +
+            "Set PUBLIC_BASE_URL (on Railway, turn on public networking). " +
+            "gmail_get_attachment still works for small attachments.",
+        );
+      }
+      const g = clients.resolve(account);
+      const results = await mapWithLimit(items, async (item) => {
+        try {
+          let { filename, mimeType } = item;
+          let size: number | undefined;
+          // Fill in whatever the caller did not pass by looking at the message itself.
+          if (!filename || !mimeType) {
+            const msg = await g.gmail.users.messages.get({
+              userId: "me",
+              id: item.messageId,
+              format: "full",
+            });
+            const found = collectAttachments(msg.data.payload).find(
+              (a) => a.attachmentId === item.attachmentId,
+            );
+            filename = filename ?? found?.filename;
+            mimeType = mimeType ?? found?.mimeType;
+            size = found?.size;
+          }
+          const { url, expiresAt } = await issueDownloadLink(
+            {
+              account: account ?? clients.defaultName,
+              messageId: item.messageId,
+              attachmentId: item.attachmentId,
+              name: filename || "attachment",
+              mimeType: mimeType ?? "application/octet-stream",
+              size,
+            },
+            ttlMinutes ?? DEFAULT_TTL_MINUTES,
+          );
+          return {
+            messageId: item.messageId,
+            attachmentId: item.attachmentId,
+            filename: filename || "attachment",
+            mimeType: mimeType ?? "application/octet-stream",
+            bytes: size ?? null,
+            downloadUrl: url,
+            expiresAt,
+          };
+        } catch (e) {
+          return {
+            messageId: item.messageId,
+            attachmentId: item.attachmentId,
+            error: String(e instanceof Error ? e.message : e),
+          };
+        }
+      });
+      const good = results.filter((r) => !("error" in r));
+      return ok({
+        summary: `🔗 Built ${good.length}/${items.length} download link(s)`,
+        results,
+        note: "Each link works without any further sign-in until it expires — treat it as a password for that one file.",
+      });
+    }),
+  );
+
+  // ---- gmail_create_upload_session / gmail_confirm_upload -------------------
+
+  server.registerTool(
+    "gmail_create_upload_session",
+    {
+      title: "Start a direct upload for a big attachment",
+      description:
+        "Open a resumable upload session so the client (phone, browser, script) can send a big file's bytes " +
+        "straight to Google, then attach it to an email — instead of squeezing it through this conversation as " +
+        "content_base64, which is only practical below ~1MB. " +
+        "The bytes go to Drive, not to Gmail: Gmail's own upload endpoint only accepts a complete MIME message, " +
+        "so it cannot take a bare file from a client. The file lands in a '" +
+        UPLOAD_FOLDER_NAME +
+        "' folder in your Drive and its id comes back immediately, so you can compose the mail before the upload " +
+        "even finishes. " +
+        "Flow: call this → client PUTs the bytes to uploadUrl → (optional) gmail_confirm_upload → " +
+        "gmail_send/gmail_reply/gmail_create_draft with attachments: [{driveFileId}]. " +
+        "The uploadUrl carries its own authorisation — treat it as a secret; it stays valid for about a week. " +
+        "The staged file stays in Drive afterwards; delete it there if you do not want a copy.",
+      inputSchema: {
+        account,
+        files: z
+          .array(
+            z.object({
+              name: z.string().describe("File name as it should appear on the email, e.g. 'contract.pdf'."),
+              mimeType: z
+                .string()
+                .optional()
+                .describe("Content type the client will send. Default octet-stream."),
+              sizeBytes: z
+                .number()
+                .int()
+                .positive()
+                .optional()
+                .describe("Total size in bytes, if known — lets Google reject an oversized upload up front."),
+            }),
+          )
+          .min(1)
+          .describe("Array of files to open upload sessions for."),
+      },
+      annotations: { destructiveHint: false },
+    },
+    guard(async ({ account, files }) => {
+      const g = clients.resolve(account);
+      const token = await g.accessToken();
+      const folderId = await ensureUploadFolder(g);
+      const results = await mapWithLimit(files, async ({ name, mimeType, sizeBytes }) => {
+        try {
+          const contentType = mimeType ?? "application/octet-stream";
+          // Create the (empty) file first so its id is known up front — the model
+          // can then write the email without waiting for the bytes to arrive.
+          const placeholder = await g.drive.files.create({
+            requestBody: {
+              name,
+              parents: [folderId],
+              appProperties: { gmailMcpUpload: "1" },
+            },
+            fields: "id",
+          });
+          const fileId = placeholder.data.id;
+          if (!fileId) throw new Error("Drive did not return a file id for the staged upload.");
+
+          const res = await fetch(
+            `${DRIVE_UPLOAD_ENDPOINT}/${encodeURIComponent(fileId)}?uploadType=resumable&fields=id,name,size`,
+            {
+              method: "PATCH",
+              headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Upload-Content-Type": contentType,
+                ...(sizeBytes ? { "X-Upload-Content-Length": String(sizeBytes) } : {}),
+              },
+              body: "{}",
+            },
+          );
+          if (!res.ok) {
+            return { name, error: `Google refused the session (HTTP ${res.status}): ${(await res.text()).slice(0, 500)}` };
+          }
+          const uploadUrl = res.headers.get("location");
+          if (!uploadUrl) {
+            return { name, error: "Google accepted the request but returned no Location header (no session URI)." };
+          }
+          return {
+            name,
+            driveFileId: fileId,
+            uploadUrl,
+            mimeType: contentType,
+            sizeBytes: sizeBytes ?? null,
+            howTo:
+              `PUT ${uploadUrl} with header "Content-Type: ${contentType}"` +
+              (sizeBytes ? ` and "Content-Length: ${sizeBytes}"` : "") +
+              ", body = the raw file bytes.",
+            thenSend: `Attach it with attachments: [{"driveFileId": "${fileId}"}].`,
+          };
+        } catch (e) {
+          return { name, error: String(e instanceof Error ? e.message : e) };
+        }
+      });
+      const good = results.filter((r) => !("error" in r));
+      return ok({
+        summary: `🚀 Opened ${good.length}/${files.length} upload session(s)`,
+        results,
+        note:
+          "Gmail will only carry the attachment once the client has PUT the bytes — a message sent before that " +
+          "would go out with an empty file. Check with gmail_confirm_upload when in doubt. " +
+          "Gmail caps a whole message at 25 MB.",
+      });
+    }),
+  );
+
+  server.registerTool(
+    "gmail_confirm_upload",
+    {
+      title: "Check a direct upload",
+      description:
+        "Ask Google how an upload started by gmail_create_upload_session is doing. Reports `complete` (the file is " +
+        "ready to attach), `in_progress` (how many bytes arrived, so the client knows where to resume), or " +
+        "`expired` (session gone — open a new one). Uploads nothing itself.",
+      inputSchema: {
+        uploads: z
+          .array(
+            z.object({
+              uploadUrl: z.string().describe("Session URI returned by gmail_create_upload_session."),
+              sizeBytes: z
+                .number()
+                .int()
+                .positive()
+                .optional()
+                .describe("Total size, if known — makes the status query exact."),
+            }),
+          )
+          .min(1),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    guard(async ({ uploads }) => {
+      const results = await mapWithLimit(uploads, async ({ uploadUrl, sizeBytes }) => {
+        try {
+          // An empty PUT with "bytes */total" asks for status instead of sending
+          // content; the session URI carries its own authorisation.
+          const res = await fetch(uploadUrl, {
+            method: "PUT",
+            headers: { "Content-Range": `bytes */${sizeBytes ?? "*"}` },
+          });
+          if (res.status === 200 || res.status === 201) {
+            let file: { id?: string; name?: string; size?: string } = {};
+            try {
+              file = JSON.parse(await res.text());
+            } catch {
+              /* Google answered without a usable body — the id simply isn't there. */
+            }
+            return {
+              uploadUrl,
+              status: "complete" as const,
+              driveFileId: file.id ?? null,
+              name: file.name ?? null,
+              size: file.size ?? null,
+            };
+          }
+          if (res.status === 308) {
+            // "Range: bytes=0-<last>" — absent when nothing has arrived yet.
+            const range = res.headers.get("range");
+            const last = range ? Number(range.split("-")[1]) : NaN;
+            const bytesReceived = Number.isFinite(last) ? last + 1 : 0;
+            return { uploadUrl, status: "in_progress" as const, bytesReceived, resumeFrom: bytesReceived };
+          }
+          if (res.status === 404 || res.status === 410) {
+            return {
+              uploadUrl,
+              status: "expired" as const,
+              error: "Google no longer knows this session (expired, cancelled, or finished long ago). Open a new one.",
+            };
+          }
+          return { uploadUrl, error: `Unexpected status ${res.status}: ${(await res.text()).slice(0, 500)}` };
+        } catch (e) {
+          return { uploadUrl, error: String(e instanceof Error ? e.message : e) };
+        }
+      });
+      return ok({
+        summary: `📶 Checked ${uploads.length} upload session(s)`,
+        results,
       });
     }),
   );
