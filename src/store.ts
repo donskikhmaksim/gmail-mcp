@@ -120,6 +120,42 @@ export async function ensureSchema(): Promise<void> {
       created_at    TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  // gmail_snooze: archived now, waiting to be un-archived at wake_at. user_token
+  // is nullable — onboarded (native-OAuth) deployments have no static per-user
+  // token, only an account_label, which is always present and is what the
+  // scheduler actually keys off.
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS email_snoozes (
+      id            BIGSERIAL PRIMARY KEY,
+      user_token    TEXT,
+      account_label TEXT NOT NULL,
+      message_id    TEXT NOT NULL,
+      subject       TEXT,
+      wake_at       TIMESTAMPTZ NOT NULL,
+      status        TEXT NOT NULL DEFAULT 'pending',
+      error         TEXT,
+      created_at    TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  // gmail_schedule_send: the raw RFC 822 message is built and validated (incl.
+  // resolving attachments) at schedule time, so the scheduler's job at send_at
+  // is just "hand this exact raw string to Gmail" — nothing left to fail on
+  // account of stale Drive files or a since-changed body.
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS scheduled_sends (
+      id              BIGSERIAL PRIMARY KEY,
+      user_token      TEXT,
+      account_label   TEXT NOT NULL,
+      raw_message     TEXT NOT NULL,
+      to_preview      TEXT NOT NULL,
+      subject_preview TEXT NOT NULL,
+      send_at         TIMESTAMPTZ NOT NULL,
+      status          TEXT NOT NULL DEFAULT 'pending',
+      error           TEXT,
+      sent_message_id TEXT,
+      created_at      TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
 }
 
 // ---- Download links ----
@@ -465,6 +501,186 @@ export async function deleteTokenByRefresh(refreshToken: string): Promise<void> 
 export async function deleteTokenByAccess(accessToken: string): Promise<void> {
   const p = getPool();
   await p.query(`DELETE FROM oauth_tokens WHERE access_token = $1`, [accessToken]);
+}
+
+// ---- Snoozed emails (wake up + return to Inbox at wake_at) ----
+
+export interface SnoozeRow {
+  id: number;
+  userToken: string | null;
+  accountLabel: string;
+  messageId: string;
+  subject: string | null;
+  wakeAt: Date;
+}
+
+export async function addSnooze(row: {
+  userToken: string | null;
+  accountLabel: string;
+  messageId: string;
+  subject?: string;
+  wakeAt: Date;
+}): Promise<void> {
+  const p = getPool();
+  await p.query(
+    `INSERT INTO email_snoozes (user_token, account_label, message_id, subject, wake_at)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [row.userToken, row.accountLabel, row.messageId, row.subject ?? null, row.wakeAt],
+  );
+}
+
+/** All still-pending snoozes for an account, soonest first — for a future "list snoozed" tool. */
+export async function listPendingSnoozes(accountLabel: string): Promise<SnoozeRow[]> {
+  const p = getPool();
+  const res = await p.query(
+    `SELECT * FROM email_snoozes WHERE account_label = $1 AND status = 'pending' ORDER BY wake_at ASC`,
+    [accountLabel],
+  );
+  return res.rows.map(rowToSnooze);
+}
+
+/**
+ * Atomically claims every snooze whose wake_at has arrived, flipping it to
+ * 'processing' in the same statement — so two overlapping poller ticks (or
+ * two server instances) can never both act on the same row.
+ */
+export async function claimDueSnoozes(now: Date): Promise<SnoozeRow[]> {
+  const p = getPool();
+  const res = await p.query(
+    `UPDATE email_snoozes SET status = 'processing'
+     WHERE id IN (SELECT id FROM email_snoozes WHERE status = 'pending' AND wake_at <= $1 FOR UPDATE SKIP LOCKED)
+     RETURNING *`,
+    [now],
+  );
+  return res.rows.map(rowToSnooze);
+}
+
+export async function markSnoozeDone(id: number): Promise<void> {
+  const p = getPool();
+  await p.query(`UPDATE email_snoozes SET status = 'done' WHERE id = $1`, [id]);
+}
+
+export async function markSnoozeFailed(id: number, error: string): Promise<void> {
+  const p = getPool();
+  // Back to 'pending' (not a terminal 'failed') so the next tick retries —
+  // transient Google errors (rate limit, blip) shouldn't strand a snooze forever.
+  await p.query(`UPDATE email_snoozes SET status = 'pending', error = $2 WHERE id = $1`, [id, error]);
+}
+
+function rowToSnooze(row: {
+  id: number;
+  user_token: string | null;
+  account_label: string;
+  message_id: string;
+  subject: string | null;
+  wake_at: Date;
+}): SnoozeRow {
+  return {
+    id: Number(row.id),
+    userToken: row.user_token,
+    accountLabel: row.account_label,
+    messageId: row.message_id,
+    subject: row.subject,
+    wakeAt: new Date(row.wake_at),
+  };
+}
+
+// ---- Scheduled sends (send this exact raw message at send_at) ----
+
+export interface ScheduledSendRow {
+  id: number;
+  userToken: string | null;
+  accountLabel: string;
+  rawMessage: string;
+  toPreview: string;
+  subjectPreview: string;
+  sendAt: Date;
+}
+
+export async function addScheduledSend(row: {
+  userToken: string | null;
+  accountLabel: string;
+  rawMessage: string;
+  toPreview: string;
+  subjectPreview: string;
+  sendAt: Date;
+}): Promise<number> {
+  const p = getPool();
+  const res = await p.query(
+    `INSERT INTO scheduled_sends (user_token, account_label, raw_message, to_preview, subject_preview, send_at)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+    [row.userToken, row.accountLabel, row.rawMessage, row.toPreview, row.subjectPreview, row.sendAt],
+  );
+  return Number(res.rows[0].id);
+}
+
+/** Pending scheduled sends for an account, soonest first. */
+export async function listScheduledSends(accountLabel: string): Promise<ScheduledSendRow[]> {
+  const p = getPool();
+  const res = await p.query(
+    `SELECT * FROM scheduled_sends WHERE account_label = $1 AND status = 'pending' ORDER BY send_at ASC`,
+    [accountLabel],
+  );
+  return res.rows.map(rowToScheduledSend);
+}
+
+/** Cancels a still-pending send. Returns false if it was already sent, canceled, or unknown. */
+export async function cancelScheduledSend(id: number, accountLabel: string): Promise<boolean> {
+  const p = getPool();
+  const res = await p.query(
+    `UPDATE scheduled_sends SET status = 'canceled'
+     WHERE id = $1 AND account_label = $2 AND status = 'pending'`,
+    [id, accountLabel],
+  );
+  return (res.rowCount ?? 0) > 0;
+}
+
+/** Same claim-and-lock pattern as claimDueSnoozes — see its comment. */
+export async function claimDueSends(now: Date): Promise<ScheduledSendRow[]> {
+  const p = getPool();
+  const res = await p.query(
+    `UPDATE scheduled_sends SET status = 'sending'
+     WHERE id IN (SELECT id FROM scheduled_sends WHERE status = 'pending' AND send_at <= $1 FOR UPDATE SKIP LOCKED)
+     RETURNING *`,
+    [now],
+  );
+  return res.rows.map(rowToScheduledSend);
+}
+
+export async function markSendSent(id: number, sentMessageId: string): Promise<void> {
+  const p = getPool();
+  await p.query(`UPDATE scheduled_sends SET status = 'sent', sent_message_id = $2 WHERE id = $1`, [
+    id,
+    sentMessageId,
+  ]);
+}
+
+export async function markSendFailed(id: number, error: string): Promise<void> {
+  const p = getPool();
+  // Unlike a snoozed email (safe to retry — modify() is idempotent), retrying a
+  // send risks a DUPLICATE email if the first attempt actually went through but
+  // the response was lost. Fail terminally and surface the error instead.
+  await p.query(`UPDATE scheduled_sends SET status = 'failed', error = $2 WHERE id = $1`, [id, error]);
+}
+
+function rowToScheduledSend(row: {
+  id: number;
+  user_token: string | null;
+  account_label: string;
+  raw_message: string;
+  to_preview: string;
+  subject_preview: string;
+  send_at: Date;
+}): ScheduledSendRow {
+  return {
+    id: Number(row.id),
+    userToken: row.user_token,
+    accountLabel: row.account_label,
+    rawMessage: row.raw_message,
+    toPreview: row.to_preview,
+    subjectPreview: row.subject_preview,
+    sendAt: new Date(row.send_at),
+  };
 }
 
 export { randomUUID };

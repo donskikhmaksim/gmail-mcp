@@ -16,7 +16,27 @@ import {
   DEFAULT_TTL_MINUTES,
   MAX_TTL_MINUTES,
 } from "../downloads.js";
-interface PgStore { addSnooze(args: { userToken: string; accountName: string; messageId: string; subject?: string; unsnoozeAt: Date }): Promise<void>; }
+interface PgStore {
+  addSnooze(args: {
+    userToken: string | null;
+    accountName: string;
+    messageId: string;
+    subject?: string;
+    unsnoozeAt: Date;
+  }): Promise<void>;
+  addScheduledSend(args: {
+    userToken: string | null;
+    accountName: string;
+    rawMessage: string;
+    toPreview: string;
+    subjectPreview: string;
+    sendAt: Date;
+  }): Promise<number>;
+  listScheduledSends(
+    accountName: string,
+  ): Promise<{ id: number; toPreview: string; subjectPreview: string; sendAt: Date }[]>;
+  cancelScheduledSend(id: number, accountName: string): Promise<boolean>;
+}
 
 const GOOGLE_DOC_MIME = "application/vnd.google-apps.document";
 
@@ -932,8 +952,9 @@ export function registerGmailTools(
       title: "Snooze emails",
       description:
         "Archive one or more messages now and automatically return them to the Inbox at a specified time " +
-        "(requires DATABASE_URL — Railway Postgres). Without Postgres the messages are still archived " +
-        "but auto-restore is unavailable. " +
+        "(requires DATABASE_URL — Railway Postgres; a background check runs every minute). Without Postgres " +
+        "the messages are still archived but auto-restore is unavailable — the result's `persisted` field " +
+        "says which happened, so this is never silently false advertising. " +
         "Pass `unsnoozeAt` as an ISO 8601 datetime, e.g. '2024-01-15T09:00:00'.",
       inputSchema: {
         account,
@@ -966,7 +987,10 @@ export function registerGmailTools(
               requestBody: { removeLabelIds: ["INBOX"] },
             });
             const { store, userToken } = snoozeCtx;
-            if (store && userToken) {
+            // userToken is null for onboarded (native-OAuth) deployments — that's
+            // expected, not a reason to skip persisting; accountName alone is
+            // enough for the scheduler to find the right Google account later.
+            if (store) {
               const accountName = account ?? clients.defaultName;
               await store.addSnooze({
                 userToken,
@@ -975,7 +999,11 @@ export function registerGmailTools(
                 unsnoozeAt,
               });
             }
-            return { id: item.messageId, unsnoozeAt: unsnoozeAt.toISOString() };
+            return {
+              id: item.messageId,
+              unsnoozeAt: unsnoozeAt.toISOString(),
+              persisted: !!store,
+            };
           } catch (e) {
             return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
           }
@@ -983,6 +1011,141 @@ export function registerGmailTools(
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
         summary: `⏰ Snoozed ${ok_.length}/${items.length} message(s)`,
+        results,
+      });
+    }),
+  );
+
+  // ---- gmail_schedule_send / gmail_list_scheduled_sends / gmail_cancel_scheduled_send ----
+  //
+  // Gmail's own API has no "send later" parameter — verified against the
+  // official users.messages.send reference, which takes no delay/schedule
+  // field at all. This is this server holding the message itself and sending
+  // it for real, on time, from its own always-on process; Gmail never knows it
+  // was ever delayed.
+
+  server.registerTool(
+    "gmail_schedule_send",
+    {
+      title: "Schedule an email to send later",
+      description:
+        "Compose one or more emails now, but hold them and actually send each at its own `sendAt` time " +
+        "(requires DATABASE_URL — Railway Postgres; a background check runs every minute, so delivery can be up " +
+        "to ~1 minute late, never early). Gmail itself has no delayed-send API — this works because the message " +
+        "is fully built and validated right now (attachments resolved, addresses checked) and stored ready to go, " +
+        "so nothing can fail at send time except Gmail itself being briefly down. " +
+        "Use gmail_list_scheduled_sends to check what's pending and gmail_cancel_scheduled_send to pull one back " +
+        "before it fires. Without DATABASE_URL this tool cannot work at all — say so plainly rather than pretending.",
+      inputSchema: {
+        account,
+        messages: z
+          .array(
+            z.object({
+              to: z.string().describe("Recipient(s), comma-separated."),
+              subject: z.string(),
+              body: z.string(),
+              cc: z.string().optional(),
+              bcc: z.string().optional(),
+              attachments: attachmentsField,
+              sendAt: z.string().describe("ISO 8601 datetime to send at, e.g. '2026-07-28T08:00:00-07:00'. Must be in the future."),
+            }),
+          )
+          .min(1),
+      },
+    },
+    guard(async ({ account, messages }) => {
+      const { store, userToken } = snoozeCtx;
+      if (!store) {
+        return fail(
+          "Scheduled send requires DATABASE_URL (Railway Postgres) to be configured on this server — " +
+            "without it there is nowhere to hold the message until sendAt. Use gmail_send for immediate delivery.",
+        );
+      }
+      const g = clients.resolve(account);
+      const accountName = account ?? clients.defaultName;
+      const results = await mapWithLimit(messages, async (msg) => {
+        try {
+          const sendAt = new Date(msg.sendAt);
+          if (isNaN(sendAt.getTime())) {
+            return { to: msg.to, subject: msg.subject, error: `Cannot parse date "${msg.sendAt}". Use ISO 8601.` };
+          }
+          if (sendAt <= new Date()) {
+            return { to: msg.to, subject: msg.subject, error: `sendAt "${msg.sendAt}" is already in the past.` };
+          }
+          // Resolve attachments and build the raw MIME NOW, so a bad driveFileId
+          // or an over-quota Drive fails this call instead of silently rotting
+          // in the queue until sendAt.
+          const atts = msg.attachments?.length ? await resolveAttachments(g, msg.attachments) : undefined;
+          const raw = buildRawEmail({ to: msg.to, subject: msg.subject, body: msg.body, cc: msg.cc, bcc: msg.bcc, attachments: atts });
+          const id = await store.addScheduledSend({
+            userToken,
+            accountName,
+            rawMessage: raw,
+            toPreview: msg.to,
+            subjectPreview: msg.subject,
+            sendAt,
+          });
+          return { id, to: msg.to, subject: msg.subject, sendAt: sendAt.toISOString() };
+        } catch (e) {
+          return { to: msg.to, subject: msg.subject, error: String(e instanceof Error ? e.message : e) };
+        }
+      });
+      const ok_ = results.filter((r) => !("error" in r));
+      return ok({
+        summary: `🕗 Scheduled ${ok_.length}/${messages.length} message(s)`,
+        results,
+      });
+    }),
+  );
+
+  server.registerTool(
+    "gmail_list_scheduled_sends",
+    {
+      title: "List emails waiting to be sent",
+      description: "List messages queued by gmail_schedule_send that have not gone out (or been canceled) yet, soonest first.",
+      inputSchema: { account },
+      annotations: { readOnlyHint: true },
+    },
+    guard(async ({ account }) => {
+      const { store } = snoozeCtx;
+      if (!store) {
+        return ok({ summary: "No scheduled sends — DATABASE_URL is not configured, so nothing can be queued.", results: [] });
+      }
+      const accountName = account ?? clients.defaultName;
+      const rows = await store.listScheduledSends(accountName);
+      return ok({
+        summary: `🕗 ${rows.length} message(s) waiting to send`,
+        results: rows.map((r) => ({ id: r.id, to: r.toPreview, subject: r.subjectPreview, sendAt: r.sendAt.toISOString() })),
+      });
+    }),
+  );
+
+  server.registerTool(
+    "gmail_cancel_scheduled_send",
+    {
+      title: "Cancel a scheduled email",
+      description: "Cancel one or more messages queued by gmail_schedule_send, as long as they have not already gone out.",
+      inputSchema: {
+        account,
+        ids: z.array(z.number().int()).min(1).describe("Ids from gmail_list_scheduled_sends."),
+      },
+      annotations: { destructiveHint: true },
+    },
+    guard(async ({ account, ids }) => {
+      const { store } = snoozeCtx;
+      if (!store) {
+        return fail("DATABASE_URL is not configured, so there is nothing scheduled to cancel.");
+      }
+      const accountName = account ?? clients.defaultName;
+      const results = await mapWithLimit(ids, async (id) => {
+        const canceled = await store.cancelScheduledSend(id, accountName);
+        return canceled
+          ? { id, canceled: true as const }
+          : { id, canceled: false as const, error: "Already sent, already canceled, or unknown id." };
+      });
+      const ok_ = results.filter((r) => r.canceled);
+      return ok({
+        summary: `🚫 Canceled ${ok_.length}/${ids.length} scheduled send(s)`,
         results,
       });
     }),

@@ -51,7 +51,7 @@ function resolveLegacyUser(req: Request, config: Config): User | null {
 }
 
 /** Builds the User from ALL Google accounts linked to this instance via onboarding. */
-async function userFromGoogleAccounts(config: Config): Promise<User | null> {
+export async function userFromGoogleAccounts(config: Config): Promise<User | null> {
   const accounts = await getGoogleAccounts();
   if (!accounts.length) return null;
   const clientId = config.onboarding.googleClientId!;
