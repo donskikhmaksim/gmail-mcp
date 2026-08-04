@@ -8,7 +8,7 @@ import dns from "node:dns/promises";
 import net from "node:net";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { gmail_v1 } from "googleapis";
-import { ok, fail, guard, isTextual, mapWithLimit } from "../util.js";
+import { ok, fail, guard, isTextual, mapWithLimit, safeText } from "../util.js";
 import { accountField, type UserClients } from "../accounts.js";
 import type { GoogleClients } from "../google.js";
 import { documentToPlainText } from "./docs.js";
@@ -190,10 +190,12 @@ function describeLines(
   results: Array<{ id?: string | null; error?: string } & MsgMeta>,
   icon: string,
 ): string[] {
+  // subject/from/snippet/error are all externally-controlled — neutralise each
+  // through safeText so a crafted email can't forge status lines in this output.
   return results.map((r) =>
     r.error
-      ? `⚠️ ${r.id}: ${r.error}`
-      : `${icon} «${r.subject || "(без темы)"}» — ${r.from || "?"}${r.snippet ? `: ${r.snippet.slice(0, 140)}` : ""}`,
+      ? `⚠️ ${r.id}: ${safeText(r.error)}`
+      : `${icon} «${safeText(r.subject) || "(без темы)"}» — ${safeText(r.from) || "?"}${r.snippet ? `: ${safeText(r.snippet, 140)}` : ""}`,
   );
 }
 
