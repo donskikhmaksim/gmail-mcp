@@ -4,6 +4,8 @@
  */
 import { z } from "zod";
 import { Readable } from "node:stream";
+import dns from "node:dns/promises";
+import net from "node:net";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { gmail_v1 } from "googleapis";
 import { ok, fail, guard, isTextual, mapWithLimit } from "../util.js";
@@ -273,6 +275,193 @@ export interface AttachmentInput {
 /** Gmail caps a whole message (body + attachments) at 25 MB. */
 const ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
 
+// ---- SSRF / OOM guard for url-based attachments -----------------------------
+//
+// A tool that downloads a URL server-side turns this MCP into a proxy into the
+// hosting network. On Railway that means cloud-metadata (169.254.169.254),
+// localhost ports and private ranges. `references/security-checklist.md` §2:
+// https-only, resolve every IP and reject private/link-local/loopback,
+// manual redirects (a public host can redirect to 169.254.169.254), a timeout,
+// and a STREAMING size cap enforced BEFORE buffering (a URL that streams
+// gigabytes is otherwise a guaranteed container OOM). Written portable — the
+// same url-attach path lives in drive-mcp, so this block is copied verbatim.
+
+const FETCH_TIMEOUT_MS = 20_000;
+const MAX_ATTACHMENT_REDIRECTS = 3;
+
+/** Optional DNS resolver override (tests inject a fake so no real lookup happens). */
+export type LookupFn = (host: string) => Promise<{ address: string }[]>;
+const defaultLookup: LookupFn = (host) => dns.lookup(host, { all: true });
+
+/**
+ * True when an IP literal is loopback / private / link-local / reserved /
+ * multicast — i.e. NOT a public destination. Covers both IPv4 and IPv6
+ * (including IPv4-mapped IPv6 like ::ffff:169.254.169.254). Exported for tests.
+ */
+export function isBlockedIp(ip: string): boolean {
+  const kind = net.isIP(ip);
+  if (kind === 4) return isBlockedIpv4(ip);
+  if (kind === 6) return isBlockedIpv6(ip);
+  return true; // not a parseable IP → treat as unsafe
+}
+
+function isBlockedIpv4(ip: string): boolean {
+  const o = ip.split(".").map(Number);
+  if (o.length !== 4 || o.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+  const [a, b] = o;
+  if (a === 0) return true; // 0.0.0.0/8 "this host"
+  if (a === 10) return true; // 10.0.0.0/8 private
+  if (a === 127) return true; // 127.0.0.0/8 loopback
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local (cloud metadata)
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 private
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16 private
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
+  if (a >= 224) return true; // 224.0.0.0/4 multicast + 240.0.0.0/4 reserved + 255.*
+  return false;
+}
+
+function isBlockedIpv6(ip: string): boolean {
+  const lower = ip.toLowerCase();
+  // IPv4-mapped / IPv4-compatible — validate the embedded v4 address.
+  const mapped = lower.match(/(?:^|:)((?:\d{1,3}\.){3}\d{1,3})$/);
+  if (mapped) return isBlockedIpv4(mapped[1]);
+  if (lower === "::1" || lower === "::") return true; // loopback / unspecified
+  const head = lower.split(":")[0] ?? "";
+  const n = parseInt(head || "0", 16);
+  if (lower.startsWith("fe8") || lower.startsWith("fe9") || lower.startsWith("fea") || lower.startsWith("feb"))
+    return true; // fe80::/10 link-local
+  if (n >= 0xfc00 && n <= 0xfdff) return true; // fc00::/7 unique-local
+  if (lower.startsWith("ff")) return true; // ff00::/8 multicast
+  return false;
+}
+
+/**
+ * Validates a URL for a server-side fetch: https-only, and every resolved IP
+ * must be public. Throws a 🛑-style refusal on anything unsafe. Returns the
+ * parsed URL when clean. `lookup` is injectable for offline tests.
+ */
+export async function assertPublicUrl(rawUrl: string, lookup: LookupFn = defaultLookup): Promise<URL> {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw new Error("🛑 Ссылка на вложение неразборчива — вложение не скачано.");
+  }
+  if (url.protocol !== "https:") {
+    throw new Error(`🛑 Разрешены только https-ссылки на вложения (получено «${url.protocol}»). Вложение не скачано.`);
+  }
+  const host = url.hostname.replace(/^\[|\]$/g, ""); // strip IPv6 brackets
+  // If the host is already an IP literal, check it directly (no DNS at all).
+  if (net.isIP(host)) {
+    if (isBlockedIp(host)) throw new Error("🛑 Ссылка ведёт на внутренний/приватный адрес — вложение не скачано.");
+    return url;
+  }
+  let addrs: { address: string }[];
+  try {
+    addrs = await lookup(host);
+  } catch {
+    throw new Error("🛑 Не удалось разрешить имя хоста ссылки — вложение не скачано.");
+  }
+  if (!addrs.length) throw new Error("🛑 Имя хоста ссылки не разрешается ни в один адрес — вложение не скачано.");
+  for (const a of addrs) {
+    if (isBlockedIp(a.address)) {
+      throw new Error("🛑 Имя хоста ссылки разрешается во внутренний/приватный адрес — вложение не скачано.");
+    }
+  }
+  return url;
+}
+
+/**
+ * Fetches a URL into a Buffer with SSRF validation, manual redirects (each
+ * Location re-validated), a per-request timeout and a streaming size cap
+ * enforced WHILE downloading (never buffers past the cap). Returns the bytes
+ * and the response content-type. Exported for tests.
+ */
+export async function fetchAttachmentSafely(
+  rawUrl: string,
+  maxBytes: number,
+  lookup: LookupFn = defaultLookup,
+): Promise<{ buf: Buffer; contentType: string | null }> {
+  let current = rawUrl;
+  for (let hop = 0; hop <= MAX_ATTACHMENT_REDIRECTS; hop++) {
+    const url = await assertPublicUrl(current, lookup);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+    let resp: Response;
+    try {
+      resp = await fetch(url, { redirect: "manual", signal: ctrl.signal, headers: { accept: "*/*" } });
+    } catch (e) {
+      clearTimeout(timer);
+      if ((e as { name?: string })?.name === "AbortError") {
+        throw new Error("🛑 Источник вложения не ответил вовремя (таймаут). Вложение не скачано.");
+      }
+      throw new Error("🛑 Не удалось соединиться с источником вложения. Вложение не скачано.");
+    }
+    // Manual redirect: re-validate the target through assertPublicUrl on next hop.
+    if (resp.status >= 300 && resp.status < 400 && resp.headers.get("location")) {
+      clearTimeout(timer);
+      current = new URL(resp.headers.get("location")!, url).toString();
+      continue;
+    }
+    if (!resp.ok) {
+      clearTimeout(timer);
+      throw new Error(`🛑 Источник вложения ответил ошибкой (HTTP ${resp.status}). Вложение не скачано.`);
+    }
+    // Fast pre-check: a declared Content-Length over the cap is refused up front.
+    const declared = Number(resp.headers.get("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      clearTimeout(timer);
+      throw new Error(
+        `🛑 Вложение по ссылке — ${Math.round(declared / (1024 * 1024))} МБ; Gmail ограничивает письмо 25 МБ. Не скачано.`,
+      );
+    }
+    const contentType = resp.headers.get("content-type")?.split(";")[0]?.trim() ?? null;
+    try {
+      const buf = await readCappedStream(resp.body, maxBytes);
+      clearTimeout(timer);
+      return { buf, contentType };
+    } catch (e) {
+      clearTimeout(timer);
+      throw e;
+    }
+  }
+  throw new Error("🛑 Слишком много перенаправлений при скачивании вложения. Не скачано.");
+}
+
+/**
+ * Reads a web stream into a Buffer, aborting the moment the accumulated size
+ * would exceed `maxBytes` — so a URL that streams gigabytes never fills memory.
+ * Exported for tests.
+ */
+export async function readCappedStream(
+  body: ReadableStream<Uint8Array> | null,
+  maxBytes: number,
+): Promise<Buffer> {
+  if (!body) return Buffer.alloc(0);
+  const reader = body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        total += value.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => {});
+          throw new Error(
+            `🛑 Вложение по ссылке превышает лимит ${Math.round(maxBytes / (1024 * 1024))} МБ (Gmail-кап). Скачивание прервано.`,
+          );
+        }
+        chunks.push(Buffer.from(value));
+      }
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+  return Buffer.concat(chunks, total);
+}
+
 /** Resolves attachment inputs (Drive file ids or inline base64) into mail attachments. */
 async function resolveAttachments(
   g: GoogleClients,
@@ -303,21 +492,13 @@ async function resolveAttachments(
       }
       out.push({ filename, mimeType, base64: buf.toString("base64") });
     } else if (item.url) {
-      const resp = await fetch(item.url);
-      if (!resp.ok) {
-        throw new Error(`Could not download attachment from ${item.url}: ${resp.status} ${resp.statusText}`);
-      }
-      const buf = Buffer.from(await resp.arrayBuffer());
-      if (buf.byteLength > ATTACHMENT_MAX_BYTES) {
-        throw new Error(
-          `Attachment from ${item.url} is ${Math.round(buf.byteLength / (1024 * 1024))} MB; Gmail caps a message at 25 MB.`,
-        );
-      }
+      // SSRF/OOM-guarded: https-only, private IPs refused, manual redirects,
+      // timeout, streaming size cap enforced before buffering. See §2 above.
+      const { buf, contentType } = await fetchAttachmentSafely(item.url, ATTACHMENT_MAX_BYTES);
       const urlName = item.url.split("?")[0].replace(/\/+$/, "").split("/").pop() || "attachment";
       out.push({
         filename: item.filename ?? urlName,
-        mimeType:
-          item.mimeType ?? resp.headers.get("content-type")?.split(";")[0] ?? "application/octet-stream",
+        mimeType: item.mimeType ?? contentType ?? "application/octet-stream",
         base64: buf.toString("base64"),
       });
     } else if (item.contentBase64) {
