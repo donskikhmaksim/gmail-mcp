@@ -36,7 +36,19 @@ interface PgStore {
   }): Promise<number>;
   listScheduledSends(
     accountName: string,
-  ): Promise<{ id: number; toPreview: string; subjectPreview: string; sendAt: Date }[]>;
+    status?: string,
+  ): Promise<
+    {
+      id: number;
+      toPreview: string;
+      subjectPreview: string;
+      sendAt: Date;
+      status?: string;
+      error?: string | null;
+      sentMessageId?: string | null;
+    }[]
+  >;
+  countScheduledSends(accountName: string, status: string): Promise<number>;
   cancelScheduledSend(id: number, accountName: string): Promise<boolean>;
 }
 
@@ -1330,20 +1342,49 @@ export function registerGmailTools(
     "gmail_list_scheduled_sends",
     {
       title: "List emails waiting to be sent",
-      description: "List messages queued by gmail_schedule_send that have not gone out (or been canceled) yet, soonest first.",
-      inputSchema: { account },
+      description:
+        "List messages queued by gmail_schedule_send, soonest first. By default shows only `pending` (still waiting). " +
+        "Pass `status` to inspect other states: `failed` (send failed — includes the full error; e.g. a bad account " +
+        "label or a process that died mid-send), `sending` (currently being sent), `sent`, `canceled`, or `all`. " +
+        "Even a default (`pending`) call warns you when failed sends exist, so a silently-failed send can't hide.",
+      inputSchema: {
+        account,
+        status: z
+          .enum(["pending", "failed", "sending", "sent", "canceled", "all"])
+          .default("pending")
+          .optional()
+          .describe("Which sends to list. Default 'pending'. Use 'failed' to see sends that did not go out."),
+      },
       annotations: { readOnlyHint: true },
     },
-    guard(async ({ account }) => {
+    guard(async ({ account, status }) => {
       const { store } = snoozeCtx;
       if (!store) {
         return ok({ summary: "No scheduled sends — DATABASE_URL is not configured, so nothing can be queued.", results: [] });
       }
       const accountName = clients.canonicalName(account);
-      const rows = await store.listScheduledSends(accountName);
+      const wanted = status ?? "pending";
+      const rows = await store.listScheduledSends(accountName, wanted);
+      // Always surface the failed count, even on a default 'pending' call — a
+      // failed send that no one looks at is exactly how incident 1 stayed hidden.
+      const failedCount = await store.countScheduledSends(accountName, "failed");
+      const note =
+        failedCount > 0 && wanted !== "failed"
+          ? `⚠️ есть ${failedCount} провалившаяся(ихся) отправка(ок) — посмотрите status='failed'.`
+          : undefined;
       return ok({
-        summary: `🕗 ${rows.length} message(s) waiting to send`,
-        results: rows.map((r) => ({ id: r.id, to: r.toPreview, subject: r.subjectPreview, sendAt: r.sendAt.toISOString() })),
+        summary: `🕗 ${rows.length} message(s) with status='${wanted}'`,
+        ...(note ? { note } : {}),
+        results: rows.map((r) => ({
+          id: r.id,
+          to: r.toPreview,
+          subject: r.subjectPreview,
+          sendAt: r.sendAt.toISOString(),
+          status: r.status ?? wanted,
+          // Show the full error for anything that failed, so the reason is visible.
+          ...(r.error ? { error: r.error } : {}),
+          ...(r.sentMessageId ? { sentMessageId: r.sentMessageId } : {}),
+        })),
       });
     }),
   );

@@ -97,6 +97,12 @@ export interface Config {
   requireAuth: boolean;
   users: User[];
   onboarding: OnboardingConfig;
+  /**
+   * A scheduled send stuck in 'sending' longer than this many minutes is
+   * reaped to 'failed' by the poller (a process that died mid-send). Env
+   * SENDING_STUCK_MINUTES, default 10.
+   */
+  sendingStuckMinutes: number;
 }
 
 function loadOnboarding(): OnboardingConfig {
@@ -351,5 +357,7 @@ export function loadConfig(): Config {
   }
 
   const requireAuth = onboarding.enabled || users.length > 1 || users.some((u) => !!u.token);
-  return { transport, port, requireAuth, users, onboarding };
+  const stuckRaw = Number(process.env.SENDING_STUCK_MINUTES);
+  const sendingStuckMinutes = Number.isFinite(stuckRaw) && stuckRaw > 0 ? stuckRaw : 10;
+  return { transport, port, requireAuth, users, onboarding, sendingStuckMinutes };
 }

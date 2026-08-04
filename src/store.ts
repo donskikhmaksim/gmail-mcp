@@ -156,6 +156,11 @@ export async function ensureSchema(): Promise<void> {
       created_at      TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  // When a send is claimed it flips to 'sending'; if the process dies before
+  // it records a result, the row is stranded there forever — invisible to a
+  // pending-only list and never re-claimed. sending_since lets the reaper find
+  // and fail such rows (see reapStuckSends). Older deployments lack the column.
+  await p.query(`ALTER TABLE scheduled_sends ADD COLUMN IF NOT EXISTS sending_since TIMESTAMPTZ`);
 }
 
 // ---- Download links ----
@@ -595,7 +600,14 @@ export interface ScheduledSendRow {
   toPreview: string;
   subjectPreview: string;
   sendAt: Date;
+  status: string;
+  error: string | null;
+  sentMessageId: string | null;
+  sendingSince: Date | null;
 }
+
+/** Statuses a caller may filter scheduled sends by; 'all' means no filter. */
+export type ScheduledSendStatus = "pending" | "failed" | "sending" | "sent" | "canceled" | "all";
 
 export async function addScheduledSend(row: {
   userToken: string | null;
@@ -614,14 +626,35 @@ export async function addScheduledSend(row: {
   return Number(res.rows[0].id);
 }
 
-/** Pending scheduled sends for an account, soonest first. */
-export async function listScheduledSends(accountLabel: string): Promise<ScheduledSendRow[]> {
+/**
+ * Scheduled sends for an account, soonest first, filtered by status (default
+ * 'pending'). 'all' returns every non-null status so failed/stuck rows are
+ * finally visible — the fix for incident 1, where a failed row was invisible to
+ * every tool.
+ */
+export async function listScheduledSends(
+  accountLabel: string,
+  status: ScheduledSendStatus = "pending",
+): Promise<ScheduledSendRow[]> {
+  const p = getPool();
+  const res =
+    status === "all"
+      ? await p.query(`SELECT * FROM scheduled_sends WHERE account_label = $1 ORDER BY send_at ASC`, [accountLabel])
+      : await p.query(
+          `SELECT * FROM scheduled_sends WHERE account_label = $1 AND status = $2 ORDER BY send_at ASC`,
+          [accountLabel, status],
+        );
+  return res.rows.map(rowToScheduledSend);
+}
+
+/** How many scheduled sends an account has in a given status (e.g. 'failed'). */
+export async function countScheduledSends(accountLabel: string, status: string): Promise<number> {
   const p = getPool();
   const res = await p.query(
-    `SELECT * FROM scheduled_sends WHERE account_label = $1 AND status = 'pending' ORDER BY send_at ASC`,
-    [accountLabel],
+    `SELECT COUNT(*)::int AS n FROM scheduled_sends WHERE account_label = $1 AND status = $2`,
+    [accountLabel, status],
   );
-  return res.rows.map(rowToScheduledSend);
+  return res.rows[0]?.n ?? 0;
 }
 
 /** Cancels a still-pending send. Returns false if it was already sent, canceled, or unknown. */
@@ -638,13 +671,37 @@ export async function cancelScheduledSend(id: number, accountLabel: string): Pro
 /** Same claim-and-lock pattern as claimDueSnoozes — see its comment. */
 export async function claimDueSends(now: Date): Promise<ScheduledSendRow[]> {
   const p = getPool();
+  // Stamp sending_since alongside the status flip, so a crash between here and
+  // the result write leaves a timestamped 'sending' row the reaper can find.
   const res = await p.query(
-    `UPDATE scheduled_sends SET status = 'sending'
+    `UPDATE scheduled_sends SET status = 'sending', sending_since = NOW()
      WHERE id IN (SELECT id FROM scheduled_sends WHERE status = 'pending' AND send_at <= $1 FOR UPDATE SKIP LOCKED)
      RETURNING *`,
     [now],
   );
   return res.rows.map(rowToScheduledSend);
+}
+
+/**
+ * Fails rows stuck in 'sending' longer than `olderThanMinutes` — a process that
+ * died mid-send. NEVER re-sends: Gmail has no idempotency key, so a retry could
+ * duplicate a mail that actually went out (see markSendFailed). The row is
+ * marked failed with an explicit "check Sent manually" note and becomes visible
+ * via listScheduledSends(status='failed'). Returns how many were reaped.
+ */
+export async function reapStuckSends(olderThanMinutes: number): Promise<number> {
+  const p = getPool();
+  const res = await p.query(
+    `UPDATE scheduled_sends
+       SET status = 'failed',
+           error = 'процесс перезапустился во время отправки — статус неизвестен, проверьте отправленные вручную'
+     WHERE status = 'sending'
+       AND sending_since IS NOT NULL
+       AND sending_since < NOW() - ($1 || ' minutes')::interval
+     RETURNING id`,
+    [String(olderThanMinutes)],
+  );
+  return res.rowCount ?? 0;
 }
 
 export async function markSendSent(id: number, sentMessageId: string): Promise<void> {
@@ -671,6 +728,10 @@ function rowToScheduledSend(row: {
   to_preview: string;
   subject_preview: string;
   send_at: Date;
+  status?: string;
+  error?: string | null;
+  sent_message_id?: string | null;
+  sending_since?: Date | null;
 }): ScheduledSendRow {
   return {
     id: Number(row.id),
@@ -680,6 +741,10 @@ function rowToScheduledSend(row: {
     toPreview: row.to_preview,
     subjectPreview: row.subject_preview,
     sendAt: new Date(row.send_at),
+    status: row.status ?? "pending",
+    error: row.error ?? null,
+    sentMessageId: row.sent_message_id ?? null,
+    sendingSince: row.sending_since ? new Date(row.sending_since) : null,
   };
 }
 

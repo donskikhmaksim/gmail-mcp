@@ -7,6 +7,7 @@ import {
   addSnooze,
   addScheduledSend,
   listScheduledSends,
+  countScheduledSends,
   cancelScheduledSend,
 } from "./store.js";
 
@@ -36,7 +37,9 @@ const pgStoreAdapter = {
       subjectPreview: args.subjectPreview,
       sendAt: args.sendAt,
     }),
-  listScheduledSends: (accountName: string) => listScheduledSends(accountName),
+  listScheduledSends: (accountName: string, status?: string) =>
+    listScheduledSends(accountName, (status as import("./store.js").ScheduledSendStatus) ?? "pending"),
+  countScheduledSends: (accountName: string, status: string) => countScheduledSends(accountName, status),
   cancelScheduledSend: (id: number, accountName: string) => cancelScheduledSend(id, accountName),
 };
 

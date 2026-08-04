@@ -18,12 +18,12 @@ const check = (label, cond, extra = "") => {
   if (!cond) failures++;
 };
 
-function fakeConfig({ onboardingEnabled = false, users = [] } = {}) {
-  return { onboarding: { enabled: onboardingEnabled }, users };
+function fakeConfig({ onboardingEnabled = false, users = [], sendingStuckMinutes = 10 } = {}) {
+  return { onboarding: { enabled: onboardingEnabled }, users, sendingStuckMinutes };
 }
 
 function fakeDeps(overrides = {}) {
-  const calls = { modify: [], send: [], done: [], failed: [], sendOk: [], sendFailed: [] };
+  const calls = { modify: [], send: [], done: [], failed: [], sendOk: [], sendFailed: [], reaped: [] };
   const clientsFor = new Map(); // userName -> { resolve(label) -> gmail client }
   const deps = {
     resolveOnboardedUser: async () => null,
@@ -59,6 +59,7 @@ function fakeDeps(overrides = {}) {
     claimDueSends: async () => [],
     markSendSent: async (id, msgId) => calls.sendOk.push({ id, msgId }),
     markSendFailed: async (id, err) => calls.sendFailed.push({ id, err }),
+    reapStuckSends: async (mins) => { calls.reaped.push(mins); return 0; },
     ...overrides,
   };
   return { deps, calls };

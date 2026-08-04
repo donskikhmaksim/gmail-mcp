@@ -27,6 +27,7 @@ export interface SchedulerDeps {
   claimDueSends: typeof store.claimDueSends;
   markSendSent: typeof store.markSendSent;
   markSendFailed: typeof store.markSendFailed;
+  reapStuckSends: typeof store.reapStuckSends;
 }
 
 export const defaultDeps: SchedulerDeps = {
@@ -38,6 +39,7 @@ export const defaultDeps: SchedulerDeps = {
   claimDueSends: store.claimDueSends,
   markSendSent: store.markSendSent,
   markSendFailed: store.markSendFailed,
+  reapStuckSends: store.reapStuckSends,
 };
 
 /**
@@ -100,12 +102,37 @@ export async function processDueSends(config: Config, deps: SchedulerDeps = defa
   }
 }
 
+/**
+ * Reaps scheduled sends stranded in 'sending' (a process that died mid-send)
+ * to 'failed' — NEVER re-sending (Gmail is not idempotent). Best-effort: logs
+ * how many were reaped so the failure is at least visible in the logs, on top
+ * of becoming listable via gmail_list_scheduled_sends(status='failed').
+ */
+export async function reapStuckSends(config: Config, deps: SchedulerDeps = defaultDeps): Promise<number> {
+  const n = await deps.reapStuckSends(config.sendingStuckMinutes);
+  if (n > 0) {
+    console.error(
+      `[scheduler] reaped ${n} scheduled send(s) stuck in 'sending' > ${config.sendingStuckMinutes}min → 'failed' (NOT re-sent; verify Sent manually)`,
+    );
+  }
+  return n;
+}
+
+/** How many poller ticks between stuck-send sweeps (the reaper also runs at startup). */
+const REAP_EVERY_TICKS = 5;
+
 /** Starts the poller. Call once, only when a database is configured. */
 export function startScheduler(config: Config, deps: SchedulerDeps = defaultDeps): void {
+  // Sweep once at startup: a crash-restart is exactly when rows are stranded.
+  reapStuckSends(config, deps).catch((e) =>
+    console.error("[scheduler] startup reap failed:", e instanceof Error ? e.message : e),
+  );
+  let ticks = 0;
   const tick = async () => {
     try {
       await processDueSnoozes(config, deps);
       await processDueSends(config, deps);
+      if (++ticks % REAP_EVERY_TICKS === 0) await reapStuckSends(config, deps);
     } catch (e) {
       // A tick-level failure (e.g. the database briefly unreachable) must not
       // kill the interval — log and simply try again next tick.

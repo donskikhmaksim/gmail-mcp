@@ -34,10 +34,11 @@ function makeStore() {
       scheduledRows.set(id, { id, ...args, canceled: false });
       return id;
     },
-    listScheduledSends: async (accountName) =>
+    listScheduledSends: async (accountName, status = "pending") =>
       [...scheduledRows.values()]
-        .filter((r) => r.accountName === accountName && !r.canceled)
-        .map((r) => ({ id: r.id, toPreview: r.toPreview, subjectPreview: r.subjectPreview, sendAt: r.sendAt })),
+        .filter((r) => r.accountName === accountName && !r.canceled && (status === "all" || status === "pending"))
+        .map((r) => ({ id: r.id, toPreview: r.toPreview, subjectPreview: r.subjectPreview, sendAt: r.sendAt, status: "pending" })),
+    countScheduledSends: async () => 0,
     cancelScheduledSend: async (id, accountName) => {
       const row = scheduledRows.get(id);
       if (!row || row.accountName !== accountName || row.canceled) return false;
