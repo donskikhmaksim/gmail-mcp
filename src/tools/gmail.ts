@@ -239,6 +239,211 @@ export async function accountEmail(
   }
 }
 
+// ---- Post-verify for sends (references/identity-postverify.md §5) -----------
+//
+// A 200 OK from messages.send means "Gmail accepted it", NOT "it went to the
+// right place". After every send the server makes a SEPARATE metadata read of
+// the new message and checks it independently: the classic self-send tell is
+// labelIds ⊇ {SENT, INBOX} (a reply to your own message comes back to you —
+// incident 2). The report is built here, sanitised through safeText (S1), and
+// glued onto the tool response by the server. Fail-closed: any ❌ keeps the
+// summary off "sent".
+
+export type PostVerifyOutcome = "ok" | "warn" | "mismatch";
+
+export interface PostVerifyResult {
+  outcome: PostVerifyOutcome;
+  messageId: string;
+  /** One ready-made §5.3 bullet line (external text already run through safeText). */
+  line: string;
+  /** Machine-readable detail for the per-item results array. */
+  detail: string;
+}
+
+/** Resolves a promise or rejects after ms — so a hung messages.get can't hang the tool. */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    p.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); },
+    );
+  });
+}
+
+const POST_VERIFY_TIMEOUT_MS = 10_000;
+
+/**
+ * Independently verifies one just-sent message with a fresh metadata read.
+ * `expectedTo` is the recipient the caller intended; `selfEmail` (when known)
+ * is this account's own address. Never throws — a read failure/timeout yields
+ * a ⚠️ "not verified", not a broken send. Exported for testing.
+ */
+export async function postVerifySend(
+  g: GoogleClients,
+  messageId: string,
+  expectedTo: string,
+  selfEmail?: string,
+  timeoutMs: number = POST_VERIFY_TIMEOUT_MS,
+): Promise<PostVerifyResult> {
+  const expected = extractEmail(expectedTo);
+  if (!messageId) {
+    return {
+      outcome: "warn",
+      messageId: "",
+      line: `- ⚠️ **«${safeText(expectedTo)}»** — Gmail не вернул id письма, отправку не удалось перепроверить`,
+      detail: "no message id returned",
+    };
+  }
+  let subject = "";
+  let toHeader = "";
+  let labelIds: string[] = [];
+  try {
+    const r = await withTimeout(
+      g.gmail.users.messages.get({
+        userId: "me",
+        id: messageId,
+        format: "metadata",
+        metadataHeaders: ["To", "Cc", "Bcc", "Subject", "From"],
+      }),
+      timeoutMs,
+      "post-verify messages.get",
+    );
+    const h = r.data.payload?.headers;
+    subject = header(h, "Subject");
+    toHeader = header(h, "To");
+    labelIds = r.data.labelIds ?? [];
+  } catch (e) {
+    return {
+      outcome: "warn",
+      messageId,
+      line: `- ⚠️ **«${safeText(subject) || safeText(expectedTo)}»** — не удалось перепроверить (${safeText(e instanceof Error ? e.message : String(e), 60)}); письмо могло уйти, пруфа нет`,
+      detail: "read failed/timed out",
+    };
+  }
+  const subjLabel = safeText(subject) || "(без темы)";
+  const actualTo = safeText(toHeader) || "(?)";
+  const inSent = labelIds.includes("SENT");
+  const inInbox = labelIds.includes("INBOX");
+  // Primary tell of incident 2: a message both SENT and in the INBOX went to
+  // the account itself. Also flag it when the actual To resolves to selfEmail.
+  const actualToAddr = extractEmail(toHeader);
+  const selfSend = (inSent && inInbox) || (!!selfEmail && !!actualToAddr && actualToAddr === selfEmail.toLowerCase());
+  if (selfSend) {
+    return {
+      outcome: "mismatch",
+      messageId,
+      line: `- ❌ **«${subjLabel}»** — ушло ВАМ ЖЕ (в отправленных И во входящих${selfEmail ? `, To=${safeText(selfEmail)}` : ""}); проверьте адресата — похоже на ответ самому себе`,
+      detail: "self-send: labels SENT+INBOX",
+    };
+  }
+  if (!inSent) {
+    return {
+      outcome: "warn",
+      messageId,
+      line: `- ⚠️ **«${subjLabel}»** — письма пока нет в «Отправленных» (метка SENT не проставилась); возможна задержка Gmail, перепроверьте`,
+      detail: "no SENT label yet",
+    };
+  }
+  // Recipient sanity: if the intended address is nowhere in the actual To, warn
+  // (aliases/lists make a hard mismatch too noisy — self-send above is the hard ❌).
+  if (expected && actualToAddr && !toHeader.toLowerCase().includes(expected)) {
+    return {
+      outcome: "warn",
+      messageId,
+      line: `- ⚠️ **«${subjLabel}»** — в отправленном To=${actualTo}, ожидался ${safeText(expectedTo)}; сверьте адресата`,
+      detail: "recipient differs from expected",
+    };
+  }
+  return {
+    outcome: "ok",
+    messageId,
+    line: `- ✅ **«${subjLabel}»** — в «Отправленных», To: ${actualTo}`,
+    detail: "confirmed in Sent",
+  };
+}
+
+/** Now, formatted for America/Los_Angeles. */
+function nowInLA(): string {
+  return new Date().toLocaleString("sv-SE", { timeZone: "America/Los_Angeles" }) + " America/Los_Angeles";
+}
+
+/** Builds the §5.3 proof block from per-message post-verify results (server-glued). */
+export function renderPostVerifyReport(results: PostVerifyResult[]): string {
+  const okN = results.filter((r) => r.outcome === "ok").length;
+  const warnN = results.filter((r) => r.outcome === "warn").length;
+  const mmN = results.filter((r) => r.outcome === "mismatch").length;
+  const body = results.map((r) => r.line).join("\n");
+  return (
+    `### 🧾 Независимая проверка отправки\n` +
+    `_${nowInLA()} · запрошено ⇄ «Отправленные» Gmail_\n\n` +
+    `${body}\n\n` +
+    `**Итог: ✅ ${okN} подтверждено, ⚠️ ${warnN} не проверено, ❌ ${mmN} расхождение.**\n` +
+    `_[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО — это серверная проверка, не заменяй пересказом]_`
+  );
+}
+
+/** Worst outcome across a batch, for choosing the summary status. */
+export function worstOutcome(results: PostVerifyResult[]): PostVerifyOutcome {
+  if (results.some((r) => r.outcome === "mismatch")) return "mismatch";
+  if (results.some((r) => r.outcome === "warn")) return "warn";
+  return "ok";
+}
+
+/**
+ * Post-verifies every successfully-sent message in a batch and assembles the
+ * tool response: an honest header (✅ / ⚠️ / ❌) reflecting BOTH per-item send
+ * failures and the post-verify outcome, plus the §5.3 proof block glued on by
+ * the server. Fail-closed: any ❌ (self-send) keeps the header off "sent".
+ */
+async function buildSendResult(
+  g: GoogleClients,
+  results: Array<{ messageId?: string | null; error?: string; expectedTo?: string }>,
+  total: number,
+  selfEmail: string | undefined,
+  verb: string,
+): Promise<ReturnType<typeof ok>> {
+  const sent = results.filter((r) => r.messageId && !("error" in r && r.error));
+  const pv = await mapWithLimit(sent, (r) => postVerifySend(g, r.messageId!, r.expectedTo ?? "", selfEmail));
+  const okN = sent.length;
+  const failN = total - okN;
+  const worst = worstOutcome(pv);
+  let icon = "✉️";
+  let tail = "";
+  if (worst === "mismatch") {
+    icon = "❌";
+    tail = " — РАСХОЖДЕНИЕ при проверке, см. отчёт";
+  } else if (worst === "warn" || failN > 0) {
+    icon = "⚠️";
+    if (failN > 0) tail = ` (${failN} с ошибкой)`;
+  }
+  // Strip the internal expectedTo marker from the results echoed back.
+  const cleaned = results.map(({ expectedTo, ...rest }) => rest);
+  return ok({
+    summary: `${icon} ${verb} ${okN}/${total}${tail}`,
+    results: cleaned,
+    ...(pv.length ? { verification: renderPostVerifyReport(pv) } : {}),
+  });
+}
+
+/**
+ * Pre-snapshot of an outbound message before the irreversible send
+ * (identity-postverify.md §5.2). Until the consent_audit table exists (pkg A1)
+ * this lands in the server log — NEVER the full body, only a short preview.
+ */
+function logSendPreSnapshot(
+  accountName: string,
+  msg: { to: string; cc?: string; bcc?: string; subject: string; body?: string },
+): void {
+  const preview = (msg.body ?? "").replace(/\s+/g, " ").slice(0, 80);
+  console.error(
+    `[send pre-snapshot] account=${accountName} to=${msg.to}` +
+      (msg.cc ? ` cc=${msg.cc}` : "") +
+      (msg.bcc ? " bcc=<set>" : "") +
+      ` subject=${JSON.stringify(msg.subject)} body[0:80]=${JSON.stringify(preview)}`,
+  );
+}
+
 /** RFC 2822 + base64url encoding for sending. Exported for testing. */
 export interface MailAttachment {
   filename: string;
@@ -862,21 +1067,22 @@ export function registerGmailTools(
     },
     guard(async ({ account, messages }) => {
       const g = clients.resolve(account);
+      const accountName = clients.canonicalName(account);
+      const selfEmail = await accountEmail(g, accountName);
       const results = await mapWithLimit(messages, async (msg) => {
           try {
             const atts = msg.attachments?.length ? await resolveAttachments(g, msg.attachments) : undefined;
             const raw = buildRawEmail({ to: msg.to, subject: msg.subject, body: msg.body, cc: msg.cc, bcc: msg.bcc, attachments: atts });
+            // Pre-snapshot before the irreversible send (§5.2) — server log only
+            // until the audit table exists; never the full body.
+            logSendPreSnapshot(accountName, msg);
             const res = await g.gmail.users.messages.send({ userId: "me", requestBody: { raw } });
-            return { messageId: res.data.id, threadId: res.data.threadId };
+            return { messageId: res.data.id, threadId: res.data.threadId, expectedTo: msg.to };
           } catch (e) {
             return { error: String(e instanceof Error ? e.message : e) };
           }
         });
-      const ok_ = results.filter((r) => !("error" in r));
-      return ok({
-        summary: `✉️ Sent ${ok_.length}/${messages.length} message(s)`,
-        results,
-      });
+      return buildSendResult(g, results, messages.length, selfEmail, "Отправлено");
     }),
   );
 
@@ -903,6 +1109,8 @@ export function registerGmailTools(
     },
     guard(async ({ account, replies }) => {
       const g = clients.resolve(account);
+      const accountName = clients.canonicalName(account);
+      const selfEmail = await accountEmail(g, accountName);
       const results = await mapWithLimit(replies, async (item) => {
           try {
             const orig = await g.gmail.users.messages.get({
@@ -929,6 +1137,7 @@ export function registerGmailTools(
               attachments: atts,
             });
             const threadId = orig.data.threadId ?? undefined;
+            logSendPreSnapshot(accountName, { to: fromAddr, cc, subject, body: item.body });
             const draft = await g.gmail.users.drafts.create({
               userId: "me",
               requestBody: { message: { raw, threadId } },
@@ -937,16 +1146,14 @@ export function registerGmailTools(
               userId: "me",
               requestBody: { id: draft.data.id! },
             });
-            return { messageId: res.data.id };
+            // The reply's recipient is the original sender (fromAddr) — post-verify
+            // checks the sent copy did not come back to us (incident 2).
+            return { messageId: res.data.id, expectedTo: fromAddr };
           } catch (e) {
             return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
           }
         });
-      const ok_ = results.filter((r) => !("error" in r));
-      return ok({
-        summary: `↩️ Replied to ${ok_.length}/${replies.length} message(s)`,
-        results,
-      });
+      return buildSendResult(g, results, replies.length, selfEmail, "Ответов отправлено");
     }),
   );
 
@@ -972,6 +1179,8 @@ export function registerGmailTools(
     },
     guard(async ({ account, items }) => {
       const g = clients.resolve(account);
+      const accountName = clients.canonicalName(account);
+      const selfEmail = await accountEmail(g, accountName);
       const results = await mapWithLimit(items, async (item) => {
           try {
             const orig = await g.gmail.users.messages.get({ userId: "me", id: item.messageId, format: "full" });
@@ -999,17 +1208,14 @@ export function registerGmailTools(
               });
             }
             const raw = buildRawEmail({ to: item.to, subject, body, attachments: atts.length ? atts : undefined });
+            logSendPreSnapshot(accountName, { to: item.to, subject, body: item.body });
             const res = await g.gmail.users.messages.send({ userId: "me", requestBody: { raw } });
-            return { messageId: res.data.id };
+            return { messageId: res.data.id, expectedTo: item.to };
           } catch (e) {
             return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
           }
         });
-      const ok_ = results.filter((r) => !("error" in r));
-      return ok({
-        summary: `➡️ Forwarded ${ok_.length}/${items.length} message(s)`,
-        results,
-      });
+      return buildSendResult(g, results, items.length, selfEmail, "Переслано");
     }),
   );
 

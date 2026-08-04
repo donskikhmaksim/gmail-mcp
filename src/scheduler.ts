@@ -13,6 +13,7 @@
 import type { Config, User } from "./config.js";
 import { userFromGoogleAccounts } from "./http.js";
 import { buildUserClients, type UserClients } from "./accounts.js";
+import { postVerifySend, extractEmail } from "./tools/gmail.js";
 import * as store from "./store.js";
 
 const TICK_MS = 60_000;
@@ -93,6 +94,17 @@ export async function processDueSends(config: Config, deps: SchedulerDeps = defa
         requestBody: { raw: row.rawMessage },
       });
       await deps.markSendSent(row.id, res.data.id ?? "");
+      // Best-effort post-verify: the background has no chat channel, so a bad
+      // outcome (e.g. self-send) is logged. It never throws and never affects
+      // the already-recorded send.
+      try {
+        const pv = await postVerifySend(g, res.data.id ?? "", extractEmail(row.toPreview));
+        if (pv.outcome !== "ok") {
+          console.error(`[scheduler] post-verify ${pv.outcome} for send ${row.id}: ${pv.detail}`);
+        }
+      } catch {
+        /* post-verify is advisory in the background */
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[scheduler] scheduled send ${row.id} (${row.toPreview}) failed permanently: ${msg}`);

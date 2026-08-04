@@ -44,6 +44,13 @@ function fakeDeps(overrides = {}) {
                       calls.send.push(args);
                       return { data: { id: "SENTID" } };
                     },
+                    // Post-verify (B3) reads the sent message back. A normal
+                    // send lands in Sent only — labelIds ["SENT"], not INBOX.
+                    get: async (args) => {
+                      calls.postVerifyGet = (calls.postVerifyGet ?? []);
+                      calls.postVerifyGet.push(args);
+                      return { data: { labelIds: ["SENT"], payload: { headers: [{ name: "To", value: "a@b.com" }, { name: "Subject", value: "S" }] } } };
+                    },
                   },
                 },
               },
