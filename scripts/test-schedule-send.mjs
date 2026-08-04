@@ -52,31 +52,44 @@ function makeStore() {
 const modifyCalls = [];
 const sendCalls = [];
 
+const keyFor = (n) => (n && n.trim() ? n.trim() : "personal");
+const known = new Set(["personal"]);
 const fakeClients = {
   names: ["personal"],
   defaultName: "personal",
   multi: false,
-  resolve: () => ({
-    docs: {},
-    drive: {},
-    gmail: {
-      users: {
-        messages: {
-          modify: async (args) => {
-            modifyCalls.push(args);
-            return { data: {} };
+  resolve: (n) => {
+    const key = keyFor(n);
+    if (!known.has(key)) throw new Error(`❌ Неизвестный аккаунт "${key}". Доступные: personal (me@personal.test).`);
+    return {
+      docs: {},
+      drive: {},
+      gmail: {
+        users: {
+          getProfile: async () => ({ data: { emailAddress: "me@personal.test" } }),
+          messages: {
+            modify: async (args) => {
+              modifyCalls.push(args);
+              return { data: {} };
+            },
+            send: async (args) => {
+              sendCalls.push(args);
+              return { data: { id: "SENTID", threadId: "THREAD1" } };
+            },
+            get: async () => ({ data: { payload: {}, labelIds: ["SENT"] } }),
+            attachments: { get: async () => ({ data: { data: "", size: 0 } }) },
           },
-          send: async (args) => {
-            sendCalls.push(args);
-            return { data: { id: "SENTID", threadId: "THREAD1" } };
-          },
-          get: async () => ({ data: { payload: {} } }),
-          attachments: { get: async () => ({ data: { data: "", size: 0 } }) },
         },
       },
-    },
-    accessToken: async () => "ya29.FAKE",
-  }),
+      accessToken: async () => "ya29.FAKE",
+    };
+  },
+  canonicalName: (n) => {
+    const key = keyFor(n);
+    if (!known.has(key)) throw new Error(`❌ Неизвестный аккаунт "${key}". Доступные: personal (me@personal.test).`);
+    return key;
+  },
+  emailFor: (n) => (known.has(keyFor(n)) ? "me@personal.test" : undefined),
   baseGmailQuery: () => "",
 };
 

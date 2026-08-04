@@ -15,18 +15,40 @@ export interface UserClients {
   resolve(name?: string): GoogleClients;
   /** Base Gmail search fragment configured for the named account (or ""). */
   baseGmailQuery(name?: string): string;
+  /**
+   * The canonical account label for a (possibly empty/omitted) `name`: the
+   * trimmed name if it maps to a real account, else the default. THROWS the
+   * same "unknown account" error resolve() does when the name is unknown. Use
+   * this instead of `name ?? defaultName` before persisting deferred work —
+   * that idiom keeps `name === ""` verbatim (not nullish), storing a bogus
+   * empty label the scheduler can never resolve later (incident 1 root cause).
+   */
+  canonicalName(name?: string): string;
+  /** The configured email for an account label, or undefined when unknown. */
+  emailFor(name?: string): string | undefined;
+}
+
+/** Human list of accounts as `label (email)` when the email is known, else just `label`. */
+function availableAccountsHint(names: string[], emails: Map<string, string>): string {
+  return names.map((n) => (emails.get(n) ? `${n} (${emails.get(n)})` : n)).join(", ");
 }
 
 export function buildUserClients(user: User): UserClients {
   const map = new Map<string, GoogleClients>();
   const queries = new Map<string, string>();
+  const emails = new Map<string, string>();
   for (const acc of user.accounts) {
     map.set(acc.name, createGoogleClients(acc.auth));
     queries.set(acc.name, acc.gmailQuery ?? "");
+    if (acc.email) emails.set(acc.name, acc.email);
   }
   const names = user.accounts.map((a) => a.name);
   const keyFor = (name?: string) =>
     name && name.trim() ? name.trim() : user.defaultAccount;
+  const unknownError = (key: string) =>
+    new Error(
+      `❌ Неизвестный аккаунт "${key}". Доступные: ${availableAccountsHint(names, emails)}.`,
+    );
   return {
     names,
     defaultName: user.defaultAccount,
@@ -34,12 +56,16 @@ export function buildUserClients(user: User): UserClients {
     resolve(name?: string): GoogleClients {
       const key = keyFor(name);
       const clients = map.get(key);
-      if (!clients) {
-        throw new Error(
-          `Unknown account "${key}". Available accounts: ${names.join(", ")}.`,
-        );
-      }
+      if (!clients) throw unknownError(key);
       return clients;
+    },
+    canonicalName(name?: string): string {
+      const key = keyFor(name);
+      if (!map.has(key)) throw unknownError(key);
+      return key;
+    },
+    emailFor(name?: string): string | undefined {
+      return emails.get(keyFor(name));
     },
     baseGmailQuery(name?: string): string {
       return queries.get(keyFor(name)) ?? "";

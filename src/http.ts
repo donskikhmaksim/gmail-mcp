@@ -76,6 +76,7 @@ export async function userFromGoogleAccounts(config: Config): Promise<User | nul
   const clientSecret = config.onboarding.googleClientSecret!;
   const mapped: Account[] = accounts.map((a) => ({
     name: a.label,
+    email: a.email,
     auth: { mode: "oauth", clientId, clientSecret, refreshToken: a.refreshToken },
   }));
   const def = accounts.find((a) => a.isDefault) ?? accounts[0];

@@ -62,6 +62,8 @@ const fakeClients = {
   names: ["personal"],
   defaultName: "personal",
   multi: false,
+  canonicalName: (n) => (n && n.trim() ? n.trim() : "personal"),
+  emailFor: () => "me@personal.test",
   resolve: () => ({
     gmail: {
       users: {

@@ -185,6 +185,46 @@ function describeLines(
   );
 }
 
+/**
+ * Pulls the bare address out of an RFC 822 mailbox like `Name <a@b.com>` (or a
+ * plain `a@b.com`), lower-cased and trimmed. "" when nothing address-like is
+ * found. Exported for testing. Used to compute the real reply recipient and to
+ * compare it against the account's own address (self-reply detection).
+ */
+export function extractEmail(raw: string): string {
+  if (!raw) return "";
+  const angle = raw.match(/<([^>]+)>/);
+  const candidate = (angle ? angle[1] : raw).trim().toLowerCase();
+  // If several addresses are comma-separated (To: a, b), take the first.
+  const first = candidate.split(",")[0].trim();
+  return /@/.test(first) ? first : "";
+}
+
+/** Per-process cache of account-label → real email, filled from users.getProfile. */
+const profileEmailCache = new Map<string, string>();
+
+/**
+ * The real email address behind an account label, via Gmail's users.getProfile
+ * (cached per label). Best-effort: returns undefined on any error rather than
+ * failing the caller — the label alone is still shown (fail-soft). Exported for
+ * testing.
+ */
+export async function accountEmail(
+  g: GoogleClients,
+  label: string,
+  cache: Map<string, string> = profileEmailCache,
+): Promise<string | undefined> {
+  if (cache.has(label)) return cache.get(label);
+  try {
+    const r = await g.gmail.users.getProfile({ userId: "me" });
+    const email = r.data.emailAddress ?? undefined;
+    if (email) cache.set(label, email);
+    return email;
+  } catch {
+    return undefined;
+  }
+}
+
 /** RFC 2822 + base64url encoding for sending. Exported for testing. */
 export interface MailAttachment {
   filename: string;
@@ -1172,7 +1212,7 @@ export function registerGmailTools(
             // expected, not a reason to skip persisting; accountName alone is
             // enough for the scheduler to find the right Google account later.
             if (store) {
-              const accountName = account ?? clients.defaultName;
+              const accountName = clients.canonicalName(account);
               await store.addSnooze({
                 userToken,
                 accountName,
@@ -1242,8 +1282,15 @@ export function registerGmailTools(
             "without it there is nowhere to hold the message until sendAt. Use gmail_send for immediate delivery.",
         );
       }
+      // Fail-fast on an unknown account label BEFORE anything is queued: both
+      // resolve() and canonicalName() throw the same "❌ Неизвестный аккаунт …
+      // Доступные: personal (email), …" error naming labels AND emails, so an
+      // incident-1-style typo ("maksim.donskikh" instead of "work") is caught
+      // here, at call time — not an hour later in the background scheduler.
+      // canonicalName also stores the resolved canonical label (never a stray
+      // "" from `account ?? default`), closing the :resolve/:accountName drift.
       const g = clients.resolve(account);
-      const accountName = account ?? clients.defaultName;
+      const accountName = clients.canonicalName(account);
       const results = await mapWithLimit(messages, async (msg) => {
         try {
           const sendAt = new Date(msg.sendAt);
@@ -1292,7 +1339,7 @@ export function registerGmailTools(
       if (!store) {
         return ok({ summary: "No scheduled sends — DATABASE_URL is not configured, so nothing can be queued.", results: [] });
       }
-      const accountName = account ?? clients.defaultName;
+      const accountName = clients.canonicalName(account);
       const rows = await store.listScheduledSends(accountName);
       return ok({
         summary: `🕗 ${rows.length} message(s) waiting to send`,
@@ -1317,7 +1364,7 @@ export function registerGmailTools(
       if (!store) {
         return fail("DATABASE_URL is not configured, so there is nothing scheduled to cancel.");
       }
-      const accountName = account ?? clients.defaultName;
+      const accountName = clients.canonicalName(account);
       const results = await mapWithLimit(ids, async (id) => {
         const canceled = await store.cancelScheduledSend(id, accountName);
         return canceled
@@ -1851,7 +1898,7 @@ export function registerGmailTools(
           }
           const { url, expiresAt } = await issueDownloadLink(
             {
-              account: account ?? clients.defaultName,
+              account: clients.canonicalName(account),
               messageId: item.messageId,
               attachmentId: item.attachmentId,
               name: filename || "attachment",

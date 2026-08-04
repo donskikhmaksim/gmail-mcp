@@ -31,6 +31,13 @@ export interface Account {
   auth: GoogleAuthConfig;
   /** Optional Gmail search fragment ANDed into every gmail_search for this account. */
   gmailQuery?: string;
+  /**
+   * The account's real email address, when known (onboarded deployments carry
+   * it from the DB). Used so an "unknown account" error and send previews can
+   * show `work (maksim@…)`, not just an opaque label. Absent for env-only
+   * accounts — the label is then shown alone (fail-soft).
+   */
+  email?: string;
 }
 
 export interface User {
