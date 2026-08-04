@@ -34,10 +34,35 @@ export interface FederatedProviderOptions {
   relayUrl?: string;
   /** Shared HMAC secret the relay uses to verify the `state` we sign. */
   relaySecret?: string;
+  /**
+   * Allowlist (lower-cased emails) of who may link a NEW Google account.
+   * Undefined/empty = unrestricted. Never applied to an email that is already
+   * linked (re-consent/refresh of an existing account always succeeds).
+   */
+  ownerEmails?: string[];
 }
 
 function b64url(input: Buffer): string {
   return input.toString("base64url");
+}
+
+/**
+ * Allowlist gate for linking a NEW Google account — pulled out as a pure
+ * function (no store/network access) so it is unit-testable directly; see
+ * scripts/test-credential-source.mjs. Never applied to an already-linked
+ * email (re-consent/refresh of an existing account always succeeds, even if
+ * OWNER_EMAILS was tightened afterwards), and a no-op when OWNER_EMAILS is
+ * unset (fail-open, back-compat for forks without the env var).
+ */
+export function checkOwnerAllowlist(email: string, alreadyLinked: boolean, ownerEmails?: string[]): void {
+  if (alreadyLinked) return;
+  if (!ownerEmails?.length) return;
+  if (!ownerEmails.includes(email.toLowerCase())) {
+    throw new Error(
+      `${email} is not allowed to link a new Google account on this server. ` +
+        "Contact the owner if you believe this is a mistake.",
+    );
+  }
 }
 
 /** Outcome of the Google redirect round-trip. */
@@ -189,6 +214,10 @@ export class GoogleFederatedProvider implements OAuthServerProvider {
     const oauth2 = google.oauth2({ version: "v2", auth: oauth });
     const { data } = await oauth2.userinfo.get();
     const email = data.email ?? "unknown";
+
+    // Allowlist gate: only for NEW accounts (not yet linked).
+    const alreadyLinked = !!(await store.getRefreshTokenByEmail(email));
+    checkOwnerAllowlist(email, alreadyLinked, this.opts.ownerEmails);
 
     // Google only issues a refresh token on the first grant, and the MCP connect
     // flow deliberately no longer forces a re-consent. Reuse the stored token for

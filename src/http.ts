@@ -50,6 +50,24 @@ function resolveLegacyUser(req: Request, config: Config): User | null {
   return null;
 }
 
+/**
+ * Chooses which User to serve a static-token (legacy MCP_AUTH_TOKEN) request
+ * with, when onboarding is enabled: prefer live Postgres-backed accounts,
+ * falling back to the env-configured `legacyUser` only when onboarding has
+ * nothing linked yet (or is disabled). Pulled out of handleMcp as a pure,
+ * Express-free function so it is unit-testable without a running server or a
+ * real database — see scripts/test-credential-source.mjs.
+ */
+export async function selectLegacyOrOnboardingUser(
+  legacyUser: User,
+  onboardingEnabled: boolean,
+  fetchOnboardingUser: () => Promise<User | null>,
+): Promise<User | null> {
+  if (!onboardingEnabled) return legacyUser;
+  const onboardingUser = await fetchOnboardingUser();
+  return onboardingUser ?? (legacyUser.accounts.length ? legacyUser : null);
+}
+
 /** Builds the User from ALL Google accounts linked to this instance via onboarding. */
 export async function userFromGoogleAccounts(config: Config): Promise<User | null> {
   const accounts = await getGoogleAccounts();
@@ -151,6 +169,7 @@ export async function startHttpServer(config: Config): Promise<void> {
       baseUrl,
       relayUrl: config.onboarding.relayUrl,
       relaySecret: config.onboarding.relaySecret,
+      ownerEmails: config.onboarding.ownerEmails,
     });
 
     const issuerUrl = new URL(baseUrl);
@@ -252,7 +271,12 @@ export async function startHttpServer(config: Config): Promise<void> {
     } else if (!config.requireAuth) {
       user = config.users[0] ?? null;
     } else {
-      user = resolveLegacyUser(req, config);
+      const legacyUser = resolveLegacyUser(req, config);
+      user = legacyUser
+        ? await selectLegacyOrOnboardingUser(legacyUser, config.onboarding.enabled, () =>
+            userFromGoogleAccounts(config),
+          )
+        : null;
     }
 
     if (!user) {

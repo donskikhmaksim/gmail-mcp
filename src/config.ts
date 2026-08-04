@@ -72,6 +72,15 @@ export interface OnboardingConfig {
    * `/dashboard/<secret>`. When unset, the dashboard is disabled.
    */
   dashboardSecret?: string;
+  /**
+   * Allowlist of Google account emails (lower-cased) permitted to LINK a NEW
+   * account through onboarding (dashboard "add account" or the MCP connect
+   * flow's first-ever consent). Already-linked accounts are never affected —
+   * this only gates new additions. When unset, linking is unrestricted
+   * (fail-open, so self-hosted forks without this env var keep working as
+   * before).
+   */
+  ownerEmails?: string[];
 }
 
 export interface Config {
@@ -99,6 +108,13 @@ function loadOnboarding(): OnboardingConfig {
   const relayUrl = process.env.OAUTH_RELAY_URL?.trim().replace(/\/+$/, "") || undefined;
   const relaySecret = process.env.OAUTH_RELAY_SECRET?.trim() || undefined;
   const dashboardSecret = process.env.DASHBOARD_SECRET?.trim() || undefined;
+  const ownerEmailsRaw = process.env.OWNER_EMAILS?.trim();
+  const ownerEmails = ownerEmailsRaw
+    ? ownerEmailsRaw
+        .split(",")
+        .map((e) => e.trim().toLowerCase())
+        .filter(Boolean)
+    : undefined;
 
   const enabled = !!(
     databaseUrl &&
@@ -118,6 +134,7 @@ function loadOnboarding(): OnboardingConfig {
     relayUrl: relayUrl && relaySecret ? relayUrl : undefined,
     relaySecret: relayUrl && relaySecret ? relaySecret : undefined,
     dashboardSecret,
+    ownerEmails,
   };
 }
 
@@ -307,9 +324,14 @@ export function loadConfig(): Config {
     }
   } catch (err) {
     // With onboarding enabled, env users are optional — everyone comes from the
-    // database instead, so an absence of env credentials is fine.
+    // database instead, so an absence of env credentials is fine. But if
+    // MCP_AUTH_TOKEN is set, keep a token-holder user with an EMPTY account
+    // list (rather than dropping the token entirely) so a static-token caller
+    // can still authenticate and handleMcp can fill their accounts in from the
+    // Postgres-backed onboarding store instead.
     if (onboarding.enabled) {
-      users = [];
+      const token = process.env.MCP_AUTH_TOKEN?.trim() || undefined;
+      users = token ? [{ name: "default", token, accounts: [], defaultAccount: "default" }] : [];
     } else {
       throw new Error(
         (err as Error).message +
