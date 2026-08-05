@@ -156,6 +156,23 @@ export async function startHttpServer(config: Config): Promise<void> {
   // disabled, tgApprovalConfig.webhookSecret is "" and secretTokenMatches
   // rejects every request (empty expected secret never matches).
   app.post("/tg/webhook", async (req: Request, res: Response) => {
+    // Route-level gate on TG_WEBHOOK_OWNER -- checked FIRST, before reading
+    // the secret header or the body. Defense-in-depth alongside
+    // registerWebhook's own self-guard (tg_approval.ts): since
+    // consumeTgDecisionAnyServer made webhook consume server-agnostic across
+    // all 6 MCP servers that will eventually share one Telegram bot token
+    // (gmail/sheets/calendar/docs/drive-mcp + ticktick-mcp), a
+    // TG_APPROVAL_WEBHOOK_SECRET leak on ANY single one of them would
+    // otherwise let an attacker decide approvals for every other server too
+    // -- including gmail_send, the most dangerous one. A server that isn't
+    // the designated owner must never process this route at all, even with a
+    // technically-correct secret, and must never depend on whoever ports this
+    // file to the other 5 repos remembering to not mount the route --
+    // 404 (not 401) so a non-owner server doesn't even reveal the route exists.
+    if (!tgApprovalConfig.webhookOwner) {
+      res.status(404).end();
+      return;
+    }
     const provided = req.header("x-telegram-bot-api-secret-token") ?? "";
     if (!secretTokenMatches(provided, tgApprovalConfig.webhookSecret)) {
       res.status(401).end();
