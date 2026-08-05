@@ -100,7 +100,12 @@ export interface TgApprovalGate {
 // ───────────────────────── Telegram HTTP plumbing ───────────────────────────
 
 const TELEGRAM_API = "https://api.telegram.org";
-const PREVIEW_CAP = 400;
+// Telegram's own hard limit on sendMessage.text is 4096 UTF-16 code units;
+// 3500 leaves room for the "<tool> · <account>" footer line + HTML tag
+// overhead from mdToTelegramHtml without risking a 400 from the API. Раньше
+// был 400 — Максим прямо попросил полный текст плана в боте, не обрезанный
+// (задача #79), урезание было для другого дизайна (короткая подсказка).
+const PREVIEW_CAP = 3500;
 
 function apiUrl(cfg: TgApprovalConfig, method: string): string {
   return `${TELEGRAM_API}/bot${cfg.botToken}/${method}`;
@@ -109,6 +114,40 @@ function apiUrl(cfg: TgApprovalConfig, method: string): string {
 function clipPreview(s: string, max = PREVIEW_CAP): string {
   const one = s.trim();
   return one.length > max ? one.slice(0, max) + "…" : one;
+}
+
+/**
+ * Конвертер лёгкого markdown (того же, что рендерят `renderConsentBlock`/
+ * `ConsentPlan.preview` в consent.ts — `### заголовок`, `**жирный**`,
+ * `` `код` ``, `_курсив_`) в Telegram HTML parse_mode. Раньше `sendMessage`
+ * уходил без `parse_mode` вообще — Telegram показывал сырые `###`/`**` как
+ * буквальный текст (найдено по живому скриншоту прода — план `drive_upload_file`
+ * с буквальными звёздочками в чате).
+ *
+ * Порядок обязателен: (1) HTML-экранирование СЫРОГО текста — до вставки любых
+ * своих тегов, иначе получим двойное экранирование; (2) построчная замена
+ * заголовков; (3) `**bold**` → `<b>`; (4) `` `code` `` → `<code>`; (5) `_italic_`
+ * → `<i>`, но ТОЛЬКО когда подчёркивание не внутри слова (`(?<!\w)_.../(?!\w)`
+ * — тот же приём, что GFM использует для «intraword emphasis», см.
+ * CommonMark/GFM spec) — иначе имена файлов вида `n8n_email_algo_report.md`
+ * (реальный кейс с того же скриншота) ломались бы: наивная замена съела бы
+ * подчёркивания и раскурсивила бы середину имени файла.
+ */
+function mdToTelegramHtml(text: string): string {
+  const escaped = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  return escaped
+    .split("\n")
+    .map((line) => {
+      const h = /^(#{1,6})\s+(.*)$/.exec(line);
+      return h ? `<b>${h[2]}</b>` : line;
+    })
+    .join("\n")
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/(?<!\w)_([^_\n]+)_(?!\w)/g, "<i>$1</i>");
 }
 
 interface TgCallResult {
@@ -160,10 +199,11 @@ export function createTgApprovalGate(
 
     async notifyPlan(manifestId, previewBody, meta) {
       try {
-        const text = `${clipPreview(previewBody)}\n\n${meta.tool} · ${meta.accountLabel}`;
+        const rawText = `${clipPreview(previewBody)}\n\n${meta.tool} · ${meta.accountLabel}`;
         const sent = await tgCall(cfg, "sendMessage", {
           chat_id: cfg.ownerChatId,
-          text,
+          text: mdToTelegramHtml(rawText),
+          parse_mode: "HTML",
           reply_markup: {
             inline_keyboard: [
               [
