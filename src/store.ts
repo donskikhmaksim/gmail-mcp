@@ -219,6 +219,29 @@ export async function ensureSchema(): Promise<void> {
     )
   `);
   await p.query(`CREATE INDEX IF NOT EXISTS consent_audit_server_ts_idx ON consent_audit (server, ts DESC)`);
+
+  // ---- Optional Telegram-approval layer (package P1, plan-tg-approval.md
+  // §2/§7). Purely ADDITIVE — consent_manifests/consent_audit above are FROZEN
+  // and untouched. Off by default (TG_APPROVAL_ENABLED=false): this table is
+  // created unconditionally (cheap, keeps schema identical between a fork with
+  // and without the Telegram bot configured) but stays empty when the feature
+  // is off, since consent.ts's `tg` branch is never invoked in that case.
+  // Times are epoch-milliseconds (BIGINT), same convention as consent_manifests.
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS tg_approvals (
+      manifest_id TEXT PRIMARY KEY,
+      server      TEXT NOT NULL,
+      chat_id     TEXT NOT NULL,
+      message_id  BIGINT,
+      status      TEXT NOT NULL DEFAULT 'PENDING',
+      created_at  BIGINT NOT NULL,
+      expires_at  BIGINT NOT NULL,
+      decided_at  BIGINT
+    )
+  `);
+  await p.query(
+    `CREATE INDEX IF NOT EXISTS tg_approvals_cleanup_idx ON tg_approvals (server, status, expires_at)`,
+  );
 }
 
 // ---- Download links ----
@@ -1111,6 +1134,113 @@ export async function countConsentAudit(filters: ConsentAuditFilters): Promise<n
   const { where, params } = buildAuditWhere(filters);
   const res = await p.query(`SELECT COUNT(*)::int AS n FROM consent_audit WHERE ${where}`, params);
   return res.rows[0]?.n ?? 0;
+}
+
+// ---- Optional Telegram-approval layer (package P1) --------------------------
+//
+// Implements `TgApprovalStore` from `src/tg_approval.ts` SIGNATURE-FOR-
+// SIGNATURE (checked via `: TgApprovalStore` in server.ts, same discipline as
+// `consentStoreAdapter` above). `server` is always the caller's own constant
+// ($self) — every query filters on it so the 5 servers sharing this Postgres
+// can never cross-read each other's approval rows.
+
+export interface TgApprovalRow {
+  manifestId: string;
+  server: string;
+  chatId: string;
+  messageId: number | null;
+  status: "PENDING" | "APPROVED" | "REJECTED";
+  createdAt: number;
+  expiresAt: number;
+  decidedAt: number | null;
+}
+
+function rowToTgApproval(row: {
+  manifest_id: string;
+  server: string;
+  chat_id: string;
+  message_id: string | number | null;
+  status: string;
+  created_at: string | number;
+  expires_at: string | number;
+  decided_at: string | number | null;
+}): TgApprovalRow {
+  return {
+    manifestId: row.manifest_id,
+    server: row.server,
+    chatId: row.chat_id,
+    messageId: row.message_id === null ? null : Number(row.message_id),
+    status: row.status as TgApprovalRow["status"],
+    createdAt: Number(row.created_at),
+    expiresAt: Number(row.expires_at),
+    decidedAt: row.decided_at === null ? null : Number(row.decided_at),
+  };
+}
+
+/** Inserts a new PENDING approval row. `manifest_id` is a fresh UUID minted by
+ * consent.ts's plan phase — collisions are not expected, so this is a plain
+ * INSERT (not upsert), matching consent_manifests' createManifest above. */
+export async function createTgApproval(input: {
+  manifestId: string;
+  server: string;
+  chatId: string;
+  messageId: number | null;
+  createdAt: number;
+  expiresAt: number;
+}): Promise<void> {
+  const p = getPool();
+  await p.query(
+    `INSERT INTO tg_approvals (manifest_id, server, chat_id, message_id, status, created_at, expires_at)
+     VALUES ($1, $2, $3, $4, 'PENDING', $5, $6)`,
+    [input.manifestId, input.server, input.chatId, input.messageId, input.createdAt, input.expiresAt],
+  );
+}
+
+/** Reads an approval row scoped to `server`; null if missing OR belongs to another server. */
+export async function getTgApproval(manifestId: string, server: string): Promise<TgApprovalRow | null> {
+  const p = getPool();
+  const res = await p.query(`SELECT * FROM tg_approvals WHERE manifest_id = $1 AND server = $2`, [
+    manifestId,
+    server,
+  ]);
+  if (!res.rows.length) return null;
+  return rowToTgApproval(res.rows[0]);
+}
+
+/**
+ * Atomic one-shot decision, same shape as `consumeManifest` above: a single
+ * `UPDATE … WHERE status = 'PENDING' … RETURNING` closes the double-tap /
+ * replay race in the database. Returns null on any miss (unknown manifest,
+ * wrong server, already APPROVED/REJECTED, OR the approval row's OWN TTL has
+ * expired) — the webhook handler treats a miss as "already handled, no-op"
+ * (idempotent against Telegram retries). The TTL check is checked against the
+ * SAME `now` value used to stamp `decided_at`, so there's no window between
+ * the compare and the write (mirrors `consumeManifest`'s `expires_at > $4`
+ * guard on consent_manifests). Without this, a button tapped after the
+ * approval row's own TTL — but while the underlying CONSENT manifest is still
+ * AWAITING_CONSENT — would record a decision `checkApproval` had already
+ * started treating as "none" (TTL-expired), which is a self-inconsistent
+ * result even though `notifyPlan` caps the row's `expiresAt` at the consent
+ * manifest's own expiry (their windows coincide by default, but must not be
+ * assumed to always coincide — this table's TTL is independently
+ * configurable via `TG_APPROVAL_TTL_MS`, see `tg_approval.ts`'s
+ * `notifyPlan`).
+ */
+export async function consumeTgDecision(
+  manifestId: string,
+  server: string,
+  status: "APPROVED" | "REJECTED",
+): Promise<TgApprovalRow | null> {
+  const p = getPool();
+  const now = Date.now();
+  const res = await p.query(
+    `UPDATE tg_approvals SET status = $3, decided_at = $4
+      WHERE manifest_id = $1 AND server = $2 AND status = 'PENDING' AND expires_at > $4
+      RETURNING *`,
+    [manifestId, server, status, now],
+  );
+  if (!res.rows.length) return null;
+  return rowToTgApproval(res.rows[0]);
 }
 
 export { randomUUID };

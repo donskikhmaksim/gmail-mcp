@@ -16,6 +16,8 @@ import {
 import { renderDashboard } from "./dashboard.js";
 import { initDownloads, resolveDownloadLink } from "./downloads.js";
 import { buildUserClients } from "./accounts.js";
+import { tgApprovalConfig, tgApprovalStoreAdapter } from "./server.js";
+import { handleWebhook, registerWebhook, secretTokenMatches } from "./tg_approval.js";
 
 const JSONRPC_UNAUTHORIZED = {
   jsonrpc: "2.0" as const,
@@ -144,6 +146,31 @@ export async function startHttpServer(config: Config): Promise<void> {
     res.json({ status: "ok", endpoint: "/mcp" });
   });
   app.get("/health", (_req, res) => res.json({ status: "ok" }));
+
+  // ---- Optional Telegram-approval webhook (plan-tg-approval.md) ----
+  // Deliberately OUTSIDE the normal /mcp auth -- Telegram itself calls this,
+  // not an MCP client. Protected by the secret_token Telegram echoes back on
+  // every request (set via registerWebhook's setWebhook call below), checked
+  // constant-time. Mounted unconditionally (cheap route, no-op body) so
+  // toggling TG_APPROVAL_ENABLED never needs a redeploy of routing -- when
+  // disabled, tgApprovalConfig.webhookSecret is "" and secretTokenMatches
+  // rejects every request (empty expected secret never matches).
+  app.post("/tg/webhook", async (req: Request, res: Response) => {
+    const provided = req.header("x-telegram-bot-api-secret-token") ?? "";
+    if (!secretTokenMatches(provided, tgApprovalConfig.webhookSecret)) {
+      res.status(401).end();
+      return;
+    }
+    try {
+      await handleWebhook(tgApprovalConfig, tgApprovalStoreAdapter, req.body);
+    } catch (err) {
+      console.error("TG approval webhook error:", err);
+    }
+    // Always 200 -- Telegram retries on non-2xx, and every failure mode here
+    // (wrong from.id, replay, unknown callback_data) is intentionally a no-op,
+    // not an error Telegram should retry.
+    res.status(200).end();
+  });
 
   initDownloads(config.onboarding.publicBaseUrl);
 
@@ -353,6 +380,10 @@ export async function startHttpServer(config: Config): Promise<void> {
   };
   app.get("/mcp", methodNotAllowed);
   app.delete("/mcp", methodNotAllowed);
+
+  if (tgApprovalConfig.enabled) {
+    await registerWebhook(tgApprovalConfig);
+  }
 
   await new Promise<void>((resolve) => {
     app.listen(config.port, () => {

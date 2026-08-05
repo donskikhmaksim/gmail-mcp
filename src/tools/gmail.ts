@@ -21,6 +21,7 @@ import {
   type ConsentStore,
   type ConsentConfig,
   type ConsentPlan,
+  type TgApprovalGate,
 } from "../consent.js";
 import {
   issueDownloadLink,
@@ -1584,6 +1585,14 @@ export interface GmailSnoozeContext {
    * gate itself is off in that case too, so there is no audit to read.
    */
   auditStore: AuditStore | null;
+  /**
+   * Optional out-of-band Telegram-approval layer (plan-tg-approval.md).
+   * undefined ⇒ `requireConsent`'s `tg` branch never runs — behaviour is
+   * byte-for-byte identical to before this field existed. Production always
+   * passes `tgApprovalGate` from server.ts, whose `enabledFor()` is itself
+   * false unless TG_APPROVAL_ENABLED=true.
+   */
+  tg?: TgApprovalGate;
 }
 
 /** Fallback gate config for callers that don't wire a real one (offline unit
@@ -1909,7 +1918,7 @@ export function registerGmailTools(
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, messages, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = snoozeCtx;
+      const { consentStore, consentCfg, tg } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Отправка недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -1928,6 +1937,7 @@ export function registerGmailTools(
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: () => {
           if (!messages || !messages.length) {
             throw new Error("Нужен непустой `messages`, чтобы построить план отправки.");
@@ -2024,7 +2034,7 @@ export function registerGmailTools(
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, replies, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = snoozeCtx;
+      const { consentStore, consentCfg, tg } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Ответ недоступен: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -2043,6 +2053,7 @@ export function registerGmailTools(
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         // Plan phase ONLY reads the originals (messages.get) to resolve the
         // real recipient and build the preview — no drafts.create here (that
         // was the incident-2 precursor: a draft is a mutation too). The exact
@@ -2206,7 +2217,7 @@ export function registerGmailTools(
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = snoozeCtx;
+      const { consentStore, consentCfg, tg } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Пересылка недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -2225,6 +2236,7 @@ export function registerGmailTools(
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         // Plan phase only reads the original (cheap metadata read) to build the
         // preview and an identity fingerprint (From/Subject) — attachment bytes
         // are NOT touched here, only at execute (avoids downloading/holding
@@ -2372,7 +2384,7 @@ export function registerGmailTools(
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, drafts, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = snoozeCtx;
+      const { consentStore, consentCfg, tg } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Создание черновика недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -2391,6 +2403,7 @@ export function registerGmailTools(
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: () => {
           if (!drafts || !drafts.length) {
             throw new Error("Нужен непустой `drafts`, чтобы построить план создания черновика.");
@@ -2477,7 +2490,7 @@ export function registerGmailTools(
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, messageIds, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = snoozeCtx;
+      const { consentStore, consentCfg, tg } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Архивирование недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -2494,6 +2507,7 @@ export function registerGmailTools(
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: () => buildIdBatchPlan(g, accountName, messageIds, "Архивирование писем", "archive"),
         rehash: (addressing) => rehashIdBatch(g, addressing as IdBatchPayload),
       });
@@ -2558,7 +2572,7 @@ export function registerGmailTools(
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, messageIds, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = snoozeCtx;
+      const { consentStore, consentCfg, tg } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Удаление в Корзину недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -2575,6 +2589,7 @@ export function registerGmailTools(
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: () => buildIdBatchPlan(g, accountName, messageIds, "Удаление писем в Корзину", "trash"),
         rehash: (addressing) => rehashIdBatch(g, addressing as IdBatchPayload),
       });
@@ -2646,7 +2661,7 @@ export function registerGmailTools(
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = snoozeCtx;
+      const { consentStore, consentCfg, tg } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Изменение меток недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -2663,6 +2678,7 @@ export function registerGmailTools(
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план изменения меток.");
@@ -2790,7 +2806,7 @@ export function registerGmailTools(
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = snoozeCtx;
+      const { consentStore, consentCfg, tg } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Отложенный возврат в inbox недоступен: не настроено хранилище согласия (DATABASE_URL). Без него " +
@@ -2807,6 +2823,7 @@ export function registerGmailTools(
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план отложенного возврата в inbox.");
@@ -2936,7 +2953,7 @@ export function registerGmailTools(
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, messages, manifest_id, user_reply }) => {
-      const { store, userToken, consentStore, consentCfg } = snoozeCtx;
+      const { store, userToken, consentStore, consentCfg, tg } = snoozeCtx;
       if (!store) {
         return fail(
           "Scheduled send requires DATABASE_URL (Railway Postgres) to be configured on this server — " +
@@ -2968,6 +2985,7 @@ export function registerGmailTools(
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: () => {
           if (!messages || !messages.length) {
             throw new Error("Нужен непустой `messages`, чтобы построить план отложенной отправки.");
@@ -3310,7 +3328,7 @@ export function registerGmailTools(
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = snoozeCtx;
+      const { consentStore, consentCfg, tg } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Сохранение в Drive недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -3327,6 +3345,7 @@ export function registerGmailTools(
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         // Plan reads the MIME tree (format=full) to locate the attachment's
         // real filename/size for identity — it does NOT download the
         // attachment's bytes (those live behind a separate attachments.get
@@ -3491,7 +3510,7 @@ export function registerGmailTools(
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, labels, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = snoozeCtx;
+      const { consentStore, consentCfg, tg } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Создание метки недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -3508,6 +3527,7 @@ export function registerGmailTools(
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: () => {
           if (!labels || !labels.length) {
             throw new Error("Нужен непустой `labels`, чтобы построить план создания меток.");
@@ -3598,7 +3618,7 @@ export function registerGmailTools(
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = snoozeCtx;
+      const { consentStore, consentCfg, tg } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Изменение метки недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -3615,6 +3635,7 @@ export function registerGmailTools(
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         // Plan reads the CURRENT name of every label — the identity-guard
         // pair (id + name) identity-postverify.md §4 requires: a caller
         // passing only an id gets the current name filled in by the server,
@@ -3734,7 +3755,7 @@ export function registerGmailTools(
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, labelIds, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = snoozeCtx;
+      const { consentStore, consentCfg, tg } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Удаление метки недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -3751,6 +3772,7 @@ export function registerGmailTools(
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         // Plan reads each label's current name AND a best-effort message
         // count (identity-postverify.md §5.2 pre-snapshot requirement for
         // this irreversible op) — a failed count never blocks the plan, it
@@ -3879,7 +3901,7 @@ export function registerGmailTools(
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, threadId, folderId, folderName, format, scope, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = snoozeCtx;
+      const { consentStore, consentCfg, tg } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Экспорт треда недоступен: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -3914,6 +3936,7 @@ export function registerGmailTools(
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!threadId) {
             throw new Error("Нужен непустой `threadId`, чтобы построить план экспорта.");
@@ -4210,7 +4233,7 @@ export function registerGmailTools(
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, files, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = snoozeCtx;
+      const { consentStore, consentCfg, tg } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Загрузочная сессия недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -4227,6 +4250,7 @@ export function registerGmailTools(
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: () => {
           if (!files || !files.length) {
             throw new Error("Нужен непустой `files`, чтобы построить план открытия загрузочных сессий.");
