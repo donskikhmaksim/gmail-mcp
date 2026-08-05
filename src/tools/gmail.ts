@@ -6,6 +6,7 @@ import { z } from "zod";
 import { Readable } from "node:stream";
 import dns from "node:dns/promises";
 import net from "node:net";
+import { Agent as UndiciAgent, fetch as pinnedFetch } from "undici";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { gmail_v1 } from "googleapis";
 import { ok, fail, guard, isTextual, mapWithLimit, safeText } from "../util.js";
@@ -594,12 +595,20 @@ function isBlockedIpv6(ip: string): boolean {
   return false;
 }
 
+/** A resolved-and-vetted host: every address in `addrs` already passed isBlockedIp. */
+interface ResolvedHost {
+  url: URL;
+  addrs: { address: string; family: 4 | 6 }[];
+}
+
 /**
- * Validates a URL for a server-side fetch: https-only, and every resolved IP
- * must be public. Throws a 🛑-style refusal on anything unsafe. Returns the
- * parsed URL when clean. `lookup` is injectable for offline tests.
+ * Resolves + validates a URL for a server-side fetch: https-only, and every
+ * resolved IP must be public. Throws a 🛑-style refusal on anything unsafe.
+ * Returns the parsed URL AND the exact vetted addresses, so the caller can
+ * pin the actual TCP connection to one of them (see `fetchAttachmentSafely`
+ * below for why re-resolving is unsafe). `lookup` is injectable for tests.
  */
-export async function assertPublicUrl(rawUrl: string, lookup: LookupFn = defaultLookup): Promise<URL> {
+async function resolveAndValidateHost(rawUrl: string, lookup: LookupFn): Promise<ResolvedHost> {
   let url: URL;
   try {
     url = new URL(rawUrl);
@@ -611,23 +620,66 @@ export async function assertPublicUrl(rawUrl: string, lookup: LookupFn = default
   }
   const host = url.hostname.replace(/^\[|\]$/g, ""); // strip IPv6 brackets
   // If the host is already an IP literal, check it directly (no DNS at all).
-  if (net.isIP(host)) {
+  const literalKind = net.isIP(host);
+  if (literalKind) {
     if (isBlockedIp(host)) throw new Error("🛑 Ссылка ведёт на внутренний/приватный адрес — вложение не скачано.");
-    return url;
+    return { url, addrs: [{ address: host, family: literalKind as 4 | 6 }] };
   }
-  let addrs: { address: string }[];
+  let resolved: { address: string }[];
   try {
-    addrs = await lookup(host);
+    resolved = await lookup(host);
   } catch {
     throw new Error("🛑 Не удалось разрешить имя хоста ссылки — вложение не скачано.");
   }
-  if (!addrs.length) throw new Error("🛑 Имя хоста ссылки не разрешается ни в один адрес — вложение не скачано.");
-  for (const a of addrs) {
+  if (!resolved.length) throw new Error("🛑 Имя хоста ссылки не разрешается ни в один адрес — вложение не скачано.");
+  const addrs: { address: string; family: 4 | 6 }[] = [];
+  for (const a of resolved) {
     if (isBlockedIp(a.address)) {
       throw new Error("🛑 Имя хоста ссылки разрешается во внутренний/приватный адрес — вложение не скачано.");
     }
+    const fam = net.isIP(a.address);
+    addrs.push({ address: a.address, family: (fam === 6 ? 6 : 4) as 4 | 6 });
   }
+  return { url, addrs };
+}
+
+/**
+ * Validates a URL for a server-side fetch: https-only, and every resolved IP
+ * must be public. Throws a 🛑-style refusal on anything unsafe. Returns the
+ * parsed URL when clean. `lookup` is injectable for offline tests.
+ *
+ * NOTE: this alone does not protect a subsequent `fetch(url)` against DNS
+ * rebinding — see `fetchAttachmentSafely`, which pins the connection to the
+ * exact addresses validated here instead of letting the HTTP client resolve
+ * the host again.
+ */
+export async function assertPublicUrl(rawUrl: string, lookup: LookupFn = defaultLookup): Promise<URL> {
+  const { url } = await resolveAndValidateHost(rawUrl, lookup);
   return url;
+}
+
+/**
+ * A `net.connect`/`tls.connect`-compatible `lookup` function that ignores
+ * whatever hostname it is asked to resolve and always answers with the
+ * pre-vetted address list — i.e. it performs no DNS resolution of its own.
+ * Handles both call shapes Node's connectors use: `{all:true}` (array of
+ * `{address,family}`, used by Happy-Eyeballs/autoSelectFamily) and the
+ * single-address legacy shape (`callback(err, address, family)`).
+ *
+ * Exported for tests: the strongest proof that rebinding is closed is
+ * calling this with a hostname argument that does NOT match what it was
+ * built for, and asserting it still answers with only the vetted addresses
+ * — i.e. structurally incapable of falling back to a fresh resolve.
+ */
+export function pinnedLookup(addrs: { address: string; family: 4 | 6 }[]): net.LookupFunction {
+  return (_hostname, options, callback) => {
+    const wantsAll = typeof options === "object" && options !== null && "all" in options && options.all === true;
+    if (wantsAll) {
+      callback(null, addrs.map((a) => ({ address: a.address, family: a.family })));
+    } else {
+      callback(null, addrs[0].address, addrs[0].family);
+    }
+  };
 }
 
 /**
@@ -635,53 +687,88 @@ export async function assertPublicUrl(rawUrl: string, lookup: LookupFn = default
  * Location re-validated), a per-request timeout and a streaming size cap
  * enforced WHILE downloading (never buffers past the cap). Returns the bytes
  * and the response content-type. Exported for tests.
+ *
+ * DNS-rebinding / TOCTOU fix: `resolveAndValidateHost` resolves + validates
+ * the host exactly ONCE per hop. The actual TCP/TLS connection is then
+ * pinned to that SAME vetted address via a per-hop undici `Agent` with a
+ * custom `connect.lookup` (see `pinnedLookup`) — the HTTP client is never
+ * allowed to re-resolve the hostname itself. Without this, an attacker
+ * serving a short-TTL DNS record could answer the validation lookup with a
+ * public IP and the connect-time lookup (a completely independent resolve
+ * inside the HTTP client) with a private one, e.g. Railway's
+ * 169.254.169.254 metadata endpoint — validated-but-not-what-you-connect-to.
+ * Host header and TLS SNI are left untouched (still the real hostname, via
+ * the `Agent`'s connector, which reads `servername`/`host` from the request
+ * URL, not from the resolved IP) so certificate validation still works
+ * normally against the real hostname.
+ *
+ * We deliberately use `undici`'s OWN `fetch` + `Agent` pair (same package,
+ * same realm) instead of Node's global `fetch` with an externally-built
+ * dispatcher: Node's global fetch is powered by an INTERNAL undici bundled
+ * into the Node binary (this repo's runtime: Node 22, internal undici
+ * 6.24.1) with its own request-handler wire format, and handing it a
+ * dispatcher built from the separately-installed `undici` npm package
+ * throws (`InvalidArgumentError: invalid onRequestStart method`) whenever
+ * the two versions' internal handler interfaces disagree — verified
+ * empirically while building this fix. Using undici's fetch+Agent together
+ * sidesteps that version-skew trap entirely: both come from the exact same
+ * module instance, so pinning cannot silently regress on a Node bump.
  */
+export type PinnedFetchFn = typeof pinnedFetch;
+
 export async function fetchAttachmentSafely(
   rawUrl: string,
   maxBytes: number,
   lookup: LookupFn = defaultLookup,
+  // Injectable for offline tests — must be given a `dispatcher` to actually
+  // exercise the pin. Defaults to undici's real fetch (see the doc comment
+  // above for why it must be undici's, not Node's global, fetch).
+  fetchImpl: PinnedFetchFn = pinnedFetch,
 ): Promise<{ buf: Buffer; contentType: string | null }> {
   let current = rawUrl;
   for (let hop = 0; hop <= MAX_ATTACHMENT_REDIRECTS; hop++) {
-    const url = await assertPublicUrl(current, lookup);
+    const { url, addrs } = await resolveAndValidateHost(current, lookup);
+    const dispatcher = new UndiciAgent({
+      connect: { lookup: pinnedLookup(addrs), timeout: FETCH_TIMEOUT_MS },
+    });
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
-    let resp: Response;
     try {
-      resp = await fetch(url, { redirect: "manual", signal: ctrl.signal, headers: { accept: "*/*" } });
-    } catch (e) {
-      clearTimeout(timer);
-      if ((e as { name?: string })?.name === "AbortError") {
-        throw new Error("🛑 Источник вложения не ответил вовремя (таймаут). Вложение не скачано.");
+      let resp: Awaited<ReturnType<typeof pinnedFetch>>;
+      try {
+        resp = await fetchImpl(url, {
+          redirect: "manual",
+          signal: ctrl.signal,
+          headers: { accept: "*/*" },
+          dispatcher,
+        });
+      } catch (e) {
+        if ((e as { name?: string })?.name === "AbortError") {
+          throw new Error("🛑 Источник вложения не ответил вовремя (таймаут). Вложение не скачано.");
+        }
+        throw new Error("🛑 Не удалось соединиться с источником вложения. Вложение не скачано.");
       }
-      throw new Error("🛑 Не удалось соединиться с источником вложения. Вложение не скачано.");
-    }
-    // Manual redirect: re-validate the target through assertPublicUrl on next hop.
-    if (resp.status >= 300 && resp.status < 400 && resp.headers.get("location")) {
-      clearTimeout(timer);
-      current = new URL(resp.headers.get("location")!, url).toString();
-      continue;
-    }
-    if (!resp.ok) {
-      clearTimeout(timer);
-      throw new Error(`🛑 Источник вложения ответил ошибкой (HTTP ${resp.status}). Вложение не скачано.`);
-    }
-    // Fast pre-check: a declared Content-Length over the cap is refused up front.
-    const declared = Number(resp.headers.get("content-length") ?? "");
-    if (Number.isFinite(declared) && declared > maxBytes) {
-      clearTimeout(timer);
-      throw new Error(
-        `🛑 Вложение по ссылке — ${Math.round(declared / (1024 * 1024))} МБ; Gmail ограничивает письмо 25 МБ. Не скачано.`,
-      );
-    }
-    const contentType = resp.headers.get("content-type")?.split(";")[0]?.trim() ?? null;
-    try {
-      const buf = await readCappedStream(resp.body, maxBytes);
-      clearTimeout(timer);
+      // Manual redirect: re-validate + re-pin the target on next hop.
+      if (resp.status >= 300 && resp.status < 400 && resp.headers.get("location")) {
+        current = new URL(resp.headers.get("location")!, url).toString();
+        continue;
+      }
+      if (!resp.ok) {
+        throw new Error(`🛑 Источник вложения ответил ошибкой (HTTP ${resp.status}). Вложение не скачано.`);
+      }
+      // Fast pre-check: a declared Content-Length over the cap is refused up front.
+      const declared = Number(resp.headers.get("content-length") ?? "");
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        throw new Error(
+          `🛑 Вложение по ссылке — ${Math.round(declared / (1024 * 1024))} МБ; Gmail ограничивает письмо 25 МБ. Не скачано.`,
+        );
+      }
+      const contentType = resp.headers.get("content-type")?.split(";")[0]?.trim() ?? null;
+      const buf = await readCappedStream(resp.body as unknown as ReadableStream<Uint8Array> | null, maxBytes);
       return { buf, contentType };
-    } catch (e) {
+    } finally {
       clearTimeout(timer);
-      throw e;
+      void dispatcher.close().catch(() => {});
     }
   }
   throw new Error("🛑 Слишком много перенаправлений при скачивании вложения. Не скачано.");
