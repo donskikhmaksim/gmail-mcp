@@ -11,7 +11,7 @@
  */
 import { MockAgent, setGlobalDispatcher } from "undici";
 import { requireConsent, sha256 } from "../src/consent.ts";
-import { createTgApprovalGate, handleWebhook, secretTokenMatches } from "../src/tg_approval.ts";
+import { createTgApprovalGate, handleWebhook, registerWebhook, secretTokenMatches } from "../src/tg_approval.ts";
 
 // ── управляемые часы (как в test-consent.mjs) ───────────────────────────────
 const clock = { t: 1_700_000_000_000 };
@@ -113,6 +113,19 @@ function makeTgStore() {
       r.decidedAt = clock.t;
       return { ...r };
     },
+    // Server-agnostic сиблинг — реальный путь `handleWebhook` после фикса
+    // "один бот на 6 серверов" (store.ts's `consumeTgDecisionAnyServer`):
+    // НЕ фильтрует по server, потому что manifest_id — PRIMARY KEY (глобально
+    // уникален), а вебхук физически не знает заранее, какому серверу
+    // принадлежит нажатая кнопка.
+    async consumeTgDecisionAnyServer(manifestId, status) {
+      const r = approvals.get(manifestId);
+      if (!r || r.status !== "PENDING") return null; // атомарный one-shot, БЕЗ фильтра по server
+      if (clock.t >= r.expiresAt) return null; // TTL-guard — зеркалит store.ts's `expires_at > $now`
+      r.status = status;
+      r.decidedAt = clock.t;
+      return { ...r };
+    },
   };
 }
 
@@ -138,6 +151,7 @@ function tgCfg(overrides = {}) {
     server: "gmail",
     toolsAllowlist: null,
     ttlMs: 3_600_000,
+    webhookOwner: false, // TG_WEBHOOK_OWNER default — most tests don't touch registerWebhook at all
     ...overrides,
   };
 }
@@ -242,12 +256,12 @@ console.log("\n[4] execute при PENDING в Telegram → refused «жду по�
   check("манифест всё ещё AWAITING_CONSENT (не consumed)", row.status === "AWAITING_CONSENT");
 }
 
-// ═══ [5] APPROVED (через тот же путь, что и webhook — consumeTgDecision) → execute проходит ═══
+// ═══ [5] APPROVED (через тот же путь, что и webhook — consumeTgDecisionAnyServer) → execute проходит ═══
 console.log("\n[5] APPROVED в Telegram + «да» в чате → confirmed");
 {
   const { dec, consentStore, tgStore, gate } = planCtx;
-  const consumed = await tgStore.consumeTgDecision(dec.manifestId, "gmail", "APPROVED");
-  check("consumeTgDecision(APPROVED) сработал", !!consumed && consumed.status === "APPROVED");
+  const consumed = await tgStore.consumeTgDecisionAnyServer(dec.manifestId, "APPROVED");
+  check("consumeTgDecisionAnyServer(APPROVED) сработал", !!consumed && consumed.status === "APPROVED");
 
   const exec = await requireConsent({
     tool: "gmail_send", accountLabel: "work", manifestId: dec.manifestId, userReply: "да",
@@ -269,7 +283,7 @@ console.log("\n[6] REJECTED в Telegram → манифест INVALIDATED, refuse
   const consentStore = makeConsentStore();
 
   const dec = await requireConsent({ tool: "gmail_send", accountLabel: "work", plan, rehash, store: consentStore, cfg: consentCfg, tg: gate });
-  await tgStore.consumeTgDecision(dec.manifestId, "gmail", "REJECTED");
+  await tgStore.consumeTgDecisionAnyServer(dec.manifestId, "REJECTED");
   clock.t += 6_000; // анти-дуплет (2)
 
   const exec = await requireConsent({
@@ -306,7 +320,7 @@ console.log("\n[7] TTL approval-запроса истёк → checkApproval='non
   clock.t = 1_700_000_000_000; // откатываем общие часы для следующих секций
 }
 
-// ═══ [7b] TTL-guard в consumeTgDecision: кнопка нажата ПОСЛЕ истечения ═══
+// ═══ [7b] TTL-guard в consumeTgDecisionAnyServer: кнопка нажата ПОСЛЕ истечения ═══
 // approval-TTL, но пока consent-манифест ещё жив (окно из приёмки: approval-
 // TTL короче consent-TTL) → webhook-путь не должен записать решение вообще.
 console.log("\n[7b] кнопка нажата после истечения approval-TTL (манифест ещё жив) → решение НЕ записывается");
@@ -342,7 +356,7 @@ console.log("\n[7b] кнопка нажата после истечения appr
 
   const rowAfter = tgStore.approvals.get(dec.manifestId);
   check(
-    "webhook НЕ перевёл строку в APPROVED — осталась PENDING (TTL-guard в consumeTgDecision)",
+    "webhook НЕ перевёл строку в APPROVED — осталась PENDING (TTL-guard в consumeTgDecisionAnyServer)",
     rowAfter.status === "PENDING",
     JSON.stringify(rowAfter),
   );
@@ -448,6 +462,116 @@ console.log("\n[11] webhook: обновление без callback_query — иг
   const tgStore = makeTgStore();
   await handleWebhook(cfg, tgStore, { update_id: 1, message: { text: "hi" } });
   check("никакого обращения к Telegram", tgCalls.length === 0);
+}
+
+// ═══ [12] один бот на 6 серверов: вебхук консюмит манифест ЧУЖОГО сервера ═══
+// Регрессионный тест на сам фикс: cfg этого процесса — "gmail" (webhook
+// физически задеплоен на gmail-mcp), а approval-строка в БД принадлежит
+// "calendar" (создана ДРУГИМ сервером через тот же общий бот-токен). Со
+// старым фильтром `AND server = cfg.server` в `consumeTgDecision` это был бы
+// 0-rows silent miss — approval "calendar" навсегда застревал бы в PENDING.
+// После фикса (`consumeTgDecisionAnyServer`, БЕЗ фильтра по server) вебхук
+// обязан консюмить его корректно именно потому, что manifest_id — глобально
+// уникальный PRIMARY KEY, а не потому, что сервера совпали.
+console.log("\n[12] вебхук на gmail консюмит approval манифеста, принадлежащего server=calendar");
+{
+  const { mock } = resetTelegramMocks();
+  mock("answerCallbackQuery", () => ({ statusCode: 200, data: { ok: true }, headers: { "content-type": "application/json" } }));
+  mock("editMessageReplyMarkup", () => ({ statusCode: 200, data: { ok: true }, headers: { "content-type": "application/json" } }));
+
+  // cfg.server = "gmail" (этот процесс), но approval-строка принадлежит "calendar".
+  const cfg = tgCfg({ server: "gmail" });
+  const tgStore = makeTgStore();
+  await tgStore.createTgApproval({
+    manifestId: "m-cross-server",
+    server: "calendar", // ЧУЖОЙ сервер, не cfg.server
+    chatId: cfg.ownerChatId,
+    messageId: 55,
+    createdAt: now(),
+    expiresAt: now() + 3_600_000,
+  });
+
+  // Контрольная проверка регрессии: старый server-scoped `consumeTgDecision`
+  // с cfg.server="gmail" против строки server="calendar" — 0 rows, silent miss.
+  const oldPathMiss = await tgStore.consumeTgDecision("m-cross-server", cfg.server, "APPROVED");
+  check(
+    "контроль: старый server-scoped путь ДЕЙСТВИТЕЛЬНО падал бы тут (0 rows) — подтверждает, что баг был реальным",
+    oldPathMiss === null,
+  );
+  check("approval всё ещё PENDING после неудачной старой попытки", tgStore.approvals.get("m-cross-server").status === "PENDING");
+
+  const update = {
+    callback_query: {
+      id: "cbq-cross-server",
+      from: { id: Number(cfg.ownerChatId) },
+      data: `a:m-cross-server`,
+      message: { message_id: 55, chat: { id: cfg.ownerChatId } },
+    },
+  };
+  await handleWebhook(cfg, tgStore, update);
+
+  const row = tgStore.approvals.get("m-cross-server");
+  check(
+    "новый server-agnostic путь: вебхук на gmail консюмит APPROVED для манифеста server=calendar",
+    row.status === "APPROVED",
+    JSON.stringify(row),
+  );
+  check("decidedAt проставлен", row.decidedAt === clock.t);
+  check("editMessageReplyMarkup вызван — кнопки сняты", tgCalls.some((c) => c.method === "editMessageReplyMarkup"));
+  check(
+    "answerCallbackQuery отвечает «Подтверждено», а не «Уже обработано»",
+    tgCalls.some((c) => c.method === "answerCallbackQuery" && c.body.text === "Подтверждено"),
+  );
+
+  // REJECTED-ветка тем же способом, другой манифест чужого сервера ("docs").
+  await tgStore.createTgApproval({
+    manifestId: "m-cross-server-2",
+    server: "docs",
+    chatId: cfg.ownerChatId,
+    messageId: 56,
+    createdAt: now(),
+    expiresAt: now() + 3_600_000,
+  });
+  await handleWebhook(cfg, tgStore, {
+    callback_query: {
+      id: "cbq-cross-server-2",
+      from: { id: Number(cfg.ownerChatId) },
+      data: `r:m-cross-server-2`,
+      message: { message_id: 56, chat: { id: cfg.ownerChatId } },
+    },
+  });
+  check(
+    "REJECTED тоже консюмится через чужой сервер (docs)",
+    tgStore.approvals.get("m-cross-server-2").status === "REJECTED",
+  );
+}
+
+// ═══ [13] registerWebhook: guard TG_WEBHOOK_OWNER ═══
+// Один бот-токен на 6 серверов означает, что setWebhook ДОЛЖЕН вызвать
+// РОВНО один из них. Без TG_WEBHOOK_OWNER=true (дефолт) registerWebhook
+// обязан быть no-op — иначе второй сервер, получивший этот же код при
+// переносе (gmail-mcp -> sheets/calendar/docs/drive/ticktick-mcp), молча
+// перезапишет чужой вебхук просто потому, что у него тоже включён
+// TG_APPROVAL_ENABLED.
+console.log("\n[13] registerWebhook: TG_WEBHOOK_OWNER не установлен/false → setWebhook НЕ вызывается");
+{
+  const { mock } = resetTelegramMocks();
+  // Если бы registerWebhook всё-таки дошёл до сети, setWebhook ответил бы ok —
+  // тест обязан провалиться на отсутствии самого вызова, а не на его результате.
+  mock("setWebhook", () => ({ statusCode: 200, data: { ok: true, result: true }, headers: { "content-type": "application/json" } }));
+
+  // (a) enabled=true, webhookOwner не задан (false по умолчанию через tgCfg()).
+  await registerWebhook(tgCfg({ enabled: true }));
+  check("webhookOwner отсутствует/false → setWebhook НЕ вызван", tgCalls.filter((c) => c.method === "setWebhook").length === 0);
+
+  // (b) enabled=true, webhookOwner ЯВНО false.
+  await registerWebhook(tgCfg({ enabled: true, webhookOwner: false }));
+  check("webhookOwner=false явно → setWebhook по-прежнему НЕ вызван", tgCalls.filter((c) => c.method === "setWebhook").length === 0);
+
+  // (c) контрольная проверка: с webhookOwner=true (и enabled=true) вызов ДОЛЖЕН пройти —
+  // подтверждает, что guard не сломал сам happy-path, а именно гейтит его.
+  await registerWebhook(tgCfg({ enabled: true, webhookOwner: true }));
+  check("webhookOwner=true → setWebhook ВЫЗВАН ровно один раз", tgCalls.filter((c) => c.method === "setWebhook").length === 1);
 }
 
 // ── итог ─────────────────────────────────────────────────────────────────

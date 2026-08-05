@@ -387,6 +387,19 @@ export interface TgApprovalConfig {
    * CONSENT_TTL_MS's default so the two layers don't silently diverge unless
    * a deployer explicitly wants that). */
   ttlMs: number;
+  /**
+   * Env TG_WEBHOOK_OWNER, default false. ONE Telegram bot token can be shared
+   * across several MCP servers (gmail/sheets/calendar/docs/drive-mcp +
+   * ticktick-mcp) — but Telegram routes every update for a bot to exactly one
+   * webhook URL, the one the most recent `setWebhook` call registered. Set
+   * `true` on exactly the ONE server that should own `/tg/webhook` and call
+   * `setWebhook` at startup; every other server sharing the same TG_BOT_TOKEN
+   * must leave this unset (default false), or their `setWebhook` calls will
+   * silently overwrite each other and approvals for whoever registered last
+   * stop reaching anyone. See `registerWebhook` in tg_approval.ts, which
+   * self-guards on this field (defense-in-depth beyond the call-site check).
+   */
+  webhookOwner: boolean;
 }
 
 export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
@@ -407,6 +420,7 @@ export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
       )
     : null;
   const ttlMs = positiveIntEnv("TG_APPROVAL_TTL_MS", 3_600_000);
+  const webhookOwner = process.env.TG_WEBHOOK_OWNER?.trim().toLowerCase() === "true";
 
   // Loud, fail-fast startup check (plan §2, package P0 "Готово" criterion):
   // ENABLED=true without every required piece must NOT silently disable the
@@ -435,6 +449,7 @@ export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
     server: consentServer,
     toolsAllowlist,
     ttlMs,
+    webhookOwner,
   };
 }
 

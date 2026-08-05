@@ -1243,4 +1243,48 @@ export async function consumeTgDecision(
   return rowToTgApproval(res.rows[0]);
 }
 
+/**
+ * Server-agnostic sibling of `consumeTgDecision` above — same atomic
+ * `UPDATE … WHERE status = 'PENDING' … RETURNING` shape, but WITHOUT the
+ * `server` filter. Exists for the shared-bot webhook path (see
+ * `tg_approval.ts`'s `handleWebhook` + `TgApprovalStore.
+ * consumeTgDecisionAnyServer`): one Telegram bot token is now shared across
+ * several MCP servers (gmail/sheets/calendar/docs/drive/ticktick), but only
+ * ONE of them physically owns `/tg/webhook` (`TG_WEBHOOK_OWNER=true` —
+ * `registerWebhook`'s guard). That one server's webhook handler receives
+ * button taps for manifests belonging to ANY of the servers, and it does not
+ * know in advance which one — it only has `manifest_id` from `callback_data`.
+ * Filtering by `server` there (the old behaviour) silently returned zero rows
+ * for every manifest that did not belong to the webhook-owning server,
+ * leaving those approvals stuck PENDING forever.
+ *
+ * This is safe precisely because `manifest_id` is `tg_approvals`' PRIMARY KEY
+ * (`ensureSchema()` above) — globally unique across every server sharing this
+ * one physical Postgres, not scoped per row. There is no server-scoping being
+ * bypassed here, only a redundant filter being dropped for the one call site
+ * that cannot supply it. Returns the row's real `server` field so the caller
+ * (`handleWebhook`) can log which server's approval was actually decided.
+ *
+ * `getTgApproval`/`checkApproval` (the EXECUTE-phase read path, called by
+ * each server for its OWN manifests only) still filter by `server` — that
+ * filter stays correct and is untouched: a server must never read another
+ * server's approval status, it just cannot avoid writing through the shared
+ * webhook.
+ */
+export async function consumeTgDecisionAnyServer(
+  manifestId: string,
+  status: "APPROVED" | "REJECTED",
+): Promise<TgApprovalRow | null> {
+  const p = getPool();
+  const now = Date.now();
+  const res = await p.query(
+    `UPDATE tg_approvals SET status = $2, decided_at = $3
+      WHERE manifest_id = $1 AND status = 'PENDING' AND expires_at > $3
+      RETURNING *`,
+    [manifestId, status, now],
+  );
+  if (!res.rows.length) return null;
+  return rowToTgApproval(res.rows[0]);
+}
+
 export { randomUUID };
