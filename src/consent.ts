@@ -117,6 +117,12 @@ export interface ConsentStore {
    * Дополняет ранее записанную аудит-строку исходом мутации и post-verify.
    * Зовётся ИНСТРУМЕНТОМ (пакет A3) ПОСЛЕ мутации, не этим модулем — объявлен
    * здесь только чтобы зафиксировать контракт для A1.
+   *
+   * `preSnapshot` добавлен пакетом A3 (identity-postverify.md §5.2): снимок
+   * исходящего объекта (account/to/cc/bcc/subject/начало тела — БЕЗ полного
+   * тела) ДО необратимой мутации. Это не gmail-специфика — то же самое
+   * потребуется T2 на остальных 4 серверах, поэтому поле в общем контракте,
+   * а не только в store.ts.
    */
   updateConsentAuditOutcome(
     auditId: string,
@@ -124,6 +130,7 @@ export interface ConsentStore {
       outcome?: "confirmed" | "failed";
       postVerify?: string | null;
       error?: string | null;
+      preSnapshot?: unknown;
     },
   ): Promise<void>;
 }

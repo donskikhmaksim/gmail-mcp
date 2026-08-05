@@ -105,6 +105,61 @@ async function buildHarness(snoozeCtx) {
 
 const parse = (r) => JSON.parse(r.content[0].text);
 
+// gmail_schedule_send is now consent-gated (package A3): a bare call with
+// `messages` only builds a plan, nothing is queued. Sections 5-7 below drive
+// the two-phase flow with a tiny in-memory ConsentStore — minConsentGapMs=0
+// skips the anti-doublet wait since that's covered by scripts/test-consent.mjs
+// / scripts/test-a3-gate.mjs, not the point of this file.
+function makeConsentStore() {
+  const manifests = new Map();
+  const audits = new Map();
+  return {
+    async createManifest(input) {
+      manifests.set(input.id, { ...input, status: "AWAITING_CONSENT", consumedAt: null, userReply: null });
+    },
+    async getManifest(id, server) {
+      const r = manifests.get(id);
+      return r && r.server === server ? { ...r } : null;
+    },
+    async consumeManifest(id, server, userReply) {
+      const r = manifests.get(id);
+      if (!r || r.server !== server || r.status !== "AWAITING_CONSENT") return null;
+      r.status = "DONE";
+      r.consumedAt = Date.now();
+      r.userReply = userReply;
+      return { ...r };
+    },
+    async invalidateManifest(id, server, userReply) {
+      const r = manifests.get(id);
+      if (r && r.server === server && r.status === "AWAITING_CONSENT") {
+        r.status = "INVALIDATED";
+        r.userReply = userReply;
+      }
+    },
+    async appendConsentAudit(entry) {
+      audits.set(entry.id, { ...entry });
+    },
+    async updateConsentAuditOutcome(auditId, outcome) {
+      const a = audits.get(auditId);
+      if (a) Object.assign(a, outcome);
+    },
+  };
+}
+const CONSENT_CFG = { server: "gmail", consentTtlMs: 3_600_000, minConsentGapMs: 0, sendBatchMax: 10 };
+function extractManifestId(previewText) {
+  const m = previewText.match(/план `([^`]+)`/);
+  if (!m) throw new Error("no manifest id found in plan preview: " + previewText);
+  return m[1];
+}
+/** Drives plan → confirm; returns the parsed execute-phase result. */
+async function scheduleThroughGate(client, args) {
+  const planResp = await client.callTool({ name: "gmail_schedule_send", arguments: args });
+  const manifestId = extractManifestId(planResp.content[0].text);
+  return parse(
+    await client.callTool({ name: "gmail_schedule_send", arguments: { manifest_id: manifestId, user_reply: "да, отправляй" } }),
+  );
+}
+
 let failures = 0;
 const check = (label, cond, extra = "") => {
   console.log(`${cond ? "  ok  " : "  FAIL"} ${label}${cond ? "" : ` — got: ${extra}`}`);
@@ -177,15 +232,10 @@ check("nothing sent immediately", sendCalls.length === 0);
 
 console.log("\n[6] schedule_send — builds and validates the raw message NOW, stores it, sends NOTHING yet");
 const store = makeStore();
-client = await buildHarness({ store, userToken: null });
-out = parse(
-  await client.callTool({
-    name: "gmail_schedule_send",
-    arguments: {
-      messages: [{ to: "boss@x.com", subject: "Отчёт", body: "Готово", sendAt: "2099-01-01T08:00:00-07:00" }],
-    },
-  }),
-);
+client = await buildHarness({ store, userToken: null, consentStore: makeConsentStore(), consentCfg: CONSENT_CFG });
+out = await scheduleThroughGate(client, {
+  messages: [{ to: "boss@x.com", subject: "Отчёт", body: "Готово", sendAt: "2099-01-01T08:00:00-07:00" }],
+});
 let r = out.results[0];
 check("id assigned", typeof r.id === "number", JSON.stringify(r));
 check("to/subject echoed", r.to === "boss@x.com" && r.subject === "Отчёт", JSON.stringify(r));
@@ -196,18 +246,13 @@ check("raw RFC822 message stored", stored.rawMessage.length > 0, String(stored.r
 check("account recorded", stored.accountName === "personal", stored.accountName);
 
 console.log("\n[7] schedule_send validation: bad/past sendAt rejected, per item");
-out = parse(
-  await client.callTool({
-    name: "gmail_schedule_send",
-    arguments: {
-      messages: [
-        { to: "a@b.com", subject: "s1", body: "b1", sendAt: "garbage" },
-        { to: "c@d.com", subject: "s2", body: "b2", sendAt: "2000-01-01T00:00:00Z" },
-        { to: "good@x.com", subject: "s3", body: "b3", sendAt: "2099-06-01T00:00:00Z" },
-      ],
-    },
-  }),
-);
+out = await scheduleThroughGate(client, {
+  messages: [
+    { to: "a@b.com", subject: "s1", body: "b1", sendAt: "garbage" },
+    { to: "c@d.com", subject: "s2", body: "b2", sendAt: "2000-01-01T00:00:00Z" },
+    { to: "good@x.com", subject: "s3", body: "b3", sendAt: "2099-06-01T00:00:00Z" },
+  ],
+});
 check("unparsable sendAt rejected", /Cannot parse date/.test(out.results[0].error ?? ""), JSON.stringify(out.results[0]));
 check("past sendAt rejected", /already in the past/.test(out.results[1].error ?? ""), JSON.stringify(out.results[1]));
 check("good item still scheduled despite siblings failing", typeof out.results[2].id === "number", JSON.stringify(out.results[2]));

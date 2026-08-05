@@ -87,15 +87,11 @@ export function buildMcpServer(user: User): McpServer {
     { name: "gmail-mcp", version: "1.0.0" },
     { instructions: "Tools to manage Gmail: read, search, send, reply, archive, delete, labels. " + accountsHint },
   );
-  // No explicit `: GmailSnoozeContext` annotation here on purpose: the two
-  // consent-gate fields below aren't declared on that type yet (A3 adds them
-  // in gmail.ts when it wires `requireConsent` into the 4 send tools). TS
-  // only excess-property-checks object LITERALS assigned to an annotated
-  // type; passing this inferred (wider) object as a plain argument to
-  // `registerGmailTools` below is fine either way, and needs no change here
-  // once A3 lands. Honest degradation (gate.md §3.5): `consentStore` is null
+  // Package A3 landed: `GmailSnoozeContext` (gmail.ts) now declares
+  // `consentStore`/`consentCfg` and the 4 send tools wire `requireConsent`
+  // through them. Honest degradation (gate.md §3.5): `consentStore` is null
   // exactly when `store` is — without Postgres there's nowhere to persist a
-  // manifest, so the gated tools must refuse outright, never send unconfirmed.
+  // manifest, so the gated tools refuse outright rather than send unconfirmed.
   const snoozeCtx = {
     store: storeReady() ? pgStoreAdapter : null,
     userToken: user.token ?? null,

@@ -14,6 +14,14 @@ import { accountField, type UserClients } from "../accounts.js";
 import type { GoogleClients } from "../google.js";
 import { documentToPlainText } from "./docs.js";
 import {
+  requireConsent,
+  sha256,
+  formatLaTime,
+  USER_REPLY_DOC,
+  type ConsentStore,
+  type ConsentConfig,
+} from "../consent.js";
+import {
   issueDownloadLink,
   downloadsAvailable,
   DEFAULT_TTL_MINUTES,
@@ -392,6 +400,24 @@ export function worstOutcome(results: PostVerifyResult[]): PostVerifyOutcome {
 }
 
 /**
+ * Phase-2 audit context (package A3): when a send tool ran through the
+ * consent gate, `buildSendResult` also files the mutation's real outcome back
+ * onto the phase-1 audit row via `updateConsentAuditOutcome` — otherwise the
+ * audit log would show "confirmed by the human" and nothing about what
+ * actually happened, repeating incident 1's invisibility. Awaited (not
+ * fire-and-forget) so a caller reading the audit log right after the tool
+ * call sees phase 2 already filled in; a DB hiccup here is logged and
+ * swallowed — it must never turn an otherwise-successful/failed send into a
+ * broken tool response.
+ */
+interface SendAuditContext {
+  consentStore: ConsentStore;
+  auditId: string;
+  /** Outbound snapshot captured BEFORE the mutation (§5.2) — no full bodies. */
+  preSnapshot: unknown;
+}
+
+/**
  * Post-verifies every successfully-sent message in a batch and assembles the
  * tool response: an honest header (✅ / ⚠️ / ❌) reflecting BOTH per-item send
  * failures and the post-verify outcome, plus the §5.3 proof block glued on by
@@ -403,6 +429,7 @@ async function buildSendResult(
   total: number,
   selfEmail: string | undefined,
   verb: string,
+  auditCtx?: SendAuditContext,
 ): Promise<ReturnType<typeof ok>> {
   const sent = results.filter((r) => r.messageId && !("error" in r && r.error));
   const pv = await mapWithLimit(sent, (r) => postVerifySend(g, r.messageId!, r.expectedTo ?? "", selfEmail));
@@ -418,6 +445,27 @@ async function buildSendResult(
     icon = "⚠️";
     if (failN > 0) tail = ` (${failN} с ошибкой)`;
   }
+  if (auditCtx) {
+    const errs = results
+      .filter((r): r is { error: string } => "error" in r && !!r.error)
+      .map((r) => r.error)
+      .join("; ");
+    await auditCtx.consentStore
+      .updateConsentAuditOutcome(auditCtx.auditId, {
+        outcome: okN > 0 ? "confirmed" : "failed",
+        postVerify:
+          `${icon} ${verb} ${okN}/${total}${tail}` +
+          (pv.length ? ` · post-verify: ${pv.map((p) => p.detail).join("; ")}` : ""),
+        error: errs || null,
+        preSnapshot: auditCtx.preSnapshot,
+      })
+      .catch((e) => {
+        console.error(
+          "[consent audit] updateConsentAuditOutcome failed:",
+          e instanceof Error ? e.message : String(e),
+        );
+      });
+  }
   // Strip the internal expectedTo marker from the results echoed back.
   const cleaned = results.map(({ expectedTo, ...rest }) => rest);
   return ok({
@@ -425,6 +473,131 @@ async function buildSendResult(
     results: cleaned,
     ...(pv.length ? { verification: renderPostVerifyReport(pv) } : {}),
   });
+}
+
+// ---- Consent-gate preview builder for the 4 send tools (package A3) --------
+//
+// A.4 / output-format.md §7.1: From (label + real email) / To / Cc / Subject /
+// Attachments / When (schedule_send, LA time) / first ~400 chars of the body.
+// All externally-influenced fields go through safeText — a crafted subject or
+// original-message header must not be able to forge extra preview lines.
+// consent.ts's renderPlanned() appends the manifest id/expiry/"show verbatim"
+// tail ON TOP of what this returns — this function must NOT add those itself.
+
+interface SendPreviewItem {
+  to: string;
+  cc?: string;
+  bcc?: string;
+  subject: string;
+  body: string;
+  attachments?: number;
+  attachmentNames?: string[];
+  sendAt?: Date;
+  /** Non-blocking notice (e.g. self-reply) — rendered as a bullet, not a refusal. */
+  warning?: string;
+}
+
+function renderSendPreview(opts: { verb: string; fromLabel: string; items: SendPreviewItem[] }): string {
+  const header = `### 📤 План: ${opts.verb} — ${opts.items.length}`;
+  const blocks = opts.items.map((it, i) => {
+    const lines = [
+      opts.items.length > 1 ? `**${i + 1}.**` : undefined,
+      `- От кого: ${safeText(opts.fromLabel, 200)}`,
+      `- Кому: ${safeText(it.to, 300)}`,
+      it.cc ? `- Копия: ${safeText(it.cc, 300)}` : undefined,
+      it.bcc ? `- Скрытая копия: ${safeText(it.bcc, 300)}` : undefined,
+      `- Тема: ${safeText(it.subject, 200) || "(без темы)"}`,
+      it.attachments
+        ? `- Вложения: ${it.attachments}${
+            it.attachmentNames?.length ? ` (${it.attachmentNames.map((n) => safeText(n, 60)).join(", ")})` : ""
+          }`
+        : undefined,
+      it.sendAt ? `- Когда: ${formatLaTime(it.sendAt.getTime())} PT` : undefined,
+      it.warning ? `- ⚠️ ${safeText(it.warning, 200)}` : undefined,
+      `- Текст: ${safeText(it.body, 400) || "(пусто)"}`,
+    ].filter((l): l is string => l != null);
+    return lines.join("\n");
+  });
+  return `${header}\n\n${blocks.join("\n\n")}`;
+}
+
+/** Compact pre-mutation outbound snapshot for the audit row (§5.2) — account
+ * is implicit (the audit row already carries accountLabel), never a full body. */
+function outboundPreSnapshot(
+  items: Array<{ to: string; cc?: string; bcc?: string; subject: string; body?: string }>,
+): unknown {
+  return items.map((it) => ({
+    to: it.to,
+    cc: it.cc,
+    bcc: it.bcc ? "<set>" : undefined,
+    subject: it.subject,
+    bodyPreview: (it.body ?? "").replace(/\s+/g, " ").slice(0, 80),
+  }));
+}
+
+// ---- Payload shapes stored in consent_manifests for the 4 gated tools ------
+// These are exactly what `decision.payload` carries back in the confirmed
+// branch — the source of truth for the mutation, never the caller's arguments
+// on the execute call (plan §A3 blocker requirement).
+
+interface SendBatchPayload {
+  account: string;
+  messages: {
+    to: string;
+    subject: string;
+    body: string;
+    cc?: string;
+    bcc?: string;
+    attachments?: AttachmentInput[];
+  }[];
+}
+
+interface ScheduleBatchPayload {
+  account: string;
+  messages: {
+    to: string;
+    subject: string;
+    body: string;
+    cc?: string;
+    bcc?: string;
+    attachments?: AttachmentInput[];
+    sendAt: string;
+  }[];
+}
+
+interface ReplyPlanItem {
+  messageId: string;
+  body: string;
+  replyAll: boolean;
+  attachments?: AttachmentInput[];
+  /** Recomputed by `rehash` on execute — the actual binding this gate defends. */
+  fromAddr: string;
+  resolvedTo: string;
+  subject: string;
+  messageIdHeader: string;
+  references: string;
+  threadId?: string;
+  cc?: string;
+}
+
+interface ReplyBatchPayload {
+  account: string;
+  replies: ReplyPlanItem[];
+}
+
+interface ForwardPlanItem {
+  messageId: string;
+  to: string;
+  body?: string;
+  subject: string;
+  /** Recomputed by `rehash` on execute — detects the original drifting/vanishing. */
+  origFrom: string;
+  origSubject: string;
+}
+
+interface ForwardBatchPayload {
+  account: string;
+  items: ForwardPlanItem[];
 }
 
 /**
@@ -865,7 +1038,30 @@ async function resolveAttachments(
 export interface GmailSnoozeContext {
   store: PgStore | null;
   userToken: string | null;
+  /**
+   * Consent-gate storage (package A1, `src/consent.ts`'s `ConsentStore`). null
+   * exactly when Postgres isn't configured. The 4 gated send tools below
+   * refuse outright when this is null — gate.md §3.5: no durable manifest
+   * storage means no gate, and that must never become a silent bypass.
+   */
+  consentStore: ConsentStore | null;
+  /**
+   * Gate knobs (TTL / anti-doublet gap / batch cap), always present even when
+   * consentStore is null so a refusal message can still be built without a
+   * crash. Real value comes from `consentServerConfig` in server.ts (env-driven).
+   */
+  consentCfg: ConsentConfig;
 }
+
+/** Fallback gate config for callers that don't wire a real one (offline unit
+ * tests exercising other tools). Mirrors config.ts's `loadConsentGateConfig()`
+ * defaults; production always gets the real env-driven config from server.ts. */
+const DEFAULT_CONSENT_CFG: ConsentConfig = {
+  server: "gmail",
+  consentTtlMs: 3_600_000,
+  minConsentGapMs: 10_000,
+  sendBatchMax: 10,
+};
 
 /** Reads a single header value out of a raw RFC 822 message (handles folding). */
 function headerFromRaw(raw: string, name: string): string {
@@ -932,7 +1128,7 @@ function escapeMboxFrom(buf: Buffer): Buffer {
 export function registerGmailTools(
   server: McpServer,
   clients: UserClients,
-  snoozeCtx: GmailSnoozeContext = { store: null, userToken: null },
+  snoozeCtx: GmailSnoozeContext = { store: null, userToken: null, consentStore: null, consentCfg: DEFAULT_CONSENT_CFG },
 ) {
   const account = accountField(clients);
 
@@ -974,6 +1170,7 @@ export function registerGmailTools(
           .optional()
           .describe("Page token from a previous call's `nextPageToken` to fetch the next page."),
       },
+      annotations: { readOnlyHint: true },
     },
     guard(async ({ account, query, maxResults, pageToken }) => {
       const g = clients.resolve(account);
@@ -1018,6 +1215,7 @@ export function registerGmailTools(
         query: z.string().default("").describe('Gmail query, e.g. "is:starred", "is:unread".'),
         unit: z.enum(["messages", "threads"]).default("messages").optional(),
       },
+      annotations: { readOnlyHint: true },
     },
     guard(async ({ account, query, unit }) => {
       const g = clients.resolve(account);
@@ -1071,6 +1269,7 @@ export function registerGmailTools(
         account,
         messageIds: z.array(z.string()).min(1).describe("Message id(s) to fetch."),
       },
+      annotations: { readOnlyHint: true },
     },
     guard(async ({ account, messageIds }) => {
       const g = clients.resolve(account);
@@ -1105,6 +1304,7 @@ export function registerGmailTools(
         account,
         threadIds: z.array(z.string()).min(1).describe("Thread id(s) to fetch."),
       },
+      annotations: { readOnlyHint: true },
     },
     guard(async ({ account, threadIds }) => {
       const g = clients.resolve(account);
@@ -1135,7 +1335,14 @@ export function registerGmailTools(
     "gmail_send",
     {
       title: "Send emails",
-      description: "Send one or more new emails (optionally with attachments). `to`/`cc`/`bcc` may be comma-separated lists.",
+      description:
+        "Send one or more new emails (optionally with attachments). Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with `messages`) " +
+        "to build a plan and return a human-readable preview — NOTHING is sent yet. Show that preview to the " +
+        "user verbatim and wait for their reply. Call again with the returned `manifest_id` and the user's " +
+        "VERBATIM `user_reply` to actually send — the approved batch is read back from the plan, not from " +
+        "whatever `messages` the second call carries (if any is passed, it is ignored). " +
+        "`to`/`cc`/`bcc` may be comma-separated lists.",
       inputSchema: {
         account,
         messages: z
@@ -1149,19 +1356,82 @@ export function registerGmailTools(
               attachments: attachmentsField,
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: true },
     },
-    guard(async ({ account, messages }) => {
+    guard(async ({ account, messages, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = snoozeCtx;
+      if (!consentStore) {
+        return fail(
+          "Отправка недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести письмо через гейт подтверждения и поэтому не отправляет — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
       const accountName = clients.canonicalName(account);
       const selfEmail = await accountEmail(g, accountName);
-      const results = await mapWithLimit(messages, async (msg) => {
+      const fromLabel = selfEmail ? `${accountName} (${selfEmail})` : accountName;
+
+      const decision = await requireConsent<SendBatchPayload>({
+        tool: "gmail_send",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: () => {
+          if (!messages || !messages.length) {
+            throw new Error("Нужен непустой `messages`, чтобы построить план отправки.");
+          }
+          const payload: SendBatchPayload = { account: accountName, messages };
+          const preview = renderSendPreview({
+            verb: "Отправка письма",
+            fromLabel,
+            items: messages.map((m) => ({
+              to: m.to,
+              cc: m.cc,
+              bcc: m.bcc,
+              subject: m.subject,
+              body: m.body,
+              attachments: m.attachments?.length,
+              attachmentNames: m.attachments
+                ?.map((a) => a.filename ?? a.driveFileId ?? "файл")
+                .filter((x): x is string => !!x),
+            })),
+          });
+          return { payload, objectHash: sha256(payload), preview, batchSize: messages.length };
+        },
+        // Binding вырождена (план §A3 / вывод 0.2): новое письмо не привязано ни
+        // к какому живому объекту, который можно перечитать — единственная
+        // защита в том, что payload берётся ИЗ манифеста (см. confirmed ниже),
+        // а не из аргументов execute-вызова. sha256(addressing) допустим ЗДЕСЬ
+        // ИМЕННО потому, что addressing УЖЕ равен payload — нет отдельного
+        // "живого мира", способного разойтись с ним. Контраст: gmail_reply/
+        // gmail_forward ниже реально сходят в Gmail за свежим состоянием.
+        rehash: (addressing) => sha256(addressing),
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const sendMessages = payload.messages;
+      const results = await mapWithLimit(sendMessages, async (msg) => {
           try {
             const atts = msg.attachments?.length ? await resolveAttachments(g, msg.attachments) : undefined;
             const raw = buildRawEmail({ to: msg.to, subject: msg.subject, body: msg.body, cc: msg.cc, bcc: msg.bcc, attachments: atts });
-            // Pre-snapshot before the irreversible send (§5.2) — server log only
-            // until the audit table exists; never the full body.
+            // Pre-snapshot before the irreversible send (§5.2) — server log,
+            // and (below) the audit row too now that A1's table exists.
             logSendPreSnapshot(accountName, msg);
             const res = await g.gmail.users.messages.send({ userId: "me", requestBody: { raw } });
             return { messageId: res.data.id, threadId: res.data.threadId, expectedTo: msg.to };
@@ -1169,7 +1439,11 @@ export function registerGmailTools(
             return { error: String(e instanceof Error ? e.message : e) };
           }
         });
-      return buildSendResult(g, results, messages.length, selfEmail, "Отправлено");
+      return buildSendResult(g, results, sendMessages.length, selfEmail, "Отправлено", {
+        consentStore,
+        auditId,
+        preSnapshot: outboundPreSnapshot(sendMessages),
+      });
     }),
   );
 
@@ -1179,7 +1453,13 @@ export function registerGmailTools(
     "gmail_reply",
     {
       title: "Reply to emails",
-      description: "Reply within the same thread of one or more existing messages.",
+      description:
+        "Reply within the same thread of one or more existing messages. Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with `replies`) " +
+        "to build a plan — this ONLY reads the original message(s), it creates no draft and sends nothing. Show " +
+        "the returned preview to the user verbatim and wait for their reply (note: if the original message was " +
+        "sent BY this account, the preview warns the reply will go back to yourself). Call again with the " +
+        "returned `manifest_id` and the user's VERBATIM `user_reply` to actually send.",
       inputSchema: {
         account,
         replies: z
@@ -1191,15 +1471,49 @@ export function registerGmailTools(
               attachments: attachmentsField,
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: true },
     },
-    guard(async ({ account, replies }) => {
+    guard(async ({ account, replies, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = snoozeCtx;
+      if (!consentStore) {
+        return fail(
+          "Ответ недоступен: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести письмо через гейт подтверждения и поэтому не отправляет — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
       const accountName = clients.canonicalName(account);
       const selfEmail = await accountEmail(g, accountName);
-      const results = await mapWithLimit(replies, async (item) => {
-          try {
+      const fromLabel = selfEmail ? `${accountName} (${selfEmail})` : accountName;
+
+      const decision = await requireConsent<ReplyBatchPayload>({
+        tool: "gmail_reply",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        // Plan phase ONLY reads the originals (messages.get) to resolve the
+        // real recipient and build the preview — no drafts.create here (that
+        // was the incident-2 precursor: a draft is a mutation too). The exact
+        // same metadata call the old single-phase handler used, just moved
+        // earlier and re-used at execute time instead of repeated (vывод 0.9).
+        plan: async () => {
+          if (!replies || !replies.length) {
+            throw new Error("Нужен непустой `replies`, чтобы построить план ответа.");
+          }
+          const items: ReplyPlanItem[] = await mapWithLimit(replies, async (item) => {
             const orig = await g.gmail.users.messages.get({
               userId: "me",
               id: item.messageId,
@@ -1213,21 +1527,90 @@ export function registerGmailTools(
             let subject = header(h, "Subject");
             if (!/^re:/i.test(subject)) subject = "Re: " + subject;
             const cc = item.replyAll ? header(h, "Cc") || undefined : undefined;
+            return {
+              messageId: item.messageId,
+              body: item.body,
+              replyAll: item.replyAll ?? false,
+              attachments: item.attachments,
+              fromAddr,
+              resolvedTo: extractEmail(fromAddr),
+              subject,
+              messageIdHeader,
+              references,
+              threadId: orig.data.threadId ?? undefined,
+              cc,
+            };
+          });
+          const payload: ReplyBatchPayload = { account: accountName, replies: items };
+          const preview = renderSendPreview({
+            verb: "Ответ на письмо",
+            fromLabel,
+            items: items.map((it) => ({
+              to: it.fromAddr,
+              cc: it.cc,
+              subject: it.subject,
+              body: it.body,
+              attachments: it.attachments?.length,
+              // Incident-2 prevention (vывод 0.7): warn, don't refuse — notes to
+              // self are legitimate; the gate's confirmation step is the real guard.
+              warning:
+                selfEmail && it.resolvedTo && it.resolvedTo === selfEmail.toLowerCase()
+                  ? "Ответ уйдёт отправителю исходного письма. Исходное отправлено ВАМИ — ответ придёт вам же."
+                  : undefined,
+            })),
+          });
+          return { payload, objectHash: sha256(payload), preview, batchSize: items.length };
+        },
+        // Real binding, not degenerate: re-reads each original message's From
+        // header RIGHT NOW and recomputes resolvedTo. Everything else in the
+        // item is copied verbatim from the stored payload (unchanged) — so the
+        // resulting hash differs from objectHash ONLY when the live recipient
+        // drifted or the original became unreadable (deleted). That is what
+        // makes this a real re-read, not `sha256(addressing)` in disguise: the
+        // comparison's outcome depends on live Gmail state, not just on what
+        // was already in the manifest.
+        rehash: async (addressing) => {
+          const a = addressing as ReplyBatchPayload;
+          const fresh = await mapWithLimit(a.replies, async (r) => {
+            try {
+              const orig = await g.gmail.users.messages.get({
+                userId: "me",
+                id: r.messageId,
+                format: "metadata",
+                metadataHeaders: ["From"],
+              });
+              const freshFrom = header(orig.data.payload?.headers, "From");
+              return { ...r, fromAddr: freshFrom, resolvedTo: extractEmail(freshFrom) };
+            } catch {
+              // Unreadable (deleted?) — force a mismatch rather than silently
+              // trusting the stale plan.
+              return { ...r, fromAddr: "__UNREADABLE__", resolvedTo: "__UNREADABLE__" };
+            }
+          });
+          return sha256({ account: a.account, replies: fresh });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const results = await mapWithLimit(payload.replies, async (item) => {
+          try {
             const atts = item.attachments?.length ? await resolveAttachments(g, item.attachments) : undefined;
             const raw = buildRawEmail({
-              to: fromAddr,
-              cc,
-              subject,
+              to: item.fromAddr,
+              cc: item.cc,
+              subject: item.subject,
               body: item.body,
-              inReplyTo: messageIdHeader || undefined,
-              references: references || undefined,
+              inReplyTo: item.messageIdHeader || undefined,
+              references: item.references || undefined,
               attachments: atts,
             });
-            const threadId = orig.data.threadId ?? undefined;
-            logSendPreSnapshot(accountName, { to: fromAddr, cc, subject, body: item.body });
+            logSendPreSnapshot(accountName, { to: item.fromAddr, cc: item.cc, subject: item.subject, body: item.body });
             const draft = await g.gmail.users.drafts.create({
               userId: "me",
-              requestBody: { message: { raw, threadId } },
+              requestBody: { message: { raw, threadId: item.threadId } },
             });
             const res = await g.gmail.users.drafts.send({
               userId: "me",
@@ -1235,12 +1618,16 @@ export function registerGmailTools(
             });
             // The reply's recipient is the original sender (fromAddr) — post-verify
             // checks the sent copy did not come back to us (incident 2).
-            return { messageId: res.data.id, expectedTo: fromAddr };
+            return { messageId: res.data.id, expectedTo: item.fromAddr };
           } catch (e) {
             return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
           }
         });
-      return buildSendResult(g, results, replies.length, selfEmail, "Ответов отправлено");
+      return buildSendResult(g, results, payload.replies.length, selfEmail, "Ответов отправлено", {
+        consentStore,
+        auditId,
+        preSnapshot: outboundPreSnapshot(payload.replies.map((r) => ({ to: r.fromAddr, cc: r.cc, subject: r.subject, body: r.body }))),
+      });
     }),
   );
 
@@ -1250,7 +1637,12 @@ export function registerGmailTools(
     "gmail_forward",
     {
       title: "Forward emails",
-      description: "Forward one or more existing messages (including their attachments) to new recipients.",
+      description:
+        "Forward one or more existing messages (including their attachments) to new recipients. Two-mode " +
+        "consent-gated tool (mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` " +
+        "(with `items`) to build a plan and return a preview — nothing is forwarded yet. Show the preview to the " +
+        "user verbatim and wait for their reply. Call again with the returned `manifest_id` and the user's " +
+        "VERBATIM `user_reply` to actually forward.",
       inputSchema: {
         account,
         items: z
@@ -1261,19 +1653,111 @@ export function registerGmailTools(
               body: z.string().optional().describe("Optional text to add above the forwarded content."),
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: true },
     },
-    guard(async ({ account, items }) => {
+    guard(async ({ account, items, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = snoozeCtx;
+      if (!consentStore) {
+        return fail(
+          "Пересылка недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести письмо через гейт подтверждения и поэтому не отправляет — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
       const accountName = clients.canonicalName(account);
       const selfEmail = await accountEmail(g, accountName);
-      const results = await mapWithLimit(items, async (item) => {
+      const fromLabel = selfEmail ? `${accountName} (${selfEmail})` : accountName;
+
+      const decision = await requireConsent<ForwardBatchPayload>({
+        tool: "gmail_forward",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        // Plan phase only reads the original (cheap metadata read) to build the
+        // preview and an identity fingerprint (From/Subject) — attachment bytes
+        // are NOT touched here, only at execute (avoids downloading/holding
+        // large blobs for a plan that might never be confirmed).
+        plan: async () => {
+          if (!items || !items.length) {
+            throw new Error("Нужен непустой `items`, чтобы построить план пересылки.");
+          }
+          const built: ForwardPlanItem[] = await mapWithLimit(items, async (item) => {
+            const orig = await g.gmail.users.messages.get({
+              userId: "me",
+              id: item.messageId,
+              format: "metadata",
+              metadataHeaders: ["From", "Subject", "Date", "To"],
+            });
+            const h = orig.data.payload?.headers;
+            const origFrom = header(h, "From");
+            const origSubject = header(h, "Subject");
+            let subject = origSubject;
+            if (!/^fwd:/i.test(subject)) subject = "Fwd: " + subject;
+            return { messageId: item.messageId, to: item.to, body: item.body, subject, origFrom, origSubject };
+          });
+          const payload: ForwardBatchPayload = { account: accountName, items: built };
+          const preview = renderSendPreview({
+            verb: "Пересылка письма",
+            fromLabel,
+            items: built.map((it) => ({
+              to: it.to,
+              subject: it.subject,
+              body:
+                (it.body ? it.body + "\n\n" : "") +
+                `[Пересылается письмо от ${it.origFrom || "?"}: «${it.origSubject || "(без темы)"}»]`,
+            })),
+          });
+          return { payload, objectHash: sha256(payload), preview, batchSize: built.length };
+        },
+        // Real binding: re-reads each original's From/Subject right now — if the
+        // message vanished (trashed/deleted) or its identity fingerprint changed
+        // since the plan, the recomputed hash differs from objectHash and the
+        // gate refuses "state changed, build a new plan" rather than forwarding
+        // whatever it can still find.
+        rehash: async (addressing) => {
+          const a = addressing as ForwardBatchPayload;
+          const fresh = await mapWithLimit(a.items, async (it) => {
+            try {
+              const orig = await g.gmail.users.messages.get({
+                userId: "me",
+                id: it.messageId,
+                format: "metadata",
+                metadataHeaders: ["From", "Subject"],
+              });
+              const h = orig.data.payload?.headers;
+              return { ...it, origFrom: header(h, "From"), origSubject: header(h, "Subject") };
+            } catch {
+              return { ...it, origFrom: "__UNREADABLE__", origSubject: "__UNREADABLE__" };
+            }
+          });
+          return sha256({ account: a.account, items: fresh });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const results = await mapWithLimit(payload.items, async (item) => {
           try {
+            // Execute re-fetches the original in full — the plan/rehash reads
+            // above are metadata-only (cheap, no attachment bytes); the actual
+            // body/attachments are only pulled once we are actually sending.
             const orig = await g.gmail.users.messages.get({ userId: "me", id: item.messageId, format: "full" });
             const h = orig.data.payload?.headers;
-            let subject = header(h, "Subject");
-            if (!/^fwd:/i.test(subject)) subject = "Fwd: " + subject;
             const forwardedHeader =
               "---------- Forwarded message ----------\r\n" +
               `From: ${header(h, "From")}\r\n` +
@@ -1294,15 +1778,19 @@ export function registerGmailTools(
                 base64: Buffer.from(att.data.data ?? "", "base64url").toString("base64"),
               });
             }
-            const raw = buildRawEmail({ to: item.to, subject, body, attachments: atts.length ? atts : undefined });
-            logSendPreSnapshot(accountName, { to: item.to, subject, body: item.body });
+            const raw = buildRawEmail({ to: item.to, subject: item.subject, body, attachments: atts.length ? atts : undefined });
+            logSendPreSnapshot(accountName, { to: item.to, subject: item.subject, body: item.body });
             const res = await g.gmail.users.messages.send({ userId: "me", requestBody: { raw } });
             return { messageId: res.data.id, expectedTo: item.to };
           } catch (e) {
             return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
           }
         });
-      return buildSendResult(g, results, items.length, selfEmail, "Переслано");
+      return buildSendResult(g, results, payload.items.length, selfEmail, "Переслано", {
+        consentStore,
+        auditId,
+        preSnapshot: outboundPreSnapshot(payload.items.map((it) => ({ to: it.to, subject: it.subject, body: it.body }))),
+      });
     }),
   );
 
@@ -1562,6 +2050,10 @@ export function registerGmailTools(
         "to ~1 minute late, never early). Gmail itself has no delayed-send API — this works because the message " +
         "is fully built and validated right now (attachments resolved, addresses checked) and stored ready to go, " +
         "so nothing can fail at send time except Gmail itself being briefly down. " +
+        "Two-mode consent-gated tool (mcp-development-standard/references/gate.md): call WITHOUT " +
+        "`manifest_id`/`user_reply` (with `messages`) to build a plan and return a preview — nothing is queued " +
+        "yet. Show the preview to the user verbatim and wait for their reply. Call again with the returned " +
+        "`manifest_id` and the user's VERBATIM `user_reply` to actually queue it. " +
         "Use gmail_list_scheduled_sends to check what's pending and gmail_cancel_scheduled_send to pull one back " +
         "before it fires. Without DATABASE_URL this tool cannot work at all — say so plainly rather than pretending.",
       inputSchema: {
@@ -1578,15 +2070,31 @@ export function registerGmailTools(
               sendAt: z.string().describe("ISO 8601 datetime to send at, e.g. '2026-07-28T08:00:00-07:00'. Must be in the future."),
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: true },
     },
-    guard(async ({ account, messages }) => {
-      const { store, userToken } = snoozeCtx;
+    guard(async ({ account, messages, manifest_id, user_reply }) => {
+      const { store, userToken, consentStore, consentCfg } = snoozeCtx;
       if (!store) {
         return fail(
           "Scheduled send requires DATABASE_URL (Railway Postgres) to be configured on this server — " +
             "without it there is nowhere to hold the message until sendAt. Use gmail_send for immediate delivery.",
+        );
+      }
+      if (!consentStore) {
+        return fail(
+          "Отложенная отправка недоступна: не настроено хранилище согласия. Без него сервер не может провести " +
+            "письмо через гейт подтверждения и поэтому не ставит его в очередь — обратитесь к администратору сервера.",
         );
       }
       // Fail-fast on an unknown account label BEFORE anything is queued: both
@@ -1598,7 +2106,51 @@ export function registerGmailTools(
       // "" from `account ?? default`), closing the :resolve/:accountName drift.
       const g = clients.resolve(account);
       const accountName = clients.canonicalName(account);
-      const results = await mapWithLimit(messages, async (msg) => {
+      const selfEmail = await accountEmail(g, accountName);
+      const fromLabel = selfEmail ? `${accountName} (${selfEmail})` : accountName;
+
+      const decision = await requireConsent<ScheduleBatchPayload>({
+        tool: "gmail_schedule_send",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: () => {
+          if (!messages || !messages.length) {
+            throw new Error("Нужен непустой `messages`, чтобы построить план отложенной отправки.");
+          }
+          const payload: ScheduleBatchPayload = { account: accountName, messages };
+          const preview = renderSendPreview({
+            verb: "Отложенная отправка",
+            fromLabel,
+            items: messages.map((m) => {
+              const d = new Date(m.sendAt);
+              return {
+                to: m.to,
+                cc: m.cc,
+                bcc: m.bcc,
+                subject: m.subject,
+                body: m.body,
+                attachments: m.attachments?.length,
+                sendAt: isNaN(d.getTime()) ? undefined : d,
+              };
+            }),
+          });
+          return { payload, objectHash: sha256(payload), preview, batchSize: messages.length };
+        },
+        // Degenerate binding, same reasoning as gmail_send: a not-yet-existing
+        // scheduled message has no live external object to re-read — the whole
+        // point is that it is built and validated at plan time and never
+        // touched again except via the manifest.
+        rehash: (addressing) => sha256(addressing),
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const results = await mapWithLimit(payload.messages, async (msg) => {
         try {
           const sendAt = new Date(msg.sendAt);
           if (isNaN(sendAt.getTime())) {
@@ -1626,8 +2178,29 @@ export function registerGmailTools(
         }
       });
       const ok_ = results.filter((r) => !("error" in r));
+      const errs = results
+        .filter((r): r is { to: string; subject: string; error: string } => "error" in r && !!r.error)
+        .map((r) => r.error)
+        .join("; ");
+      // Queuing itself IS the observable mutation here (actual delivery happens
+      // later, out of band, via the scheduler — B2/B3's job, not this call's).
+      await consentStore
+        .updateConsentAuditOutcome(auditId, {
+          outcome: ok_.length > 0 ? "confirmed" : "failed",
+          postVerify:
+            `🕗 Поставлено в очередь ${ok_.length}/${results.length}; фактическая отправка произойдёт позже — ` +
+            "проверяйте через gmail_list_scheduled_sends.",
+          error: errs || null,
+          preSnapshot: outboundPreSnapshot(payload.messages),
+        })
+        .catch((e) => {
+          console.error(
+            "[consent audit] updateConsentAuditOutcome failed:",
+            e instanceof Error ? e.message : String(e),
+          );
+        });
       return ok({
-        summary: `🕗 Scheduled ${ok_.length}/${messages.length} message(s)`,
+        summary: `🕗 Scheduled ${ok_.length}/${results.length} message(s)`,
         results,
       });
     }),
@@ -1738,6 +2311,7 @@ export function registerGmailTools(
           )
           .min(1),
       },
+      annotations: { readOnlyHint: true },
     },
     guard(async ({ account, items }) => {
       const g = clients.resolve(account);
@@ -1890,6 +2464,7 @@ export function registerGmailTools(
       title: "List labels",
       description: "List all Gmail labels (system + custom) with their ids.",
       inputSchema: { account },
+      annotations: { readOnlyHint: true },
     },
     guard(async ({ account }) => {
       const g = clients.resolve(account);

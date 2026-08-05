@@ -33,6 +33,70 @@ function gWith(getImpl) {
 const headers = (to, subject) => ({ data: { labelIds: [], payload: { headers: [{ name: "To", value: to }, { name: "Subject", value: subject }] } } });
 const withLabels = (to, subject, labelIds) => ({ data: { labelIds, payload: { headers: [{ name: "To", value: to }, { name: "Subject", value: subject }] } } });
 
+// gmail_send is now consent-gated (package A3) — a bare call with `messages`
+// only builds a plan and sends nothing. These tests care about post-verify
+// plumbing, not the gate itself (that's scripts/test-a3-gate.mjs), so the fake
+// store here uses minConsentGapMs=0 to skip the anti-doublet wait and just
+// drive plan→confirm mechanically.
+function makeFakeConsentStore() {
+  const manifests = new Map();
+  const audits = new Map();
+  return {
+    manifests,
+    audits,
+    async createManifest(input) {
+      manifests.set(input.id, { ...input, status: "AWAITING_CONSENT", consumedAt: null, userReply: null });
+    },
+    async getManifest(id, server) {
+      const r = manifests.get(id);
+      return r && r.server === server ? { ...r } : null;
+    },
+    async consumeManifest(id, server, userReply) {
+      const r = manifests.get(id);
+      if (!r || r.server !== server || r.status !== "AWAITING_CONSENT") return null;
+      r.status = "DONE";
+      r.consumedAt = Date.now();
+      r.userReply = userReply;
+      return { ...r };
+    },
+    async invalidateManifest(id, server, userReply) {
+      const r = manifests.get(id);
+      if (r && r.server === server && r.status === "AWAITING_CONSENT") {
+        r.status = "INVALIDATED";
+        r.userReply = userReply;
+      }
+    },
+    async appendConsentAudit(entry) {
+      audits.set(entry.id, { ...entry });
+    },
+    async updateConsentAuditOutcome(auditId, outcome) {
+      const a = audits.get(auditId);
+      if (a) Object.assign(a, outcome);
+    },
+  };
+}
+const FAKE_CONSENT_CFG = { server: "gmail", consentTtlMs: 3_600_000, minConsentGapMs: 0, sendBatchMax: 10 };
+
+/** Extracts the manifest id consent.ts's renderPlanned() embeds as `` `<id>` ``. */
+function extractManifestId(previewText) {
+  const m = previewText.match(/план `([^`]+)`/);
+  if (!m) throw new Error("no manifest id found in plan preview: " + previewText);
+  return m[1];
+}
+
+/** Drives the two-phase gate to completion: plan, then confirm with an
+ * affirmative user_reply. Returns the parsed (JSON) execute-phase result. */
+async function sendThroughGate(cli, toolName, planArgs) {
+  const planResp = await cli.callTool({ name: toolName, arguments: planArgs });
+  const previewText = planResp.content[0].text;
+  const manifestId = extractManifestId(previewText);
+  const execResp = await cli.callTool({
+    name: toolName,
+    arguments: { account: planArgs.account, manifest_id: manifestId, user_reply: "да, отправляй" },
+  });
+  return parse(execResp);
+}
+
 // --- 1. self-send → ❌ ------------------------------------------------------
 
 console.log("\n[1] postVerifySend — SENT+INBOX is a self-send → ❌");
@@ -110,7 +174,12 @@ function fakeClients(getImpl) {
 }
 async function harness(getImpl) {
   const server = new McpServer({ name: "b3", version: "0" });
-  registerGmailTools(server, fakeClients(getImpl), { store: null, userToken: null });
+  registerGmailTools(server, fakeClients(getImpl), {
+    store: null,
+    userToken: null,
+    consentStore: makeFakeConsentStore(),
+    consentCfg: FAKE_CONSENT_CFG,
+  });
   const cli = new Client({ name: "c", version: "0" });
   const [a, b] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(b), cli.connect(a)]);
@@ -119,7 +188,12 @@ async function harness(getImpl) {
 {
   sendCalls.length = 0;
   const cli = await harness(async () => withLabels("Me <me@x.com>", "Hi", ["SENT", "INBOX"]));
-  const out = parse(await cli.callTool({ name: "gmail_send", arguments: { messages: [{ to: "me@x.com", subject: "Hi", body: "b" }] } }));
+  const planResp = await cli.callTool({ name: "gmail_send", arguments: { messages: [{ to: "me@x.com", subject: "Hi", body: "b" }] } });
+  check("plan phase does not send", sendCalls.length === 0, String(sendCalls.length));
+  const manifestId = extractManifestId(planResp.content[0].text);
+  const out = parse(
+    await cli.callTool({ name: "gmail_send", arguments: { manifest_id: manifestId, user_reply: "да, отправляй" } }),
+  );
   check("send actually happened once", sendCalls.length === 1, String(sendCalls.length));
   check("header is NOT ✉️/✅ on self-send", out.summary.startsWith("❌"), out.summary);
   check("verification block attached", /🧾 Независимая проверка/.test(out.verification ?? ""), out.verification);
@@ -131,7 +205,7 @@ console.log("\n[6] gmail_send — clean send → normal header + ✅ proof");
 {
   sendCalls.length = 0;
   const cli = await harness(async () => withLabels("eric@x.com", "Quote", ["SENT"]));
-  const out = parse(await cli.callTool({ name: "gmail_send", arguments: { messages: [{ to: "eric@x.com", subject: "Quote", body: "b" }] } }));
+  const out = await sendThroughGate(cli, "gmail_send", { messages: [{ to: "eric@x.com", subject: "Quote", body: "b" }] });
   check("header is ✉️ Отправлено 1/1", out.summary.startsWith("✉️") && out.summary.includes("1/1"), out.summary);
   check("proof shows ✅ 1 подтверждено", /✅ 1 подтверждено/.test(out.verification ?? ""), out.verification);
 }
@@ -160,18 +234,22 @@ console.log("\n[7] gmail_send — batch of 3, middle send fails → ⚠️ aggre
     baseGmailQuery: () => "",
   };
   const server = new McpServer({ name: "b3b", version: "0" });
-  registerGmailTools(server, clients, { store: null, userToken: null });
+  registerGmailTools(server, clients, {
+    store: null,
+    userToken: null,
+    consentStore: makeFakeConsentStore(),
+    consentCfg: FAKE_CONSENT_CFG,
+  });
   const cli = new Client({ name: "c", version: "0" });
   const [a, b] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(b), cli.connect(a)]);
-  const out = parse(await cli.callTool({
-    name: "gmail_send",
-    arguments: { messages: [
+  const out = await sendThroughGate(cli, "gmail_send", {
+    messages: [
       { to: "a@x.com", subject: "1", body: "b" },
       { to: "b@x.com", subject: "2", body: "b" },
       { to: "c@x.com", subject: "3", body: "b" },
-    ] },
-  }));
+    ],
+  });
   check("header is ⚠️ (partial)", out.summary.startsWith("⚠️"), out.summary);
   check("2 of 3 sent", out.summary.includes("2/3"), out.summary);
   check("failure count shown", /1 с ошибкой/.test(out.summary), out.summary);

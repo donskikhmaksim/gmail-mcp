@@ -119,8 +119,21 @@ const fakeClients = {
   emailFor: () => "me@x.com",
   baseGmailQuery: () => "",
 };
+// gmail_schedule_send is now consent-gated (package A3) too — supply a
+// (trivial, unused-in-this-path) fake consentStore so the tool gets past its
+// own "no consent storage" refusal and actually reaches account resolution,
+// which is what this test is really checking.
+const consentStore = {
+  createManifest: async () => {},
+  getManifest: async () => null,
+  consumeManifest: async () => null,
+  invalidateManifest: async () => {},
+  appendConsentAudit: async () => {},
+  updateConsentAuditOutcome: async () => {},
+};
+const consentCfg = { server: "gmail", consentTtlMs: 3_600_000, minConsentGapMs: 10_000, sendBatchMax: 10 };
 const server = new McpServer({ name: "b1-test", version: "0" });
-registerGmailTools(server, fakeClients, { store, userToken: null });
+registerGmailTools(server, fakeClients, { store, userToken: null, consentStore, consentCfg });
 const cli = new Client({ name: "c", version: "0" });
 const [a, b] = InMemoryTransport.createLinkedPair();
 await Promise.all([server.connect(b), cli.connect(a)]);
