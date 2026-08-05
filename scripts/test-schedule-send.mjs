@@ -151,13 +151,17 @@ function extractManifestId(previewText) {
   if (!m) throw new Error("no manifest id found in plan preview: " + previewText);
   return m[1];
 }
-/** Drives plan → confirm; returns the parsed execute-phase result. */
-async function scheduleThroughGate(client, args) {
-  const planResp = await client.callTool({ name: "gmail_schedule_send", arguments: args });
+/** Drives any gated tool's plan → confirm in one call; returns the parsed
+ * execute-phase result. gmail_snooze (package T1) uses this too now — same
+ * two-phase mechanics as gmail_schedule_send (package A3), just a different
+ * tool name. */
+async function planThenExecute(client, name, args, userReply = "да, отправляй") {
+  const planResp = await client.callTool({ name, arguments: args });
   const manifestId = extractManifestId(planResp.content[0].text);
-  return parse(
-    await client.callTool({ name: "gmail_schedule_send", arguments: { manifest_id: manifestId, user_reply: "да, отправляй" } }),
-  );
+  return parse(await client.callTool({ name, arguments: { manifest_id: manifestId, user_reply: userReply } }));
+}
+async function scheduleThroughGate(client, args) {
+  return planThenExecute(client, "gmail_schedule_send", args);
 }
 
 let failures = 0;
@@ -179,13 +183,10 @@ for (const t of ["gmail_snooze", "gmail_schedule_send", "gmail_list_scheduled_se
 
 console.log("\n[2] snooze persists even when userToken is null (onboarded deployments)");
 snoozeCalls.length = 0;
-client = await buildHarness({ store: makeStore(), userToken: null });
-let out = parse(
-  await client.callTool({
-    name: "gmail_snooze",
-    arguments: { items: [{ messageId: "MSG1", unsnoozeAt: "2099-01-01T09:00:00Z" }] },
-  }),
-);
+client = await buildHarness({ store: makeStore(), userToken: null, consentStore: makeConsentStore(), consentCfg: CONSENT_CFG });
+let out = await planThenExecute(client, "gmail_snooze", {
+  items: [{ messageId: "MSG1", unsnoozeAt: "2099-01-01T09:00:00Z" }],
+});
 check("archived (INBOX label removed)", modifyCalls.at(-1)?.requestBody?.removeLabelIds?.includes("INBOX"));
 check("addSnooze WAS called despite userToken being null", snoozeCalls.length === 1, String(snoozeCalls.length));
 check("userToken null is passed through as null, not skipped", snoozeCalls[0]?.userToken === null, JSON.stringify(snoozeCalls[0]));
@@ -195,26 +196,19 @@ check("result says persisted: true", out.results[0].persisted === true, JSON.str
 console.log("\n[3] snooze without a store at all — archives, says so honestly");
 snoozeCalls.length = 0;
 modifyCalls.length = 0;
-client = await buildHarness({ store: null, userToken: null });
-out = parse(
-  await client.callTool({
-    name: "gmail_snooze",
-    arguments: { items: [{ messageId: "MSG2", unsnoozeAt: "2099-01-01T09:00:00Z" }] },
-  }),
-);
+client = await buildHarness({ store: null, userToken: null, consentStore: makeConsentStore(), consentCfg: CONSENT_CFG });
+out = await planThenExecute(client, "gmail_snooze", {
+  items: [{ messageId: "MSG2", unsnoozeAt: "2099-01-01T09:00:00Z" }],
+});
 check("still archived", modifyCalls.length === 1);
 check("nothing to persist to", snoozeCalls.length === 0);
 check("result says persisted: false — no false advertising", out.results[0].persisted === false, JSON.stringify(out.results[0]));
 
 console.log("\n[4] snooze validation: bad/past dates rejected before archiving");
 modifyCalls.length = 0;
-out = parse(
-  await client.callTool({ name: "gmail_snooze", arguments: { items: [{ messageId: "MSG3", unsnoozeAt: "not-a-date" }] } }),
-);
+out = await planThenExecute(client, "gmail_snooze", { items: [{ messageId: "MSG3", unsnoozeAt: "not-a-date" }] });
 check("unparsable date rejected", /Cannot parse date/.test(out.results[0].error ?? ""), JSON.stringify(out.results[0]));
-out = parse(
-  await client.callTool({ name: "gmail_snooze", arguments: { items: [{ messageId: "MSG4", unsnoozeAt: "2000-01-01T00:00:00Z" }] } }),
-);
+out = await planThenExecute(client, "gmail_snooze", { items: [{ messageId: "MSG4", unsnoozeAt: "2000-01-01T00:00:00Z" }] });
 check("past date rejected", /already in the past/.test(out.results[0].error ?? ""), JSON.stringify(out.results[0]));
 check("no archiving happened for either rejected item", modifyCalls.length === 0, String(modifyCalls.length));
 
