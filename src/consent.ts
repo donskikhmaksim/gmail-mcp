@@ -729,3 +729,105 @@ export async function requireConsent<T = unknown>(
   // payload берём ИЗ манифеста (не из аргументов вызова) — ТЗ 0.3 / A.1.
   return { kind: "confirmed", manifestId, payload: consumed.payload as T, auditId };
 }
+
+// ───────────────────────── Авто-исполнение по кнопке ────────────────────────
+
+/**
+ * Максим, ночь на 2026-08-05: «нажал кнопку — должно сразу исполниться на
+ * бэке, не ждать, что модель ещё раз вызовет инструмент». До этой функции
+ * кнопка в Telegram только переключала флаг в `tg_approvals` — реальная
+ * мутация происходила ТОЛЬКО когда модель САМА второй раз звала инструмент
+ * с `user_reply`; если пользователь ничего не писал в чат после нажатия —
+ * действие могло не наступить никогда.
+ *
+ * Эта функция закрывает разрыв: сервер сам, фоновым поллером (см. per-server
+ * `autoExecutePoller.ts`), находит манифесты AWAITING_CONSENT с уже
+ * APPROVED-строкой в `tg_approvals` и атомарно исполняет их — БЕЗ участия
+ * модели вообще. Та же дисциплина, что у execute-фазы `requireConsent`:
+ * binding (rehash) + одноразовость (`consumeManifest`) + аудит-лог — только
+ * шаги (3) и (3.5) (классификация `user_reply`, включая negative/affirmative)
+ * пропущены, потому что кнопка в Telegram УЖЕ есть окончательное согласие
+ * человека для этого инструмента (`tg.enabledFor(tool)` было истинно в
+ * момент постройки плана — иначе строка в `tg_approvals` не появилась бы).
+ *
+ * ВАЖНО (два независимых режима — прямое требование Максима): эта функция
+ * вызывается ТОЛЬКО фоновым поллером для манифестов, у которых
+ * `tg.enabledFor(tool)` было истинно на момент плана. Обычный путь через
+ * `requireConsent()` (чат-«да», без TG) НЕ меняется НИ НА БИТ — это отдельная
+ * функция, а не альтернативная ветка внутри `requireConsent`, чтобы не
+ * рисковать регрессией старого поведения.
+ *
+ * Возвращает null (не бросает), если манифест уже неактуален (гонка с чем-то
+ * ещё, TTL истёк, дрейф состояния) — вызывающий поллер просто пропускает и
+ * логирует, это не ошибка.
+ */
+export interface AutoExecuteResult<T = unknown> {
+  manifestId: string;
+  tool: string;
+  accountLabel: string;
+  payload: T;
+  auditId: string;
+}
+
+/** Метка вместо `user_reply` человека — честно отражает происхождение
+ * (кнопка, не текст), видна в аудит-логе. НЕ выглядит как утвердительное
+ * слово специально — если этот текст случайно попадёт куда-то ещё
+ * (например по ошибке будет передан в `requireConsent` напрямую), он не
+ * должен пройти обычную классификацию `classifyReply` как настоящее «да». */
+export const TG_AUTO_REPLY_MARKER = "[авто: подтверждено кнопкой в Telegram]";
+
+export async function tryAutoExecute<T = unknown>(
+  candidate: { manifestId: string; tool: string; accountLabel: string },
+  rehash: (addressing: ConsentAddressing) => string | Promise<string>,
+  store: ConsentStore,
+  cfg: ConsentConfig,
+): Promise<AutoExecuteResult<T> | null> {
+  const now = cfg.now ?? Date.now;
+
+  const row = await store.getManifest(candidate.manifestId, cfg.server);
+  if (
+    !row ||
+    row.tool !== candidate.tool ||
+    row.accountLabel !== candidate.accountLabel ||
+    row.status !== "AWAITING_CONSENT"
+  ) {
+    return null;
+  }
+
+  // Binding — та же проверка, что в requireConsent (4): живой мир не уехал
+  // между планом и нажатием кнопки.
+  const currentHash = await rehash(row.payload);
+  if (currentHash !== row.objectHash) {
+    return null;
+  }
+
+  // Одноразовость — тот же атомарный consumeManifest, что и у обычного пути.
+  const consumed = await store.consumeManifest(candidate.manifestId, cfg.server, TG_AUTO_REPLY_MARKER);
+  if (!consumed) return null;
+
+  const auditId = randomUUID();
+  await store.appendConsentAudit({
+    id: auditId,
+    ts: now(),
+    server: cfg.server,
+    tool: candidate.tool,
+    accountLabel: candidate.accountLabel,
+    manifestId: candidate.manifestId,
+    objectHash: row.objectHash,
+    userReply: TG_AUTO_REPLY_MARKER,
+    checks: { tgApproval: "approved", binding: "ok", oneShot: "ok" },
+    outcome: "confirmed",
+    // "tg_auto" — честно отличается от "human": подтверждение кнопкой, не
+    // текстовой репликой в чате. Тип поля — `string` (см. интерфейс выше),
+    // менять его не нужно.
+    actor: "tg_auto",
+  });
+
+  return {
+    manifestId: candidate.manifestId,
+    tool: candidate.tool,
+    accountLabel: candidate.accountLabel,
+    payload: consumed.payload as T,
+    auditId,
+  };
+}

@@ -1360,4 +1360,43 @@ export async function claimStaleDecidedApprovals(nowMs: number, limit = 50): Pro
   }));
 }
 
+/**
+ * Кандидаты на авто-исполнение по кнопке (Максим, 2026-08-05 — см.
+ * `consent.ts`'s `tryAutoExecute` doc-comment). JOIN по `manifest_id`
+ * (общий PRIMARY KEY в обеих таблицах): манифест этого сервера ещё
+ * AWAITING_CONSENT и не истёк, а его approval-строка уже APPROVED.
+ * Server-scoped по `consent_manifests.server` — сервер видит и исполняет
+ * ТОЛЬКО свои манифесты, даже если решение по кнопке принял общий вебхук
+ * другого сервера (см. `consumeTgDecisionAnyServer`'s комментарий про
+ * server-agnostic консюм самого решения — это другой шаг).
+ */
+export interface AutoExecuteCandidateRow {
+  manifestId: string;
+  tool: string;
+  accountLabel: string;
+  chatId: string;
+  messageId: number | null;
+}
+
+export async function listApprovedUnexecuted(server: string, nowMs: number, limit = 20): Promise<AutoExecuteCandidateRow[]> {
+  const p = getPool();
+  const res = await p.query(
+    `SELECT m.id AS manifest_id, m.tool, m.account_label, a.chat_id, a.message_id
+       FROM consent_manifests m
+       JOIN tg_approvals a ON a.manifest_id = m.id
+      WHERE m.server = $1 AND m.status = 'AWAITING_CONSENT' AND m.expires_at > $2
+        AND a.status = 'APPROVED'
+      ORDER BY m.created_at ASC
+      LIMIT $3`,
+    [server, nowMs, limit],
+  );
+  return res.rows.map((r) => ({
+    manifestId: r.manifest_id,
+    tool: r.tool,
+    accountLabel: r.account_label,
+    chatId: r.chat_id,
+    messageId: r.message_id === null ? null : Number(r.message_id),
+  }));
+}
+
 export { randomUUID };

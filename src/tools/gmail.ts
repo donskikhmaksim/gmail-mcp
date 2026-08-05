@@ -29,6 +29,8 @@ import {
   DEFAULT_TTL_MINUTES,
   MAX_TTL_MINUTES,
 } from "../downloads.js";
+import { registerAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 interface PgStore {
   addSnooze(args: {
     userToken: string | null;
@@ -896,6 +898,59 @@ async function buildSendResult(
     ...(pv.length ? { verification: renderPostVerifyReport(pv) } : {}),
   });
 }
+
+/**
+ * Ядро исполнения `gmail_send` — вынесено из тела тула (Максим, 2026-08-05),
+ * чтобы БЫТЬ ВЫЗЫВАЕМЫМ И ИЗ обычного MCP tool-хендлера (модель вызвала
+ * execute второй раз), И ИЗ фонового авто-поллера (кнопка в Telegram сама
+ * триггерит это, без участия модели вообще) — см. `autoExecute.ts`'s
+ * doc-comment про то, почему это НЕ MCP-параметр, а отдельная функция.
+ * Ничего в самой логике не изменилось — просто извлечена в функцию.
+ */
+async function executeSendBatchCore(
+  g: GoogleClients,
+  accountName: string,
+  selfEmail: string | undefined,
+  payload: SendBatchPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const sendMessages = payload.messages;
+  const results = await mapWithLimit(sendMessages, async (msg) => {
+    try {
+      const atts = msg.attachments?.length ? await resolveAttachments(g, msg.attachments) : undefined;
+      const raw = buildRawEmail({ to: msg.to, subject: msg.subject, body: msg.body, cc: msg.cc, bcc: msg.bcc, attachments: atts });
+      logSendPreSnapshot(accountName, msg);
+      const res = await g.gmail.users.messages.send({ userId: "me", requestBody: { raw } });
+      return { messageId: res.data.id, threadId: res.data.threadId, expectedTo: msg.to };
+    } catch (e) {
+      return { error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+  return buildSendResult(g, results, sendMessages.length, selfEmail, "Отправлено", {
+    consentStore,
+    auditId,
+    preSnapshot: outboundPreSnapshot(sendMessages),
+  });
+}
+
+/** Достаёт человекочитаемый текст из CallToolResult — тот же текст, что
+ * увидела бы модель, для отчёта в Telegram (см. autoExecute.ts's ExecuteFn). */
+function extractText(result: CallToolResult): string {
+  const first = result.content?.[0];
+  return first && first.type === "text" ? first.text : JSON.stringify(result);
+}
+
+registerAutoExecutor("gmail_send", {
+  rehash: (addressing) => sha256(addressing),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as SendBatchPayload;
+    const g = ctx.clients.resolve(p.account);
+    const selfEmail = await accountEmail(g, p.account);
+    const result = await executeSendBatchCore(g, p.account, selfEmail, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
 
 // ---- Consent-gate preview builder for the 4 send tools (package A3) --------
 //
@@ -1974,25 +2029,7 @@ export function registerGmailTools(
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const sendMessages = payload.messages;
-      const results = await mapWithLimit(sendMessages, async (msg) => {
-          try {
-            const atts = msg.attachments?.length ? await resolveAttachments(g, msg.attachments) : undefined;
-            const raw = buildRawEmail({ to: msg.to, subject: msg.subject, body: msg.body, cc: msg.cc, bcc: msg.bcc, attachments: atts });
-            // Pre-snapshot before the irreversible send (§5.2) — server log,
-            // and (below) the audit row too now that A1's table exists.
-            logSendPreSnapshot(accountName, msg);
-            const res = await g.gmail.users.messages.send({ userId: "me", requestBody: { raw } });
-            return { messageId: res.data.id, threadId: res.data.threadId, expectedTo: msg.to };
-          } catch (e) {
-            return { error: String(e instanceof Error ? e.message : e) };
-          }
-        });
-      return buildSendResult(g, results, sendMessages.length, selfEmail, "Отправлено", {
-        consentStore,
-        auditId,
-        preSnapshot: outboundPreSnapshot(sendMessages),
-      });
+      return executeSendBatchCore(g, accountName, selfEmail, payload, auditId, consentStore);
     }),
   );
 

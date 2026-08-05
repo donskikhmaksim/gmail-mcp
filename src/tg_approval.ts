@@ -196,6 +196,40 @@ async function tgCall(cfg: TgApprovalConfig, method: string, body: unknown): Pro
   return { ok: !!json.ok && res.ok, result: json.result, description: json.description };
 }
 
+/**
+ * Отправляет ИТОГ исполнения В ТО ЖЕ сообщение Telegram, где были кнопки
+ * (Максим, 2026-08-05: «нажал кнопку — сразу исполнилось, результат — сюда
+ * же, без дополнительного „дай ссылку" в чате»). `editMessageText` заменяет и
+ * текст (план → отчёт, включая ссылку/артефакт, если тул её вернул — это уже
+ * часть готового текста отчёта, никакой отдельной логики под «эта ссылка»),
+ * и `reply_markup` (кнопки снимаются в том же вызове — Telegram API это
+ * позволяет одним запросом, отдельный editMessageReplyMarkup не нужен).
+ * Best-effort: если чат/сообщение недоступны (человек удалил сообщение
+ * руками) — не бросает, просто логирует, реальное исполнение УЖЕ произошло
+ * и не должно откатываться из-за того, что отчёт некуда вписать.
+ */
+export async function reportAutoExecutionResult(
+  cfg: TgApprovalConfig,
+  chatId: string,
+  messageId: number | null,
+  reportText: string,
+): Promise<void> {
+  if (messageId == null) {
+    console.error("TG auto-execute: messageId отсутствует, отчёт некуда вписать (chat=" + chatId + ")");
+    return;
+  }
+  const res = await tgCall(cfg, "editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text: mdToTelegramHtml(clipPreview(reportText)),
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [] },
+  });
+  if (!res.ok) {
+    console.error(`TG auto-execute: editMessageText failed for message ${messageId}: ${res.description}`);
+  }
+}
+
 // ───────────────────────── Gate factory (consent.ts side) ───────────────────
 
 /**
