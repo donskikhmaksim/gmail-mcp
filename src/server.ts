@@ -1,7 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { User } from "./config.js";
+import { loadConsentGateConfig } from "./config.js";
 import { buildUserClients, registerAccountTools } from "./accounts.js";
-import { registerGmailTools, type GmailSnoozeContext } from "./tools/gmail.js";
+import { registerGmailTools } from "./tools/gmail.js";
+import type { ConsentStore, ConsentConfig } from "./consent.js";
 import {
   storeReady,
   addSnooze,
@@ -9,6 +11,12 @@ import {
   listScheduledSends,
   countScheduledSends,
   cancelScheduledSend,
+  createManifest,
+  getManifest,
+  consumeManifest,
+  invalidateManifest,
+  appendConsentAudit,
+  updateConsentAuditOutcome,
 } from "./store.js";
 
 /** Adapts store.ts's module functions to the shape gmail.ts's tools expect. */
@@ -43,6 +51,32 @@ const pgStoreAdapter = {
   cancelScheduledSend: (id: number, accountName: string) => cancelScheduledSend(id, accountName),
 };
 
+/**
+ * store.ts's consent-gate functions (package A1), typed against consent.ts's
+ * `ConsentStore` here — signature-for-signature by construction, but the
+ * `: ConsentStore` annotation means a drift fails THIS build, not A3's.
+ */
+export const consentStoreAdapter: ConsentStore = {
+  createManifest,
+  getManifest,
+  consumeManifest,
+  invalidateManifest,
+  appendConsentAudit,
+  updateConsentAuditOutcome,
+};
+
+/** This server's identity ($self) in the shared consent_manifests/consent_audit
+ * tables, plus the gate's TTL/anti-doublet/batch-cap knobs — env-driven, see
+ * `loadConsentGateConfig` in config.ts. `now` is left unset here (real
+ * `Date.now`); consent.ts's `now` injection exists for OFFLINE UNIT TESTS only. */
+const consentGateEnv = loadConsentGateConfig();
+export const consentServerConfig: ConsentConfig = {
+  server: consentGateEnv.server,
+  consentTtlMs: consentGateEnv.consentTtlMs,
+  minConsentGapMs: consentGateEnv.minConsentGapMs,
+  sendBatchMax: consentGateEnv.sendBatchMax,
+};
+
 export function buildMcpServer(user: User): McpServer {
   const clients = buildUserClients(user);
   const accountsHint = clients.multi
@@ -53,9 +87,20 @@ export function buildMcpServer(user: User): McpServer {
     { name: "gmail-mcp", version: "1.0.0" },
     { instructions: "Tools to manage Gmail: read, search, send, reply, archive, delete, labels. " + accountsHint },
   );
-  const snoozeCtx: GmailSnoozeContext = {
+  // No explicit `: GmailSnoozeContext` annotation here on purpose: the two
+  // consent-gate fields below aren't declared on that type yet (A3 adds them
+  // in gmail.ts when it wires `requireConsent` into the 4 send tools). TS
+  // only excess-property-checks object LITERALS assigned to an annotated
+  // type; passing this inferred (wider) object as a plain argument to
+  // `registerGmailTools` below is fine either way, and needs no change here
+  // once A3 lands. Honest degradation (gate.md §3.5): `consentStore` is null
+  // exactly when `store` is — without Postgres there's nowhere to persist a
+  // manifest, so the gated tools must refuse outright, never send unconfirmed.
+  const snoozeCtx = {
     store: storeReady() ? pgStoreAdapter : null,
     userToken: user.token ?? null,
+    consentStore: storeReady() ? consentStoreAdapter : null,
+    consentCfg: consentServerConfig,
   };
   registerAccountTools(server, clients);
   registerGmailTools(server, clients, snoozeCtx);
