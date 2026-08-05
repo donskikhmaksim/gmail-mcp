@@ -1287,4 +1287,77 @@ export async function consumeTgDecisionAnyServer(
   return rowToTgApproval(res.rows[0]);
 }
 
+/**
+ * Sweep queries (package: TG-approval hygiene, Максим's ask 2026-08-05):
+ * "кнопки по таймауту прям удалять" / "такой же таймаут делать для удаления
+ * экрана после отказать" — two cleanup classes, ONE periodic sweep, run ONLY
+ * by the webhook-owning server (gmail-mcp — see http.ts's setInterval), since
+ * it's the sole holder of a working Telegram write path for every server's
+ * rows (this table is shared across all 6 — see consumeTgDecisionAnyServer's
+ * own comment on why cross-server reads are safe here specifically).
+ *
+ *  1. `status='PENDING'` past its own `expires_at` (nobody tapped the button
+ *     in time) — button must come off, message otherwise left alone.
+ *  2. `status IN ('APPROVED','REJECTED')` whose OWN TTL window (expires_at,
+ *     already TTL-capped at plan time) has passed since being decided — the
+ *     whole message is deleted, so the bot's chat stays empty of stale
+ *     screens by default (Максим's stated design goal).
+ * Both classes read cheaply off the same `tg_approvals_cleanup_idx`.
+ */
+export interface StalePendingRow {
+  manifestId: string;
+  chatId: string;
+  messageId: number | null;
+}
+
+export interface StaleDecidedRow {
+  manifestId: string;
+  chatId: string;
+  messageId: number | null;
+}
+
+/** Class 1 candidates — still PENDING, TTL passed. Marks them 'EXPIRED' in the
+ * SAME statement (atomic claim) so a concurrent sweep tick / crash-retry never
+ * double-processes the same row (Telegram edit is not naturally idempotent
+ * against rate limits, so this matters more than it looks). */
+export async function claimExpiredPendingApprovals(nowMs: number, limit = 50): Promise<StalePendingRow[]> {
+  const p = getPool();
+  const res = await p.query(
+    `UPDATE tg_approvals SET status = 'EXPIRED'
+      WHERE manifest_id IN (
+        SELECT manifest_id FROM tg_approvals
+        WHERE status = 'PENDING' AND expires_at <= $1
+        ORDER BY expires_at ASC LIMIT $2
+      )
+      RETURNING manifest_id, chat_id, message_id`,
+    [nowMs, limit],
+  );
+  return res.rows.map((r) => ({
+    manifestId: r.manifest_id, chatId: r.chat_id,
+    messageId: r.message_id === null ? null : Number(r.message_id),
+  }));
+}
+
+/** Class 2 candidates — already decided, own TTL window elapsed since
+ * decision. Deletes the row in the SAME statement (this table is purely
+ * operational for the Telegram UI layer, not an audit log — consent_audit is
+ * the durable record — so nothing is lost by not keeping DONE rows around). */
+export async function claimStaleDecidedApprovals(nowMs: number, limit = 50): Promise<StaleDecidedRow[]> {
+  const p = getPool();
+  const res = await p.query(
+    `DELETE FROM tg_approvals
+      WHERE manifest_id IN (
+        SELECT manifest_id FROM tg_approvals
+        WHERE status IN ('APPROVED', 'REJECTED') AND expires_at <= $1
+        ORDER BY expires_at ASC LIMIT $2
+      )
+      RETURNING manifest_id, chat_id, message_id`,
+    [nowMs, limit],
+  );
+  return res.rows.map((r) => ({
+    manifestId: r.manifest_id, chatId: r.chat_id,
+    messageId: r.message_id === null ? null : Number(r.message_id),
+  }));
+}
+
 export { randomUUID };

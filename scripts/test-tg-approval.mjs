@@ -11,7 +11,7 @@
  */
 import { MockAgent, setGlobalDispatcher } from "undici";
 import { requireConsent, sha256 } from "../src/consent.ts";
-import { createTgApprovalGate, handleWebhook, registerWebhook, secretTokenMatches } from "../src/tg_approval.ts";
+import { createTgApprovalGate, handleWebhook, registerWebhook, runApprovalSweep, secretTokenMatches } from "../src/tg_approval.ts";
 
 // ── управляемые часы (как в test-consent.mjs) ───────────────────────────────
 const clock = { t: 1_700_000_000_000 };
@@ -125,6 +125,28 @@ function makeTgStore() {
       r.status = status;
       r.decidedAt = clock.t;
       return { ...r };
+    },
+    async claimExpiredPendingApprovals(nowMs, limit = 50) {
+      const out = [];
+      for (const [id, r] of approvals) {
+        if (r.status === "PENDING" && r.expiresAt <= nowMs) {
+          r.status = "EXPIRED";
+          out.push({ manifestId: id, chatId: r.chatId, messageId: r.messageId });
+          if (out.length >= limit) break;
+        }
+      }
+      return out;
+    },
+    async claimStaleDecidedApprovals(nowMs, limit = 50) {
+      const out = [];
+      for (const [id, r] of approvals) {
+        if ((r.status === "APPROVED" || r.status === "REJECTED") && r.expiresAt <= nowMs) {
+          out.push({ manifestId: id, chatId: r.chatId, messageId: r.messageId });
+          if (out.length >= limit) break;
+        }
+      }
+      for (const row of out) approvals.delete(row.manifestId);
+      return out;
     },
   };
 }
@@ -572,6 +594,51 @@ console.log("\n[13] registerWebhook: TG_WEBHOOK_OWNER не установлен/
   // подтверждает, что guard не сломал сам happy-path, а именно гейтит его.
   await registerWebhook(tgCfg({ enabled: true, webhookOwner: true }));
   check("webhookOwner=true → setWebhook ВЫЗВАН ровно один раз", tgCalls.filter((c) => c.method === "setWebhook").length === 1);
+}
+
+// [14] runApprovalSweep: снимает кнопку у просроченных PENDING, удаляет
+// сообщение у решённых старше TTL — Максим, 2026-08-05.
+console.log("\n[14] runApprovalSweep — чистка чата бота");
+{
+  const { mock } = resetTelegramMocks();
+  mock("editMessageReplyMarkup", () => ({ statusCode: 200, data: { ok: true, result: true }, headers: { "content-type": "application/json" } }));
+  mock("deleteMessage", () => ({ statusCode: 200, data: { ok: true, result: true }, headers: { "content-type": "application/json" } }));
+
+  const store = makeTgStore();
+  // PENDING, TTL уже прошёл — кандидат класса 1.
+  store.approvals.set("expired-1", { manifestId: "expired-1", server: "gmail", chatId: "555", messageId: 111, status: "PENDING", createdAt: clock.t - 4000, expiresAt: clock.t - 1000, decidedAt: null });
+  // PENDING, ещё не истёк — трогать нельзя.
+  store.approvals.set("still-pending", { manifestId: "still-pending", server: "gmail", chatId: "555", messageId: 222, status: "PENDING", createdAt: clock.t, expiresAt: clock.t + 10000, decidedAt: null });
+  // APPROVED, TTL-окно истекло — кандидат класса 2 (сообщение удалить).
+  store.approvals.set("decided-1", { manifestId: "decided-1", server: "sheets", chatId: "555", messageId: 333, status: "APPROVED", createdAt: clock.t - 5000, expiresAt: clock.t - 500, decidedAt: clock.t - 2000 });
+  // REJECTED, TTL-окно ещё не истекло — трогать рано.
+  store.approvals.set("decided-fresh", { manifestId: "decided-fresh", server: "ticktick", chatId: "555", messageId: 444, status: "REJECTED", createdAt: clock.t, expiresAt: clock.t + 10000, decidedAt: clock.t });
+
+  await runApprovalSweep(tgCfg({ enabled: true, webhookOwner: true }), store, now);
+
+  check("просроченный PENDING переведён в EXPIRED", store.approvals.get("expired-1").status === "EXPIRED");
+  check("editMessageReplyMarkup вызван для просроченного (снята кнопка)",
+    tgCalls.some((c) => c.method === "editMessageReplyMarkup" && c.body.message_id === 111));
+  check("ещё живой PENDING не тронут", store.approvals.get("still-pending").status === "PENDING");
+  check("ещё живой PENDING — editMessageReplyMarkup НЕ вызван для него",
+    !tgCalls.some((c) => c.method === "editMessageReplyMarkup" && c.body.message_id === 222));
+
+  check("решённый (APPROVED) старше TTL — строка удалена из store", !store.approvals.has("decided-1"));
+  check("deleteMessage вызван для решённого старше TTL",
+    tgCalls.some((c) => c.method === "deleteMessage" && c.body.message_id === 333));
+  check("свежерешённый (REJECTED, TTL не истёк) НЕ тронут", store.approvals.has("decided-fresh"));
+  check("свежерешённый — deleteMessage НЕ вызван для него",
+    !tgCalls.some((c) => c.method === "deleteMessage" && c.body.message_id === 444));
+
+  // Гейт webhookOwner — та же дисциплина, что у registerWebhook: сервер, не
+  // владеющий вебхуком, не должен трогать ЧУЖИЕ строки других серверов.
+  const { mock: mock2 } = resetTelegramMocks();
+  mock2("editMessageReplyMarkup", () => ({ statusCode: 200, data: { ok: true, result: true }, headers: { "content-type": "application/json" } }));
+  const store2 = makeTgStore();
+  store2.approvals.set("expired-2", { manifestId: "expired-2", server: "gmail", chatId: "555", messageId: 555, status: "PENDING", createdAt: clock.t - 4000, expiresAt: clock.t - 1000, decidedAt: null });
+  await runApprovalSweep(tgCfg({ enabled: true, webhookOwner: false }), store2, now);
+  check("webhookOwner=false → sweep вообще не трогает store (не-владелец молчит)",
+    store2.approvals.get("expired-2").status === "PENDING" && tgCalls.length === 0);
 }
 
 // ── итог ─────────────────────────────────────────────────────────────────

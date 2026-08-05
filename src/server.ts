@@ -25,6 +25,8 @@ import {
   getTgApproval,
   consumeTgDecision,
   consumeTgDecisionAnyServer,
+  claimExpiredPendingApprovals,
+  claimStaleDecidedApprovals,
 } from "./store.js";
 
 /** Adapts store.ts's module functions to the shape gmail.ts's tools expect. */
@@ -111,6 +113,8 @@ export const tgApprovalStoreAdapter: TgApprovalStore = {
   getTgApproval,
   consumeTgDecision,
   consumeTgDecisionAnyServer,
+  claimExpiredPendingApprovals,
+  claimStaleDecidedApprovals,
 };
 
 /**

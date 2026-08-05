@@ -30,10 +30,19 @@ export interface TgApprovalRow {
   server: string;
   chatId: string;
   messageId: number | null;
-  status: "PENDING" | "APPROVED" | "REJECTED";
+  /** "EXPIRED" — sweep-only terminal state (runApprovalSweep below): a
+   * PENDING row whose own TTL passed before anyone tapped a button. Never
+   * written by handleWebhook/consumeTgDecision*, only by the sweep. */
+  status: "PENDING" | "APPROVED" | "REJECTED" | "EXPIRED";
   createdAt: number;
   expiresAt: number;
   decidedAt: number | null;
+}
+
+export interface StaleApprovalRow {
+  manifestId: string;
+  chatId: string;
+  messageId: number | null;
 }
 
 /**
@@ -79,6 +88,15 @@ export interface TgApprovalStore {
     manifestId: string,
     status: "APPROVED" | "REJECTED",
   ): Promise<TgApprovalRow | null>;
+  /** Sweep (runApprovalSweep below), webhook-owner-only: PENDING rows past
+   * their own expiry — atomically claimed (flipped to EXPIRED) in the same
+   * query, so a slow Telegram call on one sweep tick can't overlap the next
+   * tick's claim of the same row. */
+  claimExpiredPendingApprovals(nowMs: number, limit?: number): Promise<StaleApprovalRow[]>;
+  /** Sweep, webhook-owner-only: APPROVED/REJECTED rows whose own TTL window
+   * has elapsed since being decided — deleted in the same query (this table
+   * is operational, not an audit log; consent_audit is the durable record). */
+  claimStaleDecidedApprovals(nowMs: number, limit?: number): Promise<StaleApprovalRow[]>;
 }
 
 /** Same shape as `consent.ts`'s own `TgApprovalGate` interface — duplicated
@@ -382,5 +400,60 @@ export async function registerWebhook(cfg: TgApprovalConfig): Promise<void> {
     console.error(`TG approval: webhook registered at ${url} (server=${cfg.server})`);
   } catch (err) {
     console.error(`TG approval: setWebhook threw: ${(err as Error).message} -- url=${url}`);
+  }
+}
+
+// ───────────────────────── Sweep (bot chat hygiene) ──────────────────────────
+
+/**
+ * Периодическая чистка (Максим, 2026-08-05): "кнопки по таймауту прям
+ * удалять" / "такой же таймаут делать для удаления экрана после отказать".
+ * Вызывается ТОЛЬКО на сервере-владельце вебхука (http.ts's setInterval,
+ * гейтуется тем же `cfg.webhookOwner`, что и registerWebhook) — только он
+ * держит рабочий путь записи в Telegram для строк ЛЮБОГО из 6 серверов (та
+ * же логика, что у `consumeTgDecisionAnyServer` — таблица общая, читать
+ * чужие строки здесь безопасно и осознанно).
+ *
+ * Две независимые группы, каждая — best-effort (одна упавшая правка
+ * сообщения не должна ронять всю подчистку):
+ *  1. PENDING, TTL истёк — никто не нажал кнопку. Кнопка снимается
+ *     (`editMessageReplyMarkup` с пустой клавиатурой), само сообщение
+ *     остаётся (текст плана — не мусор, может пригодиться для истории).
+ *  2. APPROVED/REJECTED, TTL истёк с момента решения — сообщение целиком
+ *     удаляется (`deleteMessage`), чтобы чат бота по умолчанию оставался
+ *     пустым (осознанное UX-требование, не побочный эффект).
+ */
+export async function runApprovalSweep(
+  cfg: TgApprovalConfig,
+  store: TgApprovalStore,
+  nowFn: () => number = Date.now,
+): Promise<void> {
+  if (!cfg.enabled || !cfg.webhookOwner) return;
+  const now = nowFn();
+
+  const expiredPending = await store.claimExpiredPendingApprovals(now);
+  for (const row of expiredPending) {
+    if (row.messageId == null) continue;
+    await tgCall(cfg, "editMessageReplyMarkup", {
+      chat_id: row.chatId,
+      message_id: row.messageId,
+      reply_markup: { inline_keyboard: [] },
+    }).catch((err) => console.error(`TG sweep: editMessageReplyMarkup failed for ${row.manifestId}: ${err}`));
+  }
+
+  const staleDecided = await store.claimStaleDecidedApprovals(now);
+  for (const row of staleDecided) {
+    if (row.messageId == null) continue;
+    await tgCall(cfg, "deleteMessage", {
+      chat_id: row.chatId,
+      message_id: row.messageId,
+    }).catch((err) => console.error(`TG sweep: deleteMessage failed for ${row.manifestId}: ${err}`));
+  }
+
+  if (expiredPending.length || staleDecided.length) {
+    console.error(
+      `TG sweep: сняты кнопки у ${expiredPending.length} просроченных, ` +
+        `удалено сообщений решённых — ${staleDecided.length}`,
+    );
   }
 }

@@ -17,7 +17,7 @@ import { renderDashboard } from "./dashboard.js";
 import { initDownloads, resolveDownloadLink } from "./downloads.js";
 import { buildUserClients } from "./accounts.js";
 import { tgApprovalConfig, tgApprovalStoreAdapter } from "./server.js";
-import { handleWebhook, registerWebhook, secretTokenMatches } from "./tg_approval.js";
+import { handleWebhook, registerWebhook, runApprovalSweep, secretTokenMatches } from "./tg_approval.js";
 
 const JSONRPC_UNAUTHORIZED = {
   jsonrpc: "2.0" as const,
@@ -400,6 +400,18 @@ export async function startHttpServer(config: Config): Promise<void> {
 
   if (tgApprovalConfig.enabled) {
     await registerWebhook(tgApprovalConfig);
+    // Чистка чата бота (Максим, 2026-08-05): снять кнопку у просроченных
+    // PENDING, удалить сообщение у решённых после того же TTL — см.
+    // runApprovalSweep's own doc-comment. Гейтуется webhookOwner ВНУТРИ
+    // самой функции (то же defense-in-depth, что у registerWebhook) —
+    // безопасно звать здесь безусловно. Раз в 5 минут — редко ловит
+    // "истекло только что", но окно в 1 час TTL этого не требует.
+    const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+    setInterval(() => {
+      runApprovalSweep(tgApprovalConfig, tgApprovalStoreAdapter).catch((err) =>
+        console.error("TG sweep: unhandled error", err),
+      );
+    }, SWEEP_INTERVAL_MS).unref();
   }
 
   await new Promise<void>((resolve) => {
