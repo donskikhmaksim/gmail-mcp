@@ -135,6 +135,47 @@ export interface ConsentStore {
   ): Promise<void>;
 }
 
+/**
+ * Опциональный внеполосный (out-of-band) фактор поверх `user_reply` — нажатие
+ * кнопки в Telegram (gate.md §3.4: «модель может сфабриковать `user_reply` —
+ * это не закрыто»; кнопка модели недоступна). DI, тем же приёмом, что и
+ * `ConsentStore` выше: этот модуль НЕ импортирует `tg_approval.ts` — конкретную
+ * реализацию инжектирует server.ts, типизируя её `: TgApprovalGate` там (как
+ * `consentStoreAdapter`), чтобы дрейф сигнатур падал на СБОРКЕ, а не в проде.
+ * Поэтому `consent.ts` остаётся переносимым ПОБАЙТОВО на другие 4 сервера
+ * независимо от того, подключён там Telegram или нет.
+ *
+ * Инвариант совместимости: `tg` не передан (undefined) → ни одна из веток
+ * ниже не выполняется, поведение гейта побайтово как до этой правки.
+ */
+export interface TgApprovalGate {
+  /** true, если ДЛЯ ЭТОГО инструмента нужен внеполосный ТГ-фактор
+   * (TG_APPROVAL_ENABLED и (TG_APPROVAL_TOOLS пусто ИЛИ содержит tool)). */
+  enabledFor(tool: string): boolean;
+  /**
+   * Отправляет превью плана в Telegram с кнопками [✅ Подтвердить][🛑 Отклонить].
+   * Зовётся ТОЛЬКО когда `enabledFor(tool)` истинно, сразу после
+   * `createManifest`. Провал — FAIL-CLOSED (это расширение честного правила
+   * gate.md §4 на этот слой): вызывающий код обязан НЕ оставлять манифест
+   * живым, если это вернуло `{ ok: false }`.
+   */
+  notifyPlan(
+    manifestId: string,
+    previewBody: string,
+    /** `expiresAt` — CONSENT-манифеста (не самого ТГ-запроса): реализация
+     * обязана взять его как ВЕРХНИЙ предел, а не как значение напрямую —
+     * approval-запрос вправе жить короче, по своему TTL, но не дольше плана,
+     * к которому относится. */
+    meta: { tool: string; accountLabel: string; expiresAt: number },
+  ): Promise<{ ok: boolean; error?: string }>;
+  /**
+   * Текущее внеполосное решение по манифесту. `"none"` покрывает СРАЗУ два
+   * случая — «запроса в Telegram никогда не было» и «TTL истёк»: фаза
+   * исполнения обрабатывает их одинаково (отказ, план заново).
+   */
+  checkApproval(manifestId: string): Promise<"approved" | "pending" | "rejected" | "none">;
+}
+
 /** Конфиг сервера (различается между репо только значением `server`). */
 export interface ConsentConfig {
   /** Константа сервера ($self), напр. "gmail". НЕ аргумент инструмента. */
@@ -203,6 +244,12 @@ export interface RequireConsentParams<T = unknown> {
   rehash: (addressing: ConsentAddressing) => string | Promise<string>;
   store: ConsentStore;
   cfg: ConsentConfig;
+  /**
+   * Опциональный внеполосный ТГ-фактор (см. `TgApprovalGate` выше). undefined
+   * ⇒ поведение гейта побайтово как до этой правки — ни один из веток ниже не
+   * задействуется.
+   */
+  tg?: TgApprovalGate;
 }
 
 /** Размеченный union исхода. Отказы — здесь, НЕ через throw. */
@@ -497,7 +544,30 @@ export async function requireConsent<T = unknown>(
       createdAt,
       expiresAt,
     });
-    return { kind: "planned", manifestId: id, preview: renderPlanned(built.preview, id, expiresAt) };
+
+    let previewBody = built.preview;
+    if (p.tg?.enabledFor(tool)) {
+      // Fail-closed (plan §4): если отправка в Telegram упала, манифест НЕ
+      // остаётся живым — иначе исполнение осталось бы доступно через голое
+      // `user_reply`, без второго фактора, который для этого инструмента
+      // объявлен обязательным.
+      const sent = await p.tg.notifyPlan(id, built.preview, { tool, accountLabel, expiresAt });
+      if (!sent.ok) {
+        await store.invalidateManifest(id, cfg.server, "");
+        return refuse(
+          "Не смог отправить запрос подтверждения в Telegram",
+          "Действие НЕ выполнено, ничего не изменено. Проверьте бота/настройки Telegram-подтверждения" +
+            (sent.error ? ` (${inlineReply(sent.error)}).` : " и попробуйте снова."),
+          { tg: "send_failed" },
+          { manifestId: id, outcome: "invalidated", reason: "tg_send_failed" },
+        );
+      }
+      previewBody =
+        `${built.preview}\n\n_⏳ Запрос на подтверждение отправлен в Telegram — подтвердите кнопкой в ` +
+        `боте, затем ответьте «да» здесь._`;
+    }
+
+    return { kind: "planned", manifestId: id, preview: renderPlanned(previewBody, id, expiresAt) };
   }
 
   // ───── ФАЗА ИСПОЛНЕНИЯ (оба заданы) ─────
@@ -569,6 +639,43 @@ export async function requireConsent<T = unknown>(
     );
   }
   // cls === "affirmation" → идём дальше.
+
+  // (3.5) Внеполосный ТГ-фактор (опционально, ВЫКЛ по умолчанию — plan §1.6).
+  // Встаёт ПОСЛЕ дешёвой/семантической проверки user_reply, ПЕРЕД дорогим
+  // binding+consume: не тратим rehash впустую, пока кнопка не нажата. Когда
+  // `tg` не передан или `enabledFor(tool)` ложно — этот блок не выполняется,
+  // поведение ниже побайтово как до этой правки.
+  if (p.tg?.enabledFor(tool)) {
+    const approval = await p.tg.checkApproval(manifestId);
+    checks.tgApproval = approval;
+    if (approval === "pending") {
+      return refuse(
+        "Жду подтверждения в Telegram",
+        "⏳ Подтвердите кнопкой в боте, затем повторите. План ещё активен.",
+        checks,
+        { manifestId, objectHash: row.objectHash },
+      );
+    }
+    if (approval === "rejected") {
+      await store.invalidateManifest(manifestId, cfg.server, userReply);
+      return refuse(
+        "Отклонено в Telegram",
+        "🛑 Действие отклонено кнопкой в Telegram. План отменён, ничего не отправлено. Чтобы " +
+          "повторить — построй план заново.",
+        checks,
+        { manifestId, objectHash: row.objectHash, outcome: "invalidated", reason: "tg_rejected" },
+      );
+    }
+    if (approval === "none") {
+      return refuse(
+        "Запрос подтверждения истёк",
+        "Запрос подтверждения в Telegram не найден или истёк по TTL. Построй план заново.",
+        checks,
+        { manifestId, objectHash: row.objectHash },
+      );
+    }
+    // approval === "approved" → идём дальше.
+  }
 
   // (4) Binding: пересчитанный хеш ЖИВОГО состояния == сохранённому при плане.
   //     row.payload здесь передаётся rehash как АДРЕСАЦИЯ (источник id для

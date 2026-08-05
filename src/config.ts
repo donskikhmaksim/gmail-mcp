@@ -359,6 +359,85 @@ export function loadConsentGateConfig(): ConsentGateConfig {
   };
 }
 
+/**
+ * Optional Telegram-approval layer (`src/tg_approval.ts`, plan-tg-approval.md).
+ * OFF by default — a fork without a Telegram bot behaves exactly as before
+ * this feature existed. Standalone from `ConsentGateConfig` on purpose (same
+ * reasoning as that interface's own doc comment): pure env, no account setup.
+ */
+export interface TgApprovalConfig {
+  /** Env TG_APPROVAL_ENABLED, default false. */
+  enabled: boolean;
+  /** Env TG_BOT_TOKEN. Required when enabled. */
+  botToken: string;
+  /** Env TG_OWNER_CHAT_ID — the only chat id the webhook accepts callbacks from. */
+  ownerChatId: string;
+  /** Env TG_APPROVAL_WEBHOOK_SECRET — Telegram's X-Telegram-Bot-Api-Secret-Token. */
+  webhookSecret: string;
+  /** Public base URL this server is reachable at (for setWebhook). Reuses
+   * PUBLIC_BASE_URL / RAILWAY_PUBLIC_DOMAIN, same resolution as onboarding's. */
+  publicBaseUrl: string;
+  /** `$self` — reuses CONSENT_SERVER so tg_approvals rows key off the same
+   * per-server identity as consent_manifests/consent_audit. */
+  server: string;
+  /** Env TG_APPROVAL_TOOLS (csv). null = every gated write tool requires the
+   * button; a non-empty set = only those tool names. */
+  toolsAllowlist: Set<string> | null;
+  /** Approval-request TTL, ms. Env TG_APPROVAL_TTL_MS, default 1h (mirrors
+   * CONSENT_TTL_MS's default so the two layers don't silently diverge unless
+   * a deployer explicitly wants that). */
+  ttlMs: number;
+}
+
+export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
+  const enabled = process.env.TG_APPROVAL_ENABLED?.trim().toLowerCase() === "true";
+  const botToken = process.env.TG_BOT_TOKEN?.trim() || "";
+  const ownerChatId = process.env.TG_OWNER_CHAT_ID?.trim() || "";
+  const webhookSecret = process.env.TG_APPROVAL_WEBHOOK_SECRET?.trim() || "";
+  const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN?.trim();
+  const publicBaseUrl =
+    process.env.PUBLIC_BASE_URL?.trim() || (railwayDomain ? `https://${railwayDomain}` : "");
+  const toolsRaw = process.env.TG_APPROVAL_TOOLS?.trim();
+  const toolsAllowlist = toolsRaw
+    ? new Set(
+        toolsRaw
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean),
+      )
+    : null;
+  const ttlMs = positiveIntEnv("TG_APPROVAL_TTL_MS", 3_600_000);
+
+  // Loud, fail-fast startup check (plan §2, package P0 "Готово" criterion):
+  // ENABLED=true without every required piece must NOT silently disable the
+  // feature or serve mutations without the second factor it claims to enforce.
+  if (enabled && (!botToken || !ownerChatId || !webhookSecret || !publicBaseUrl)) {
+    const missing = [
+      !botToken && "TG_BOT_TOKEN",
+      !ownerChatId && "TG_OWNER_CHAT_ID",
+      !webhookSecret && "TG_APPROVAL_WEBHOOK_SECRET",
+      !publicBaseUrl && "PUBLIC_BASE_URL (or RAILWAY_PUBLIC_DOMAIN)",
+    ]
+      .filter(Boolean)
+      .join(", ");
+    throw new Error(
+      `TG_APPROVAL_ENABLED=true, but missing: ${missing}. The Telegram-approval layer cannot start ` +
+        `without all of them — set them, or unset TG_APPROVAL_ENABLED to run without this layer.`,
+    );
+  }
+
+  return {
+    enabled,
+    botToken,
+    ownerChatId,
+    webhookSecret,
+    publicBaseUrl,
+    server: consentServer,
+    toolsAllowlist,
+    ttlMs,
+  };
+}
+
 export function loadConfig(): Config {
   const transport =
     (process.env.MCP_TRANSPORT as "http" | "stdio" | undefined) ??
