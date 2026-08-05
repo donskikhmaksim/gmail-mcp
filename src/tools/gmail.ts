@@ -61,6 +61,44 @@ interface PgStore {
   cancelScheduledSend(id: number, accountName: string): Promise<boolean>;
 }
 
+/** One row of the shared consent_audit log, as read by `gmail_consent_audit`
+ * (package A4). Mirrors store.ts's `ConsentAuditRow` structurally — the same
+ * "don't import store.ts directly, context provides adapters" convention as
+ * `PgStore` above; `server.ts` wires the real implementation in. */
+interface ConsentAuditRow {
+  id: string;
+  ts: number;
+  tool: string;
+  accountLabel: string;
+  manifestId?: string | null;
+  objectHash?: string | null;
+  userReply: string;
+  outcome: string;
+  refusalReason?: string | null;
+  actor: string;
+  postVerifyResult: string | null;
+  error: string | null;
+  preSnapshot: unknown;
+}
+
+interface ConsentAuditFilters {
+  server: string;
+  since?: number;
+  until?: number;
+  accountLabel?: string;
+  tool?: string;
+  outcome?: string;
+}
+
+/** Read-only access to the consent-gate audit log (package A4, `[R:полнота-1]`
+ * — "разбор инцидента без ssh"). Separate from `PgStore`/`ConsentStore` above:
+ * this is neither the scheduled-send store nor the plan/execute gate, just a
+ * read path over the same `consent_audit` table A1 already writes to. */
+interface AuditStore {
+  listConsentAudit(filters: ConsentAuditFilters, limit?: number, offset?: number): Promise<ConsentAuditRow[]>;
+  countConsentAudit(filters: ConsentAuditFilters): Promise<number>;
+}
+
 const GOOGLE_DOC_MIME = "application/vnd.google-apps.document";
 
 /** Drive's upload host — a big attachment is staged there before it is mailed. */
@@ -1051,6 +1089,12 @@ export interface GmailSnoozeContext {
    * crash. Real value comes from `consentServerConfig` in server.ts (env-driven).
    */
   consentCfg: ConsentConfig;
+  /**
+   * Read-only access to the consent_audit log (package A4). null exactly when
+   * Postgres isn't configured (same honest-degradation rule as `store`) — the
+   * gate itself is off in that case too, so there is no audit to read.
+   */
+  auditStore: AuditStore | null;
 }
 
 /** Fallback gate config for callers that don't wire a real one (offline unit
@@ -1128,7 +1172,13 @@ function escapeMboxFrom(buf: Buffer): Buffer {
 export function registerGmailTools(
   server: McpServer,
   clients: UserClients,
-  snoozeCtx: GmailSnoozeContext = { store: null, userToken: null, consentStore: null, consentCfg: DEFAULT_CONSENT_CFG },
+  snoozeCtx: GmailSnoozeContext = {
+    store: null,
+    userToken: null,
+    consentStore: null,
+    consentCfg: DEFAULT_CONSENT_CFG,
+    auditStore: null,
+  },
 ) {
   const account = accountField(clients);
 
@@ -3026,6 +3076,113 @@ export function registerGmailTools(
         summary: `📶 Checked ${uploads.length} upload session(s)`,
         results,
       });
+    }),
+  );
+
+  // ---- gmail_consent_audit (package A4, `[R:полнота-1]`) --------------------
+  // "Разбор инцидента без ssh" (limits-audit.md §11): both August 4th incidents
+  // only came to light through a manual read of the Railway logs — there was
+  // no way to ask the assistant itself "what did the consent gate actually
+  // decide". This read-only tool is that missing path over the same
+  // consent_audit table A1 already writes to (plan/refuse AND, once A3 fills
+  // it in, the mutation's real outcome + post-verify result).
+
+  server.registerTool(
+    "gmail_consent_audit",
+    {
+      title: "Read the consent-gate audit log",
+      description:
+        "Read-only log of every decision the consent gate has made for gmail_send/reply/forward/schedule_send " +
+        "(and, once gated, other write tools): plan built, confirmed, refused, or invalidated, plus — once the " +
+        "mutation actually ran — its outcome and post-verify result. This is how to answer \"what actually " +
+        "happened with that email\" or \"did the gate block anything today\" without reading server logs. " +
+        "Filter by `since`/`until` (ISO 8601), `account`, `tool`, or `outcome` " +
+        "(confirmed/refused/invalidated/failed — a manifest that's only been planned and never answered has no " +
+        "audit row yet, nothing to show). Results are newest first, capped at 100 per page " +
+        "(default 20); use `offset` to page through older rows. External text (the verbatim user_reply and the " +
+        "outbound pre-snapshot) is shown neutralised, never as live markdown.",
+      inputSchema: {
+        account: z
+          .string()
+          .optional()
+          .describe("Filter to one account label (e.g. 'work'). Omit to show all accounts, not just the default."),
+        since: z.string().optional().describe("ISO 8601 datetime — only rows at or after this time."),
+        until: z.string().optional().describe("ISO 8601 datetime — only rows at or before this time."),
+        tool: z
+          .string()
+          .optional()
+          .describe("Filter to one tool name, e.g. 'gmail_send'. Omit to show every gated tool."),
+        outcome: z
+          .enum(["confirmed", "refused", "invalidated", "failed"])
+          .optional()
+          .describe("Filter to one outcome. Omit to show all."),
+        limit: z.number().int().min(1).max(100).default(20).optional().describe("Max rows to return (1-100, default 20)."),
+        offset: z.number().int().min(0).default(0).optional().describe("Skip this many newest-first rows — for paging past the first `limit`."),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    guard(async ({ account, since, until, tool, outcome, limit, offset }) => {
+      const { auditStore, consentCfg } = snoozeCtx;
+      if (!auditStore) {
+        return ok({
+          summary: "Audit log unavailable — DATABASE_URL is not configured, so nothing has been recorded.",
+          results: [],
+        });
+      }
+      const parseWhen = (label: string, s?: string): number | undefined => {
+        if (!s) return undefined;
+        const t = Date.parse(s);
+        if (Number.isNaN(t)) throw new Error(`Cannot parse ${label}="${s}". Use ISO 8601, e.g. 2026-08-04T00:00:00-07:00.`);
+        return t;
+      };
+      const filters = {
+        server: consentCfg.server,
+        since: parseWhen("since", since),
+        until: parseWhen("until", until),
+        accountLabel: account?.trim() || undefined,
+        tool: tool?.trim() || undefined,
+        outcome,
+      };
+      const cap = limit ?? 20;
+      const off = offset ?? 0;
+      const [rows, total] = await Promise.all([
+        auditStore.listConsentAudit(filters, cap, off),
+        auditStore.countConsentAudit(filters),
+      ]);
+
+      const outcomeIcon = (o: string): string =>
+        o === "confirmed" ? "✅" : o === "failed" ? "❌" : o === "refused" || o === "invalidated" ? "🛑" : "•";
+
+      // Compact table (plan §A4: user_reply and pre_snapshot are EXTERNAL text
+      // — safeText, always). tool/account/actor/outcome are server-controlled
+      // (fixed tool names, config labels, "human"/"automation:<name>") so they
+      // are shown as-is.
+      const header = "| Время (PT) | Инструмент | Аккаунт | Actor | Исход | user_reply | post-verify | Детали |";
+      const sep = "|---|---|---|---|---|---|---|---|";
+      const lines = rows.map((r) => {
+        const details = r.error
+          ? `ошибка: ${safeText(r.error, 80)}`
+          : r.preSnapshot
+            ? `снимок: ${safeText(JSON.stringify(r.preSnapshot), 100)}`
+            : "—";
+        return (
+          `| ${formatLaTime(r.ts)} | ${r.tool} | ${r.accountLabel} | ${r.actor} | ` +
+          `${outcomeIcon(r.outcome)} ${r.outcome} | ${safeText(r.userReply, 60) || "—"} | ` +
+          `${safeText(r.postVerifyResult ?? "", 60) || "—"} | ${details} |`
+        );
+      });
+
+      const shownNote =
+        total > off + rows.length
+          ? `Показано ${rows.length} из ${total} (записи ${off + 1}–${off + rows.length}); ` +
+            `есть ещё — вызовите снова с offset=${off + rows.length}.`
+          : `Показано ${rows.length} из ${total}.`;
+
+      const body = rows.length
+        ? [header, sep, ...lines].join("\n")
+        : "Нет записей, подходящих под фильтры.";
+
+      return ok(`### 🧾 Журнал согласий\n\n${shownNote}\n\n${body}`);
     }),
   );
 }

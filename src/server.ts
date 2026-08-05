@@ -17,6 +17,8 @@ import {
   invalidateManifest,
   appendConsentAudit,
   updateConsentAuditOutcome,
+  listConsentAudit,
+  countConsentAudit,
 } from "./store.js";
 
 /** Adapts store.ts's module functions to the shape gmail.ts's tools expect. */
@@ -65,6 +67,15 @@ export const consentStoreAdapter: ConsentStore = {
   updateConsentAuditOutcome,
 };
 
+/**
+ * Read-only adapter for package A4's `gmail_consent_audit` — separate from
+ * `consentStoreAdapter` above (the plan/execute gate contract from A2) since
+ * this is a different, purely-reading surface: "разбор инцидента без ssh"
+ * (limits-audit.md §11). gmail.ts's `AuditStore` type mirrors this
+ * structurally, same convention as `PgStore`/`pgStoreAdapter` above.
+ */
+export const auditStoreAdapter = { listConsentAudit, countConsentAudit };
+
 /** This server's identity ($self) in the shared consent_manifests/consent_audit
  * tables, plus the gate's TTL/anti-doublet/batch-cap knobs — env-driven, see
  * `loadConsentGateConfig` in config.ts. `now` is left unset here (real
@@ -97,6 +108,7 @@ export function buildMcpServer(user: User): McpServer {
     userToken: user.token ?? null,
     consentStore: storeReady() ? consentStoreAdapter : null,
     consentCfg: consentServerConfig,
+    auditStore: storeReady() ? auditStoreAdapter : null,
   };
   registerAccountTools(server, clients);
   registerGmailTools(server, clients, snoozeCtx);

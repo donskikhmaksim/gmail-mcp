@@ -1032,13 +1032,11 @@ export interface ConsentAuditRow extends ConsentAuditEntry {
   preSnapshot: unknown;
 }
 
-/** Read path for A4's `gmail_consent_audit` — "разбор инцидента без ssh"
- * (limits-audit.md §11). `server` is required and always the caller's own
- * constant; `limit` is capped to 100 regardless of what's asked (limits-audit
- * §10.1), default 20. Newest first. */
-export async function listConsentAudit(filters: ConsentAuditFilters, limit = 20): Promise<ConsentAuditRow[]> {
-  const p = getPool();
-  const cap = Math.min(Math.max(Math.trunc(limit) || 20, 1), 100);
+/** Shared WHERE-clause builder for `listConsentAudit`/`countConsentAudit`, so
+ * the two can never drift apart on which rows they mean by "matching the
+ * filters" (a `total` from one query and rows from a different filter set
+ * would be a worse lie than no total at all). */
+function buildAuditWhere(filters: ConsentAuditFilters): { where: string; params: unknown[] } {
   const conds: string[] = [`server = $1`];
   const params: unknown[] = [filters.server];
   if (filters.since != null) {
@@ -1061,9 +1059,29 @@ export async function listConsentAudit(filters: ConsentAuditFilters, limit = 20)
     params.push(filters.outcome);
     conds.push(`outcome = $${params.length}`);
   }
+  return { where: conds.join(" AND "), params };
+}
+
+/** Read path for A4's `gmail_consent_audit` — "разбор инцидента без ssh"
+ * (limits-audit.md §11). `server` is required and always the caller's own
+ * constant; `limit` is capped to 100 regardless of what's asked (limits-audit
+ * §10.1), default 20. `offset` powers pagination through older rows (§10.1
+ * "показано N из M" — never a silent truncation); newest first. */
+export async function listConsentAudit(
+  filters: ConsentAuditFilters,
+  limit = 20,
+  offset = 0,
+): Promise<ConsentAuditRow[]> {
+  const p = getPool();
+  const cap = Math.min(Math.max(Math.trunc(limit) || 20, 1), 100);
+  const off = Math.max(Math.trunc(offset) || 0, 0);
+  const { where, params } = buildAuditWhere(filters);
   params.push(cap);
+  const limitIdx = params.length;
+  params.push(off);
+  const offsetIdx = params.length;
   const res = await p.query(
-    `SELECT * FROM consent_audit WHERE ${conds.join(" AND ")} ORDER BY ts DESC LIMIT $${params.length}`,
+    `SELECT * FROM consent_audit WHERE ${where} ORDER BY ts DESC LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
     params,
   );
   return res.rows.map((row) => ({
@@ -1083,6 +1101,16 @@ export async function listConsentAudit(filters: ConsentAuditFilters, limit = 20)
     error: row.error ?? null,
     preSnapshot: row.pre_snapshot ?? null,
   }));
+}
+
+/** Total rows matching `filters` (ignoring limit/offset) — lets `gmail_consent_audit`
+ * say "shown 20 of 143" honestly (limits-audit.md §10.1: silent truncation is
+ * never allowed) and tell the caller whether another page exists. */
+export async function countConsentAudit(filters: ConsentAuditFilters): Promise<number> {
+  const p = getPool();
+  const { where, params } = buildAuditWhere(filters);
+  const res = await p.query(`SELECT COUNT(*)::int AS n FROM consent_audit WHERE ${where}`, params);
+  return res.rows[0]?.n ?? 0;
 }
 
 export { randomUUID };

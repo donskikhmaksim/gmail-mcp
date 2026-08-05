@@ -39,20 +39,24 @@ const text = (r) => r.content[0].text;
 // reason attached. Keep this in sync with plan §1's priority table — moving a
 // tool INTO the gate (T1 and later) means deleting its line here, and the
 // test then demands it show up in GATED_TOOLS with real coverage instead.
+// Reasons below are the orchestrator's explicit per-tool verdict (2026-08-04),
+// not a placeholder — earlier drafts had vague "stage-6 audit decides" text
+// for 3 of these; that has been replaced with the actual decision so this
+// list can't be mistaken for still-pending triage.
 const UNGATED_WRITE_ALLOWLIST = {
-  gmail_create_draft: "reversible (draft only, never sent) — stage-6 audit decides; not P1",
-  gmail_archive: "label-only, reversible — package T1 (priority-2), explicitly out of A3's scope",
-  gmail_trash: "reversible (Trash, ~30d) — package T1 (priority-2), explicitly out of A3's scope",
-  gmail_modify_labels: "reversible label state — package T1 (priority-2), explicitly out of A3's scope",
-  gmail_snooze: "archives + schedules a restore, reversible — stage-6 audit decides; not P1",
-  gmail_cancel_scheduled_send: "itself protective (pulls a send BACK) — stage-6 audit decides; not P1",
-  gmail_create_label: "label-only, reversible — package T1 (priority-2), explicitly out of A3's scope",
-  gmail_update_label: "label-only, reversible — package T1 (priority-2), explicitly out of A3's scope",
-  gmail_delete_label: "removes a label from messages, not the messages — package T1 (priority-2)",
-  gmail_save_attachment_to_drive: "writes to Drive, not Gmail; priority-2 in plan §1, out of A3's scope",
-  gmail_export_thread_eml: "writes an export copy to Drive; not a mailbox mutation; out of A3's scope",
-  gmail_create_upload_session: "stages a placeholder Drive file for a client upload; not a send",
-  gmail_get_attachment_text: "transient OCR scratch file in Drive, best-effort cleanup; not a send",
+  gmail_create_draft: "отложено в T1 (под гейт, этап 3)",
+  gmail_archive: "отложено в T1 (приоритет-2, решение Максима)",
+  gmail_trash: "отложено в T1 (приоритет-2, решение Максима)",
+  gmail_modify_labels: "отложено в T1 (приоритет-2, решение Максима)",
+  gmail_snooze: "отложено в T1 (под гейт, этап 3)",
+  gmail_cancel_scheduled_send: "защитное действие (отмена отправки), сознательно вне гейта",
+  gmail_create_label: "отложено в T1 (приоритет-2, решение Максима)",
+  gmail_update_label: "отложено в T1 (приоритет-2, решение Максима)",
+  gmail_delete_label: "отложено в T1 (приоритет-2, решение Максима)",
+  gmail_save_attachment_to_drive: "отложено в T1 (Drive-запись под гейт, этап 3)",
+  gmail_export_thread_eml: "отложено в T1 (Drive-запись под гейт, этап 3)",
+  gmail_create_upload_session: "отложено в T1 (Drive-запись под гейт, этап 3)",
+  gmail_get_attachment_text: "по сути read (OCR), Drive-файл временный — cleanup, не гейт",
 };
 
 /** The 4 tools A3 actually gates, with how to reach their plan phase and
