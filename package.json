@@ -11,7 +11,8 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node scripts/test-attachment-links.mjs && node scripts/test-schedule-send.mjs && node scripts/test-scheduler.mjs && node scripts/test-credential-source.mjs"
+    "test:consent": "node scripts/test-consent.mjs",
+    "test": "npm run build && node scripts/test-attachment-links.mjs && node scripts/test-schedule-send.mjs && node scripts/test-scheduler.mjs && node scripts/test-credential-source.mjs && node scripts/test-s2-ssrf.mjs && node scripts/test-b1-account.mjs && node scripts/test-b2-visibility.mjs && node scripts/test-s1-safetext.mjs && node scripts/test-b3-postverify.mjs && node scripts/test-consent.mjs && node scripts/test-a1-manifests.mjs && node scripts/test-s5-failclosed.mjs && node scripts/test-a3-gate.mjs && node scripts/test-gate-coverage.mjs && node scripts/test-a4-audit.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -19,6 +20,7 @@
     "google-auth-library": "^10.7.0",
     "googleapis": "^173.0.0",
     "pg": "^8.22.0",
+    "undici": "6.28.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {

@@ -31,6 +31,13 @@ export interface Account {
   auth: GoogleAuthConfig;
   /** Optional Gmail search fragment ANDed into every gmail_search for this account. */
   gmailQuery?: string;
+  /**
+   * The account's real email address, when known (onboarded deployments carry
+   * it from the DB). Used so an "unknown account" error and send previews can
+   * show `work (maksim@…)`, not just an opaque label. Absent for env-only
+   * accounts — the label is then shown alone (fail-soft).
+   */
+  email?: string;
 }
 
 export interface User {
@@ -90,6 +97,12 @@ export interface Config {
   requireAuth: boolean;
   users: User[];
   onboarding: OnboardingConfig;
+  /**
+   * A scheduled send stuck in 'sending' longer than this many minutes is
+   * reaped to 'failed' by the poller (a process that died mid-send). Env
+   * SENDING_STUCK_MINUTES, default 10.
+   */
+  sendingStuckMinutes: number;
 }
 
 function loadOnboarding(): OnboardingConfig {
@@ -307,6 +320,45 @@ function loadSingleUser(): User {
   return { name: "default", token, accounts, defaultAccount };
 }
 
+/**
+ * Consent-gate config (packages A1/A2/A3, `mcp-development-standard/
+ * references/gate.md`). Standalone from the rest of `Config`/`loadConfig()`
+ * on purpose — it's pure env, no user/onboarding parsing, so `server.ts` can
+ * read it once at module scope without re-running the heavier account setup.
+ */
+export interface ConsentGateConfig {
+  /** Constant identifying THIS server in the shared consent_manifests/
+   * consent_audit tables (all 5 MCP servers share one physical Postgres —
+   * plan §0.4). `$self`, never a tool argument. Env CONSENT_SERVER, default "gmail". */
+  server: string;
+  /** Manifest TTL in ms. Env CONSENT_TTL_MS, default 1h. */
+  consentTtlMs: number;
+  /** Minimum gap between plan and execute in ms — anti-doublet check
+   * (gate.md §3.3(2)): catches a model calling plan then execute in the same
+   * turn, before a human could have answered. Env MIN_CONSENT_GAP_MS, default
+   * 10000 — Maksim's decision (Q3, 2026-08-04) specifically for mail; NOT the
+   * generic 5000 used elsewhere in the plan/tests. */
+  minConsentGapMs: number;
+  /** Cap on items per manifest/batch — one manifest is one radius of consent
+   * (plan §0.2/[R:полнота-7]); over the cap, the tool refuses with "split it
+   * up" instead of creating a manifest. Env SEND_BATCH_MAX, default 10. */
+  sendBatchMax: number;
+}
+
+function positiveIntEnv(name: string, fallback: number): number {
+  const raw = Number(process.env[name]);
+  return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
+export function loadConsentGateConfig(): ConsentGateConfig {
+  return {
+    server: process.env.CONSENT_SERVER?.trim() || "gmail",
+    consentTtlMs: positiveIntEnv("CONSENT_TTL_MS", 3_600_000),
+    minConsentGapMs: positiveIntEnv("MIN_CONSENT_GAP_MS", 10_000),
+    sendBatchMax: positiveIntEnv("SEND_BATCH_MAX", 10),
+  };
+}
+
 export function loadConfig(): Config {
   const transport =
     (process.env.MCP_TRANSPORT as "http" | "stdio" | undefined) ??
@@ -344,5 +396,7 @@ export function loadConfig(): Config {
   }
 
   const requireAuth = onboarding.enabled || users.length > 1 || users.some((u) => !!u.token);
-  return { transport, port, requireAuth, users, onboarding };
+  const stuckRaw = Number(process.env.SENDING_STUCK_MINUTES);
+  const sendingStuckMinutes = Number.isFinite(stuckRaw) && stuckRaw > 0 ? stuckRaw : 10;
+  return { transport, port, requireAuth, users, onboarding, sendingStuckMinutes };
 }

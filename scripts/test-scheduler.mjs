@@ -18,12 +18,12 @@ const check = (label, cond, extra = "") => {
   if (!cond) failures++;
 };
 
-function fakeConfig({ onboardingEnabled = false, users = [] } = {}) {
-  return { onboarding: { enabled: onboardingEnabled }, users };
+function fakeConfig({ onboardingEnabled = false, users = [], sendingStuckMinutes = 10 } = {}) {
+  return { onboarding: { enabled: onboardingEnabled }, users, sendingStuckMinutes };
 }
 
 function fakeDeps(overrides = {}) {
-  const calls = { modify: [], send: [], done: [], failed: [], sendOk: [], sendFailed: [] };
+  const calls = { modify: [], send: [], done: [], failed: [], sendOk: [], sendFailed: [], reaped: [] };
   const clientsFor = new Map(); // userName -> { resolve(label) -> gmail client }
   const deps = {
     resolveOnboardedUser: async () => null,
@@ -44,6 +44,13 @@ function fakeDeps(overrides = {}) {
                       calls.send.push(args);
                       return { data: { id: "SENTID" } };
                     },
+                    // Post-verify (B3) reads the sent message back. A normal
+                    // send lands in Sent only — labelIds ["SENT"], not INBOX.
+                    get: async (args) => {
+                      calls.postVerifyGet = (calls.postVerifyGet ?? []);
+                      calls.postVerifyGet.push(args);
+                      return { data: { labelIds: ["SENT"], payload: { headers: [{ name: "To", value: "a@b.com" }, { name: "Subject", value: "S" }] } } };
+                    },
                   },
                 },
               },
@@ -59,6 +66,7 @@ function fakeDeps(overrides = {}) {
     claimDueSends: async () => [],
     markSendSent: async (id, msgId) => calls.sendOk.push({ id, msgId }),
     markSendFailed: async (id, err) => calls.sendFailed.push({ id, err }),
+    reapStuckSends: async (mins) => { calls.reaped.push(mins); return 0; },
     ...overrides,
   };
   return { deps, calls };
