@@ -108,6 +108,7 @@ function makeTgStore() {
     async consumeTgDecision(manifestId, server, status) {
       const r = approvals.get(manifestId);
       if (!r || r.server !== server || r.status !== "PENDING") return null; // атомарный one-shot
+      if (clock.t >= r.expiresAt) return null; // TTL-guard — зеркалит store.ts's `expires_at > $now`
       r.status = status;
       r.decidedAt = clock.t;
       return { ...r };
@@ -302,6 +303,68 @@ console.log("\n[7] TTL approval-запроса истёк → checkApproval='non
   });
   check("kind=refused", exec.kind === "refused");
   check("текст упоминает истечение", /истёк/i.test(exec.result));
+  clock.t = 1_700_000_000_000; // откатываем общие часы для следующих секций
+}
+
+// ═══ [7b] TTL-guard в consumeTgDecision: кнопка нажата ПОСЛЕ истечения ═══
+// approval-TTL, но пока consent-манифест ещё жив (окно из приёмки: approval-
+// TTL короче consent-TTL) → webhook-путь не должен записать решение вообще.
+console.log("\n[7b] кнопка нажата после истечения approval-TTL (манифест ещё жив) → решение НЕ записывается");
+{
+  const { mock } = resetTelegramMocks();
+  mock("sendMessage", () => ({ statusCode: 200, data: { ok: true, result: { message_id: 11 } }, headers: { "content-type": "application/json" } }));
+  mock("answerCallbackQuery", () => ({ statusCode: 200, data: { ok: true }, headers: { "content-type": "application/json" } }));
+  mock("editMessageReplyMarkup", () => ({ statusCode: 200, data: { ok: true }, headers: { "content-type": "application/json" } }));
+
+  // approval-TTL (1с) короче consent-TTL (1ч) — ровно окно из приёмки.
+  const shortCfg = tgCfg({ ttlMs: 1_000 });
+  const tgStore = makeTgStore();
+  const gate = createTgApprovalGate(shortCfg, tgStore, now);
+  const consentStore = makeConsentStore();
+
+  const dec = await requireConsent({ tool: "gmail_send", accountLabel: "work", plan, rehash, store: consentStore, cfg: consentCfg, tg: gate });
+  const rowBefore = tgStore.approvals.get(dec.manifestId);
+  check("approval-строка создана, PENDING", !!rowBefore && rowBefore.status === "PENDING");
+
+  // прошли и анти-дуплет-зазор (иначе execute отказал бы раньше по check (2),
+  // не дойдя до tg-ветки), и approval-TTL (1с) — но НЕ consent-манифест (1ч).
+  clock.t += consentCfg.minConsentGapMs + 2_000;
+
+  const update = {
+    callback_query: {
+      id: "cbq-7b",
+      from: { id: Number(shortCfg.ownerChatId) },
+      data: `a:${dec.manifestId}`,
+      message: { message_id: 11, chat: { id: shortCfg.ownerChatId } },
+    },
+  };
+  await handleWebhook(shortCfg, tgStore, update);
+
+  const rowAfter = tgStore.approvals.get(dec.manifestId);
+  check(
+    "webhook НЕ перевёл строку в APPROVED — осталась PENDING (TTL-guard в consumeTgDecision)",
+    rowAfter.status === "PENDING",
+    JSON.stringify(rowAfter),
+  );
+  check("decidedAt не проставлен", rowAfter.decidedAt === null);
+  check(
+    "editMessageReplyMarkup НЕ вызван — consumed=null, кнопки снимать нечего",
+    tgCalls.filter((c) => c.method === "editMessageReplyMarkup").length === 0,
+  );
+  check(
+    "answerCallbackQuery всё же вызван (спиннер гасится «уже обработано»)",
+    tgCalls.filter((c) => c.method === "answerCallbackQuery").length === 1,
+  );
+
+  // execute остаётся refuse — манифест не должен исполниться по протухшей кнопке.
+  const exec = await requireConsent({
+    tool: "gmail_send", accountLabel: "work", manifestId: dec.manifestId, userReply: "да",
+    plan, rehash, store: consentStore, cfg: consentCfg, tg: gate,
+  });
+  check("execute: kind=refused (протухшая кнопка не исполняет план)", exec.kind === "refused", JSON.stringify(exec).slice(0, 160));
+  const manifestRow = consentStore.manifests.get(dec.manifestId);
+  check("consent-манифест НЕ стал DONE", manifestRow.status !== "DONE", JSON.stringify(manifestRow));
+
   clock.t = 1_700_000_000_000; // откатываем общие часы для следующих секций
 }
 

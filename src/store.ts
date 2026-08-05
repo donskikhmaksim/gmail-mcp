@@ -1211,8 +1211,20 @@ export async function getTgApproval(manifestId: string, server: string): Promise
  * Atomic one-shot decision, same shape as `consumeManifest` above: a single
  * `UPDATE … WHERE status = 'PENDING' … RETURNING` closes the double-tap /
  * replay race in the database. Returns null on any miss (unknown manifest,
- * wrong server, or already APPROVED/REJECTED) — the webhook handler treats a
- * miss as "already handled, no-op" (idempotent against Telegram retries).
+ * wrong server, already APPROVED/REJECTED, OR the approval row's OWN TTL has
+ * expired) — the webhook handler treats a miss as "already handled, no-op"
+ * (idempotent against Telegram retries). The TTL check is checked against the
+ * SAME `now` value used to stamp `decided_at`, so there's no window between
+ * the compare and the write (mirrors `consumeManifest`'s `expires_at > $4`
+ * guard on consent_manifests). Without this, a button tapped after the
+ * approval row's own TTL — but while the underlying CONSENT manifest is still
+ * AWAITING_CONSENT — would record a decision `checkApproval` had already
+ * started treating as "none" (TTL-expired), which is a self-inconsistent
+ * result even though `notifyPlan` caps the row's `expiresAt` at the consent
+ * manifest's own expiry (their windows coincide by default, but must not be
+ * assumed to always coincide — this table's TTL is independently
+ * configurable via `TG_APPROVAL_TTL_MS`, see `tg_approval.ts`'s
+ * `notifyPlan`).
  */
 export async function consumeTgDecision(
   manifestId: string,
@@ -1223,7 +1235,7 @@ export async function consumeTgDecision(
   const now = Date.now();
   const res = await p.query(
     `UPDATE tg_approvals SET status = $3, decided_at = $4
-      WHERE manifest_id = $1 AND server = $2 AND status = 'PENDING'
+      WHERE manifest_id = $1 AND server = $2 AND status = 'PENDING' AND expires_at > $4
       RETURNING *`,
     [manifestId, server, status, now],
   );
