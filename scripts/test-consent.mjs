@@ -83,7 +83,11 @@ const plan = () => ({
   preview: "### 📤 План отправки\n\n- **Кому:** eric@x.com",
   batchSize: 1,
 });
-const rehash = (payload) => sha256(payload); // совпадает с OBJHASH
+// СИМУЛЯЦИЯ «мир не изменился»: в тесте нет реального объекта для перечитывания,
+// поэтому rehash отдаёт тот же хеш → binding проходит. В боевом A3 rehash ОБЯЗАН
+// перечитать живое состояние по id и захешировать ЕГО (не аргумент) — см.
+// контракт ConsentAddressing/rehash в consent.ts. Тест 9 моделирует ИЗМЕНЕНИЕ мира.
+const rehash = (payload) => sha256(payload);
 
 // ── харнесс проверок ────────────────────────────────────────────────────────
 
@@ -291,6 +295,65 @@ console.log("\n[13] classifyReply — словари RU+EN");
   for (const s of neg) check(`neg: «${s}»`, classifyReply(s, ctx) === "negation", classifyReply(s, ctx));
   for (const s of unk) check(`unk: «${s}»`, classifyReply(s, ctx) === "unknown", classifyReply(s, ctx));
   check("пустая строка → unknown", classifyReply("   ", ctx) === "unknown");
+}
+
+// ── 14. регрессии приёмки: negation-конструкция vs ложная инвалидация ───────
+console.log("\n[14] дыры приёмки №1/№2: «not sure» ≠ да; «отправляй, не тяни» ≠ отрицание");
+{
+  const ctx = { manifestId: "mid", tool: "gmail_send" };
+
+  // №1 — дыра безопасности: «not X» больше НЕ читается как affirmation.
+  for (const s of ["not sure", "not ok", "not really"]) {
+    check(`«${s}» НЕ affirmation`, classifyReply(s, ctx) !== "affirmation", classifyReply(s, ctx));
+  }
+  // «not sure»/«not ok» — конструкция «частица+affirmation» → отрицание.
+  check("«not sure» = negation", classifyReply("not sure", ctx) === "negation");
+  check("«not ok» = negation", classifyReply("not ok", ctx) === "negation");
+  // «not really» — частица без утвердительной головы → unknown (не да и не инвалидация).
+  check("«not really» = unknown", classifyReply("not really", ctx) === "unknown");
+
+  // «не <affirmation>» → отрицание.
+  check("«не отправляй» = negation", classifyReply("не отправляй", ctx) === "negation");
+  check("«не надо» = negation", classifyReply("не надо", ctx) === "negation");
+
+  // №2 — ложная инвалидация: «не» перед НЕ-головой = согласие, а не отрицание.
+  check("«отправляй, не тяни» = affirmation", classifyReply("отправляй, не тяни", ctx) === "affirmation");
+  // «чего ждёшь, не томи» — согласие без явного aff-слова → хотя бы НЕ отрицание.
+  check("«чего ждёшь, не томи» ≠ negation", classifyReply("чего ждёшь, не томи", ctx) !== "negation");
+  // одиночная частица «не» сама по себе — НЕ отрицание.
+  check("одиночное «не» = unknown", classifyReply("не", ctx) === "unknown");
+}
+
+// ── 15. интеграция: «not sure» не мутирует; «не тяни» не роняет манифест ─────
+console.log("\n[15] интеграция: «not sure» → НЕ confirmed; «отправляй, не тяни» → confirmed, манифест жив до этого");
+{
+  // №1 боевой сценарий: раньше «not sure» → confirmed (мутация исполнялась). Теперь — refused.
+  clock.t = 1_700_000_000_000;
+  const { store, dec: planned } = await buildPlan();
+  const id = planned.manifestId;
+  clock.t += 6_000;
+  const dec = await requireConsent({ tool: "gmail_send", accountLabel: "work", manifestId: id, userReply: "not sure", plan, rehash, store, cfg });
+  check("«not sure» → НЕ confirmed", dec.kind !== "confirmed", dec.kind);
+  check("«not sure» → refused", dec.kind === "refused");
+  check("«not sure» манифест НЕ DONE", store.manifests.get(id).status !== "DONE");
+
+  // №2 боевой сценарий: согласие с частицей «не» → confirmed, НЕ инвалидация.
+  clock.t = 1_700_000_000_000;
+  const p2 = await buildPlan();
+  const id2 = p2.dec.manifestId;
+  clock.t += 6_000;
+  const dec2 = await requireConsent({ tool: "gmail_send", accountLabel: "work", manifestId: id2, userReply: "отправляй, не тяни", plan, rehash, store: p2.store, cfg });
+  check("«отправляй, не тяни» → confirmed", dec2.kind === "confirmed", dec2.kind);
+  check("«отправляй, не тяни» манифест DONE, не INVALIDATED", p2.store.manifests.get(id2).status === "DONE");
+
+  // одиночное «не» в реплике не инвалидирует манифест (unknown → refuse, план жив).
+  clock.t = 1_700_000_000_000;
+  const p3 = await buildPlan();
+  const id3 = p3.dec.manifestId;
+  clock.t += 6_000;
+  const dec3 = await requireConsent({ tool: "gmail_send", accountLabel: "work", manifestId: id3, userReply: "ну не знаю", plan, rehash, store: p3.store, cfg });
+  check("«ну не знаю» → refused (не понял)", dec3.kind === "refused");
+  check("«ну не знаю» манифест ЖИВ (AWAITING)", p3.store.manifests.get(id3).status === "AWAITING_CONSENT");
 }
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
