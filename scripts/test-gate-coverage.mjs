@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * A3 — reflexive gate-coverage test (plan §A3 «Системные тесты»).
+ * A3/T1 — reflexive gate-coverage test (plan §A3 «Системные тесты», extended
+ * by package T1 for the priority-2 write tools).
  *
  * Unlike every other test file here, this one does NOT hand-pick which tools
  * to exercise. It lists the tools from the REAL registered MCP registry
@@ -8,16 +9,21 @@
  * classified as a write (no `readOnlyHint: true` — the exact rule the task
  * specifies), checks it against an explicit allowlist:
  *
- *  - the 4 gated tools (gmail_send/reply/forward/schedule_send) get a real
- *    BEHAVIOURAL check: calling them WITHOUT manifest_id/user_reply must not
- *    reach the mutating fake API (messages.send / drafts.create+send /
- *    addScheduledSend), and the response must look like a plan, not a
- *    success/failure header;
+ *  - every entry in `GATED_TOOLS` (the 4 A3 send tools PLUS T1's 11
+ *    priority-2 tools) gets a real BEHAVIOURAL check: calling it WITHOUT
+ *    manifest_id/user_reply must not reach ANY mutating fake API call, and
+ *    the response must look like a plan, not a success/failure header;
  *  - everything else that is a write MUST be named in `UNGATED_WRITE_ALLOWLIST`
  *    below, with a one-line reason. A write tool that is neither gated nor
  *    allowlisted fails this test — that's the point: a new write landing in
  *    gmail.ts without going through requireConsent (or being consciously
  *    exempted) breaks CI instead of shipping silently ungated.
+ *
+ * After T1, only TWO tools remain in the allowlist, both with the
+ * orchestrator's explicit per-tool verdict (2026-08-04) as reason, not a
+ * placeholder: gmail_cancel_scheduled_send (itself protective — it cancels a
+ * send) and gmail_get_attachment_text (read/OCR; its transient Google Doc
+ * gets a reliable finally-cleanup, not a gate).
  *
  * Usage: node scripts/test-gate-coverage.mjs
  */
@@ -44,31 +50,40 @@ const text = (r) => r.content[0].text;
 // for 3 of these; that has been replaced with the actual decision so this
 // list can't be mistaken for still-pending triage.
 const UNGATED_WRITE_ALLOWLIST = {
-  gmail_create_draft: "отложено в T1 (под гейт, этап 3)",
-  gmail_archive: "отложено в T1 (приоритет-2, решение Максима)",
-  gmail_trash: "отложено в T1 (приоритет-2, решение Максима)",
-  gmail_modify_labels: "отложено в T1 (приоритет-2, решение Максима)",
-  gmail_snooze: "отложено в T1 (под гейт, этап 3)",
   gmail_cancel_scheduled_send: "защитное действие (отмена отправки), сознательно вне гейта",
-  gmail_create_label: "отложено в T1 (приоритет-2, решение Максима)",
-  gmail_update_label: "отложено в T1 (приоритет-2, решение Максима)",
-  gmail_delete_label: "отложено в T1 (приоритет-2, решение Максима)",
-  gmail_save_attachment_to_drive: "отложено в T1 (Drive-запись под гейт, этап 3)",
-  gmail_export_thread_eml: "отложено в T1 (Drive-запись под гейт, этап 3)",
-  gmail_create_upload_session: "отложено в T1 (Drive-запись под гейт, этап 3)",
-  gmail_get_attachment_text: "по сути read (OCR), Drive-файл временный — cleanup, не гейт",
+  gmail_get_attachment_text: "по сути read (OCR), Drive-файл временный — надёжный finally-cleanup, не гейт",
 };
 
-/** The 4 tools A3 actually gates, with how to reach their plan phase and
- * which counter must stay at 0 after a plan-only call. */
+/** Every tool the gate covers (A3's 4 send tools + T1's 11 priority-2 tools),
+ * with how to reach its plan phase, which counter must stay at 0 after a
+ * plan-only call, and whether it is expected to carry `destructiveHint: true`
+ * (irreversible — trash/delete_label) vs `false` (additive/reversible —
+ * everything else in T1, per Maksim's item-7 classification). */
 const GATED_TOOLS = {
-  gmail_send: { args: { messages: [{ to: "a@x.com", subject: "S", body: "B" }] }, counterKey: "send" },
-  gmail_reply: { args: { replies: [{ messageId: "M1", body: "B" }] }, counterKey: "draftsSend" },
-  gmail_forward: { args: { items: [{ messageId: "M1", to: "b@x.com" }] }, counterKey: "send" },
+  gmail_send: { args: { messages: [{ to: "a@x.com", subject: "S", body: "B" }] }, counterKey: "send", destructive: true },
+  gmail_reply: { args: { replies: [{ messageId: "M1", body: "B" }] }, counterKey: "draftsSend", destructive: true },
+  gmail_forward: { args: { items: [{ messageId: "M1", to: "b@x.com" }] }, counterKey: "send", destructive: true },
   gmail_schedule_send: {
     args: { messages: [{ to: "c@x.com", subject: "S", body: "B", sendAt: "2099-01-01T08:00:00-07:00" }] },
     counterKey: "addScheduledSend",
+    destructive: true,
   },
+  // ── T1 priority-2 tools ────────────────────────────────────────────────
+  gmail_create_draft: { args: { drafts: [{ to: "a@x.com", subject: "S", body: "B" }] }, counterKey: "draftsCreate", destructive: false },
+  gmail_archive: { args: { messageIds: ["M1"] }, counterKey: "modify", destructive: false },
+  gmail_trash: { args: { messageIds: ["M1"] }, counterKey: "trash", destructive: true },
+  gmail_modify_labels: { args: { items: [{ messageId: "M1", addLabelIds: ["STARRED"] }] }, counterKey: "modify", destructive: false },
+  gmail_snooze: { args: { items: [{ messageId: "M1", unsnoozeAt: "2099-01-01T09:00:00" }] }, counterKey: "modify", destructive: false },
+  gmail_create_label: { args: { labels: [{ name: "Vendors/Acme" }] }, counterKey: "labelCreate", destructive: false },
+  gmail_update_label: { args: { items: [{ labelId: "L1", name: "New name" }] }, counterKey: "labelPatch", destructive: false },
+  gmail_delete_label: { args: { labelIds: ["L1"] }, counterKey: "labelDelete", destructive: true },
+  gmail_save_attachment_to_drive: {
+    args: { items: [{ messageId: "M1", attachmentId: "ATT1" }] },
+    counterKey: "driveCreate",
+    destructive: false,
+  },
+  gmail_export_thread_eml: { args: { threadId: "T1" }, counterKey: "driveCreate", destructive: false },
+  gmail_create_upload_session: { args: { files: [{ name: "big.pdf" }] }, counterKey: "driveCreate", destructive: false },
 };
 
 // ── fakes (same shape as scripts/test-a3-gate.mjs, kept self-contained here
@@ -96,13 +111,33 @@ function makeConsentStore() {
 const CONSENT_CFG = { server: "gmail", consentTtlMs: 3_600_000, minConsentGapMs: 5_000, sendBatchMax: 10 };
 
 function makeCounters() {
-  return { send: 0, draftsCreate: 0, draftsSend: 0, addScheduledSend: 0 };
+  return {
+    send: 0,
+    draftsCreate: 0,
+    draftsSend: 0,
+    addScheduledSend: 0,
+    modify: 0,
+    trash: 0,
+    labelCreate: 0,
+    labelPatch: 0,
+    labelDelete: 0,
+    driveCreate: 0,
+  };
 }
 
 function buildClients(counters) {
-  const getImpl = async () => ({
-    data: { labelIds: ["SENT"], payload: { headers: [{ name: "From", value: "eric@x.com" }, { name: "Subject", value: "Hi" }] } },
-  });
+  // format-aware: "full" additionally returns a MIME part with an attachment
+  // (id ATT1) so gmail_save_attachment_to_drive's plan phase (which reads the
+  // MIME tree to locate the attachment by id) can find a match without
+  // erroring out — this file only needs the PLAN phase to succeed, real
+  // execute-phase behaviour is covered by scripts/test-t1-gate.mjs.
+  const getImpl = async ({ format } = {}) => {
+    const payload = { headers: [{ name: "From", value: "eric@x.com" }, { name: "Subject", value: "Hi" }] };
+    if (format === "full") {
+      payload.parts = [{ filename: "f.pdf", mimeType: "application/pdf", body: { attachmentId: "ATT1", size: 10 } }];
+    }
+    return { data: { labelIds: ["SENT", "INBOX"], payload } };
+  };
   return {
     names: ["work"],
     defaultName: "work",
@@ -111,15 +146,39 @@ function buildClients(counters) {
       gmail: {
         users: {
           getProfile: async () => ({ data: { emailAddress: "me@x.com" } }),
-          labels: { list: async () => ({ data: { labels: [] } }) },
+          labels: {
+            list: async () => ({ data: { labels: [] } }),
+            get: async ({ id }) => ({ data: { id, name: "Existing label" } }),
+            create: async ({ requestBody }) => {
+              counters.labelCreate++;
+              return { data: { id: "L" + counters.labelCreate, name: requestBody.name } };
+            },
+            patch: async ({ id }) => {
+              counters.labelPatch++;
+              return { data: { id, name: "Patched" } };
+            },
+            delete: async () => {
+              counters.labelDelete++;
+            },
+          },
+          threads: {
+            get: async () => ({ data: { messages: [{ payload: { headers: [{ name: "Subject", value: "Thread" }] } }] } }),
+          },
           messages: {
             send: async () => {
               counters.send++;
               return { data: { id: "SID" + counters.send, threadId: "T1" } };
             },
             get: getImpl,
-            modify: async () => ({ data: {} }),
-            trash: async () => ({ data: {} }),
+            modify: async () => {
+              counters.modify++;
+              return { data: {} };
+            },
+            trash: async () => {
+              counters.trash++;
+              return { data: {} };
+            },
+            list: async () => ({ data: { resultSizeEstimate: 0 } }),
             attachments: { get: async () => ({ data: { data: "", size: 0 } }) },
           },
           drafts: {
@@ -134,7 +193,17 @@ function buildClients(counters) {
           },
         },
       },
-      drive: { files: { list: async () => ({ data: { files: [] } }) } },
+      drive: {
+        files: {
+          list: async () => ({ data: { files: [] } }),
+          create: async ({ requestBody }) => {
+            counters.driveCreate++;
+            return { data: { id: "F" + counters.driveCreate, name: requestBody?.name } };
+          },
+          get: async ({ fileId }) => ({ data: { id: fileId, name: "f", trashed: false } }),
+        },
+      },
+      accessToken: async () => "fake-token",
     }),
     canonicalName: (n) => (n && n.trim() ? n.trim() : "work"),
     emailFor: () => "me@x.com",
@@ -199,11 +268,15 @@ check(
 );
 
 console.log("\n[3] every GATED_TOOLS entry is actually registered as a write (schema sanity)");
-for (const name of Object.keys(GATED_TOOLS)) {
+for (const [name, spec] of Object.entries(GATED_TOOLS)) {
   const t = tools.find((x) => x.name === name);
   check(`${name} is registered`, !!t, "not found in registry");
   check(`${name} is classified as write (no readOnlyHint)`, t && t.annotations?.readOnlyHint !== true, JSON.stringify(t?.annotations));
-  check(`${name} carries destructiveHint: true`, t?.annotations?.destructiveHint === true, JSON.stringify(t?.annotations));
+  check(
+    `${name} carries destructiveHint: ${spec.destructive}`,
+    t?.annotations?.destructiveHint === spec.destructive,
+    JSON.stringify(t?.annotations),
+  );
   const props = t?.inputSchema?.properties ?? {};
   check(`${name} schema exposes manifest_id`, "manifest_id" in props, JSON.stringify(Object.keys(props)));
   check(`${name} schema exposes user_reply`, "user_reply" in props, JSON.stringify(Object.keys(props)));

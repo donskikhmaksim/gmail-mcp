@@ -95,14 +95,63 @@ const fakeClients = {
   baseGmailQuery: () => "",
 };
 
+// gmail_create_upload_session is consent-gated (package T1) — a minimal fake
+// ConsentStore + a controllable clock, same shape as scripts/test-a3-gate.mjs,
+// so this pre-existing single-call-style test can drive the two-phase
+// plan→execute flow instead of expecting an immediate mutation.
+const clock = { t: 1_700_000_000_000 };
+function makeConsentStore() {
+  const manifests = new Map();
+  return {
+    async createManifest(input) {
+      manifests.set(input.id, { ...input, status: "AWAITING_CONSENT", consumedAt: null, userReply: null });
+    },
+    async getManifest(id, server) {
+      const r = manifests.get(id);
+      return r && r.server === server ? { ...r } : null;
+    },
+    async consumeManifest(id, server, userReply) {
+      const r = manifests.get(id);
+      if (!r || r.server !== server || r.status !== "AWAITING_CONSENT") return null;
+      if (!(r.expiresAt > clock.t)) return null;
+      r.status = "DONE";
+      r.consumedAt = clock.t;
+      r.userReply = userReply;
+      return { ...r };
+    },
+    async invalidateManifest(id, server, userReply) {
+      const r = manifests.get(id);
+      if (r && r.server === server && r.status === "AWAITING_CONSENT") {
+        r.status = "INVALIDATED";
+        r.userReply = userReply;
+      }
+    },
+    async appendConsentAudit() {},
+    async updateConsentAuditOutcome() {},
+  };
+}
+const consentCfg = { server: "gmail", consentTtlMs: 3_600_000, minConsentGapMs: 5_000, sendBatchMax: 10, now: () => clock.t };
+
 const server = new McpServer({ name: "gmail-mcp-test", version: "0" });
-registerGmailTools(server, fakeClients, { store: null, userToken: null });
+registerGmailTools(server, fakeClients, { store: null, userToken: null, consentStore: makeConsentStore(), consentCfg });
 const client = new Client({ name: "test-client", version: "0" });
 const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
 await Promise.all([server.connect(serverSide), client.connect(clientSide)]);
 
 const raw = async (name, args) => client.callTool({ name, arguments: args });
 const call = async (name, args) => JSON.parse((await raw(name, args)).content[0].text);
+
+/** Drives gmail_create_upload_session's plan→execute flow in one call, for
+ * tests that only care about the mutation's outcome (the gate mechanics
+ * themselves are covered by scripts/test-t1-gate.mjs). */
+async function planThenExecute(name, args) {
+  const planResp = await raw(name, args);
+  const planText = planResp.content[0].text;
+  const m = planText.match(/план `([^`]+)`/);
+  if (!m) throw new Error(`${name}: expected a plan preview, got: ${planText}`);
+  clock.t += 6_000; // past MIN_CONSENT_GAP_MS
+  return call(name, { manifest_id: m[1], user_reply: "да, давай" });
+}
 
 let failures = 0;
 const check = (label, cond, extra = "") => {
@@ -166,7 +215,7 @@ driveCalls.length = 0;
 calls.length = 0;
 folderListResult = { data: { files: [] } };
 responder = () => res({ status: 200, headers: { location: "https://upload.googleapis.com/?upload_id=S1" } });
-out = await call("gmail_create_upload_session", {
+out = await planThenExecute("gmail_create_upload_session", {
   files: [{ name: "holiday.mp4", mimeType: "video/mp4", sizeBytes: 20_000_000 }],
 });
 r = out.results[0];
@@ -186,7 +235,7 @@ console.log("\n[7] upload session — existing folder reused, defaults applied")
 driveCalls.length = 0;
 calls.length = 0;
 folderListResult = { data: { files: [{ id: "EXISTING" }] } };
-out = await call("gmail_create_upload_session", { files: [{ name: "notes.bin" }] });
+out = await planThenExecute("gmail_create_upload_session", { files: [{ name: "notes.bin" }] });
 check("no second folder created", driveCalls.filter((c) => c.op === "create" && c.args.requestBody?.mimeType?.includes("folder")).length === 0);
 check("placeholder went into the existing folder", driveCalls[1].args.requestBody.parents?.[0] === "EXISTING", JSON.stringify(driveCalls[1]?.args?.requestBody));
 check("defaults to octet-stream", calls[0].headers["X-Upload-Content-Type"] === "application/octet-stream", calls[0].headers["X-Upload-Content-Type"]);
@@ -194,10 +243,10 @@ check("no size header when size unknown", calls[0].headers["X-Upload-Content-Len
 
 console.log("\n[8] upload session — Google refuses");
 responder = () => res({ status: 403, body: '{"error":{"message":"storageQuotaExceeded"}}' });
-out = await call("gmail_create_upload_session", { files: [{ name: "big.bin" }] });
+out = await planThenExecute("gmail_create_upload_session", { files: [{ name: "big.bin" }] });
 check("HTTP status surfaced", /403/.test(out.results[0].error ?? ""), JSON.stringify(out.results[0]));
 responder = () => res({ status: 200 });
-out = await call("gmail_create_upload_session", { files: [{ name: "x.bin" }] });
+out = await planThenExecute("gmail_create_upload_session", { files: [{ name: "x.bin" }] });
 check("missing Location reported", /no Location header/.test(out.results[0].error ?? ""), JSON.stringify(out.results[0]));
 
 // --- 9. confirm -------------------------------------------------------------

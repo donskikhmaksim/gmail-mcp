@@ -20,6 +20,7 @@ import {
   USER_REPLY_DOC,
   type ConsentStore,
   type ConsentConfig,
+  type ConsentPlan,
 } from "../consent.js";
 import {
   issueDownloadLink,
@@ -415,26 +416,408 @@ function nowInLA(): string {
   return new Date().toLocaleString("sv-SE", { timeZone: "America/Los_Angeles" }) + " America/Los_Angeles";
 }
 
-/** Builds the §5.3 proof block from per-message post-verify results (server-glued). */
-export function renderPostVerifyReport(results: PostVerifyResult[]): string {
+/**
+ * One §5.3 renderer for the WHOLE file (output-format.md §7.1 p.5: "an
+ * instrument hand-rolling its own status string is a defect"). `renderPostVerifyReport`
+ * below (the 4 send tools) and every T1 mutation (trash/archive/labels/Drive
+ * writes, package T1) go through this SAME function with their own
+ * title/subtitle — the ✅/⚠️/❌ shape + verbatim-reprint tail is defined once.
+ * `results` only needs `{outcome, line}` — `PostVerifyResult` (extra
+ * `messageId`/`detail` fields) satisfies this structurally, no cast needed.
+ */
+interface VerifyLine {
+  outcome: PostVerifyOutcome;
+  line: string;
+}
+
+function renderVerifyReport(title: string, subtitle: string, results: VerifyLine[]): string {
   const okN = results.filter((r) => r.outcome === "ok").length;
   const warnN = results.filter((r) => r.outcome === "warn").length;
   const mmN = results.filter((r) => r.outcome === "mismatch").length;
   const body = results.map((r) => r.line).join("\n");
   return (
-    `### 🧾 Независимая проверка отправки\n` +
-    `_${nowInLA()} · запрошено ⇄ «Отправленные» Gmail_\n\n` +
+    `### 🧾 ${title}\n` +
+    `_${nowInLA()} · ${subtitle}_\n\n` +
     `${body}\n\n` +
     `**Итог: ✅ ${okN} подтверждено, ⚠️ ${warnN} не проверено, ❌ ${mmN} расхождение.**\n` +
     `_[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО — это серверная проверка, не заменяй пересказом]_`
   );
 }
 
-/** Worst outcome across a batch, for choosing the summary status. */
-export function worstOutcome(results: PostVerifyResult[]): PostVerifyOutcome {
+/** Builds the §5.3 proof block from per-message post-verify results (server-glued). */
+export function renderPostVerifyReport(results: PostVerifyResult[]): string {
+  return renderVerifyReport("Независимая проверка отправки", "запрошено ⇄ «Отправленные» Gmail", results);
+}
+
+/** Worst outcome across a batch, for choosing the summary status. Only needs
+ * `{outcome}` — accepts `PostVerifyResult[]`/`VerifyLine[]`/T1 verify results alike. */
+export function worstOutcome(results: Array<{ outcome: PostVerifyOutcome }>): PostVerifyOutcome {
   if (results.some((r) => r.outcome === "mismatch")) return "mismatch";
   if (results.some((r) => r.outcome === "warn")) return "warn";
   return "ok";
+}
+
+// ---- Package T1: consent gate on priority-2 write tools --------------------
+//
+// Same requireConsent/plan→execute machinery as A3's 4 send tools, applied to
+// gmail_archive/trash/modify_labels/create_label/update_label/delete_label/
+// save_attachment_to_drive/export_thread_eml/create_upload_session/
+// create_draft/snooze (Maksim's decision 2026-08-04: ALL write tools go
+// behind the gate, no "it's reversible" exemptions). Two shared building
+// blocks below cover the common "batch of existing message ids" shape
+// (archive/trash/modify_labels/snooze); create_label/update_label/
+// delete_label/save_attachment_to_drive/export_thread_eml/create_upload_session/
+// create_draft each get their own plan()/rehash() (different live objects to
+// re-read), but all funnel through the same `buildMutationResult` for the
+// §5.3 report + phase-2 audit write.
+
+/** subject/from/labelIds for a message, read fresh via a SEPARATE metadata
+ * call (never trusts the caller to supply a title — same convention
+ * `describeLines`/`fetchMeta` already use elsewhere in this file). `null` =
+ * unreadable (deleted/no access) — callers turn that into a rehash MISMATCH
+ * rather than silently trusting a stale plan (same pattern as gmail_reply/
+ * gmail_forward's rehash above). labelIds costs nothing extra: Gmail always
+ * returns it on the Message resource regardless of requested headers. */
+interface MsgIdentity {
+  subject: string;
+  from: string;
+  labelIds: string[];
+}
+
+async function fetchMsgIdentity(g: GoogleClients, ids: string[]): Promise<Map<string, MsgIdentity | null>> {
+  const out = new Map<string, MsgIdentity | null>();
+  await mapWithLimit(ids, async (id) => {
+    try {
+      const r = await g.gmail.users.messages.get({
+        userId: "me",
+        id,
+        format: "metadata",
+        metadataHeaders: ["From", "Subject"],
+      });
+      const s = summarise(r.data);
+      out.set(id, { subject: s.subject, from: s.from, labelIds: s.labelIds });
+    } catch {
+      out.set(id, null);
+    }
+  });
+  return out;
+}
+
+/** Live labelIds only (cheapest read) — used by the post-verify helpers below,
+ * which run AFTER the mutation and only care about label state, not identity. */
+async function fetchLabelIds(g: GoogleClients, id: string): Promise<string[] | null> {
+  try {
+    const r = await g.gmail.users.messages.get({ userId: "me", id, format: "minimal" });
+    return r.data.labelIds ?? [];
+  } catch {
+    return null;
+  }
+}
+
+interface IdBatchItem {
+  id: string;
+  subject: string;
+  from: string;
+  labelIds: string[];
+}
+interface IdBatchPayload {
+  account: string;
+  items: IdBatchItem[];
+}
+
+/** Projects an IdBatchPayload down to exactly {account, items:[{id,subject,from}]}
+ * — the binding surface (plan §T1 item 4). `labelIds` rides along in the
+ * payload for tools that need a pre-mutation snapshot (trash) but is
+ * deliberately NOT part of the hash: it is expected to legitimately change
+ * between plan and execute (that's the whole point of e.g. modify_labels). */
+function idBatchHashPayload(p: IdBatchPayload) {
+  return { account: p.account, items: p.items.map(({ id, subject, from }) => ({ id, subject, from })) };
+}
+
+/**
+ * Builds a plan for the common "batch of existing message ids" gated
+ * mutation (archive/trash/snooze; modify_labels/save_attachment_to_drive
+ * build their own richer item shape but reuse `fetchMsgIdentity`/the same
+ * hash convention). Refuses up front (throws — caught by `guard()`) if any id
+ * is unreadable, so a typo'd/inaccessible id never silently drops out of the
+ * batch between plan and preview.
+ */
+async function buildIdBatchPlan(
+  g: GoogleClients,
+  accountName: string,
+  messageIds: string[] | undefined,
+  verb: string,
+  errorNoun: string,
+): Promise<ConsentPlan> {
+  if (!messageIds || !messageIds.length) {
+    throw new Error(`Нужен непустой \`messageIds\`, чтобы построить план (${errorNoun}).`);
+  }
+  const idn = await fetchMsgIdentity(g, messageIds);
+  const unreadable = messageIds.filter((id) => idn.get(id) == null);
+  if (unreadable.length) {
+    throw new Error(
+      `Не удалось прочитать письмо(а) ${unreadable.join(", ")} — проверьте id или доступ. Ничего не изменено.`,
+    );
+  }
+  const items: IdBatchItem[] = messageIds.map((id) => {
+    const m = idn.get(id)!;
+    return { id, subject: m.subject, from: m.from, labelIds: m.labelIds };
+  });
+  const payload: IdBatchPayload = { account: accountName, items };
+  const lines = items.map(
+    (it) => `- «${safeText(it.subject) || "(без темы)"}» (${it.id}) — ${safeText(it.from) || "?"}`,
+  );
+  const preview = `### 📤 План: ${verb} — ${items.length}\n\n${lines.join("\n")}`;
+  return { payload, objectHash: sha256(idBatchHashPayload(payload)), preview, batchSize: items.length };
+}
+
+/** Rehash for `buildIdBatchPlan`'s payload: re-reads subject/from LIVE for
+ * every item (real binding, not `sha256(addressing)` in disguise — see
+ * consent.ts's contract comment on `rehash`). An id that vanished between
+ * plan and execute becomes "__UNREADABLE__", which can never equal what was
+ * read at plan time — forcing a mismatch rather than trusting the stale plan. */
+async function rehashIdBatch(g: GoogleClients, addressing: IdBatchPayload): Promise<string> {
+  const idn = await fetchMsgIdentity(g, addressing.items.map((it) => it.id));
+  const fresh = addressing.items.map((it) => {
+    const m = idn.get(it.id);
+    return m
+      ? { id: it.id, subject: m.subject, from: m.from }
+      : { id: it.id, subject: "__UNREADABLE__", from: "__UNREADABLE__" };
+  });
+  return sha256({ account: addressing.account, items: fresh });
+}
+
+// ---- T1 post-verify helpers (identity-postverify.md §5) --------------------
+// Each does a SEPARATE fresh read after the mutation — never reuses the
+// mutation call's own response as proof (§5.1 p.1). Never throws: a read
+// failure/timeout is ⚠️ "not verified", matching postVerifySend's contract.
+
+/** Post-verify: message no longer carries INBOX (archive/snooze's target state). */
+async function postVerifyNotInInbox(g: GoogleClients, id: string, subjectHint: string): Promise<VerifyLine & { detail: string }> {
+  const subj = safeText(subjectHint) || "(без темы)";
+  const labels = await fetchLabelIds(g, id);
+  if (labels === null) {
+    return { outcome: "warn", line: `- ⚠️ **«${subj}»** (${id}) — не удалось перепроверить состояние письма`, detail: "read failed" };
+  }
+  if (labels.includes("INBOX")) {
+    return { outcome: "mismatch", line: `- ❌ **«${subj}»** (${id}) — всё ещё во «Входящих» (INBOX)`, detail: "still in INBOX" };
+  }
+  return { outcome: "ok", line: `- ✅ **«${subj}»** (${id}) — вне «Входящих»`, detail: "not in INBOX" };
+}
+
+/** Post-verify: message carries TRASH. */
+async function postVerifyInTrash(g: GoogleClients, id: string, subjectHint: string): Promise<VerifyLine & { detail: string }> {
+  const subj = safeText(subjectHint) || "(без темы)";
+  const labels = await fetchLabelIds(g, id);
+  if (labels === null) {
+    return { outcome: "warn", line: `- ⚠️ **«${subj}»** (${id}) — не удалось перепроверить`, detail: "read failed" };
+  }
+  if (!labels.includes("TRASH")) {
+    return { outcome: "mismatch", line: `- ❌ **«${subj}»** (${id}) — метки TRASH нет, письмо не в Корзине`, detail: "no TRASH label" };
+  }
+  return { outcome: "ok", line: `- ✅ **«${subj}»** (${id}) — в Корзине`, detail: "in Trash" };
+}
+
+/** Post-verify: `addLabelIds` are all present AND `removeLabelIds` are all
+ * absent from the live labelIds. */
+async function postVerifyLabelsApplied(
+  g: GoogleClients,
+  id: string,
+  subjectHint: string,
+  addLabelIds: string[] = [],
+  removeLabelIds: string[] = [],
+): Promise<VerifyLine & { detail: string }> {
+  const subj = safeText(subjectHint) || "(без темы)";
+  const labels = await fetchLabelIds(g, id);
+  if (labels === null) {
+    return { outcome: "warn", line: `- ⚠️ **«${subj}»** (${id}) — не удалось перепроверить метки`, detail: "read failed" };
+  }
+  const missingAdd = addLabelIds.filter((l) => !labels.includes(l));
+  const stillThere = removeLabelIds.filter((l) => labels.includes(l));
+  if (missingAdd.length || stillThere.length) {
+    const parts = [
+      missingAdd.length ? `не добавились: ${missingAdd.join(", ")}` : "",
+      stillThere.length ? `не удалились: ${stillThere.join(", ")}` : "",
+    ]
+      .filter(Boolean)
+      .join("; ");
+    return { outcome: "mismatch", line: `- ❌ **«${subj}»** (${id}) — ${parts}`, detail: parts };
+  }
+  return { outcome: "ok", line: `- ✅ **«${subj}»** (${id}) — метки применены`, detail: "labels applied" };
+}
+
+async function fetchLabel(g: GoogleClients, id: string): Promise<{ id: string; name: string } | null> {
+  try {
+    const r = await g.gmail.users.labels.get({ userId: "me", id });
+    return { id: r.data.id ?? id, name: r.data.name ?? "" };
+  } catch {
+    return null;
+  }
+}
+
+/** Post-verify: a label with this id exists and its live name matches. */
+async function postVerifyLabelExists(
+  g: GoogleClients,
+  id: string,
+  expectedName: string,
+): Promise<VerifyLine & { detail: string }> {
+  const label = safeText(expectedName) || "(без имени)";
+  const live = await fetchLabel(g, id);
+  if (!live) {
+    return { outcome: "warn", line: `- ⚠️ **«${label}»** (${id}) — не удалось перепроверить метку`, detail: "read failed" };
+  }
+  if (live.name !== expectedName) {
+    return {
+      outcome: "mismatch",
+      line: `- ❌ **«${label}»** (${id}) — живое имя «${safeText(live.name)}» не совпадает с ожидаемым`,
+      detail: "name mismatch",
+    };
+  }
+  return { outcome: "ok", line: `- ✅ **«${label}»** (${id}) — метка существует`, detail: "exists" };
+}
+
+/** Post-verify: the label id no longer appears in labels.list — a SEPARATE
+ * read, never the delete call's own 200 OK (§5.1 p.3). */
+async function postVerifyLabelGone(g: GoogleClients, id: string, nameHint: string): Promise<VerifyLine & { detail: string }> {
+  const label = safeText(nameHint) || "(без имени)";
+  let live: gmail_v1.Schema$Label[] | undefined;
+  try {
+    const r = await g.gmail.users.labels.list({ userId: "me" });
+    live = r.data.labels ?? [];
+  } catch (e) {
+    return {
+      outcome: "warn",
+      line: `- ⚠️ **«${label}»** (${id}) — не удалось перепроверить (${safeText(e instanceof Error ? e.message : String(e), 60)})`,
+      detail: "read failed",
+    };
+  }
+  if (live.some((l) => l.id === id)) {
+    return { outcome: "mismatch", line: `- ❌ **«${label}»** (${id}) — метка всё ещё существует`, detail: "still exists" };
+  }
+  return { outcome: "ok", line: `- ✅ **«${label}»** (${id}) — метка удалена`, detail: "deleted" };
+}
+
+/** Post-verify: a Drive file exists (by id) and is not trashed. Used by
+ * save_attachment_to_drive/export_thread_eml/create_upload_session. */
+async function postVerifyDriveFileExists(
+  g: GoogleClients,
+  fileId: string | null | undefined,
+  nameHint: string | null | undefined,
+): Promise<VerifyLine & { detail: string }> {
+  const label = safeText(nameHint) || "(без имени)";
+  if (!fileId) {
+    return { outcome: "warn", line: `- ⚠️ **«${label}»** — id файла в Drive неизвестен, перепроверить нечем`, detail: "no file id" };
+  }
+  try {
+    const r = await g.drive.files.get({ fileId, fields: "id,name,trashed" });
+    if (r.data.trashed) {
+      return { outcome: "mismatch", line: `- ❌ **«${label}»** — файл в Drive оказался в корзине`, detail: "trashed" };
+    }
+    return {
+      outcome: "ok",
+      line: `- ✅ **«${safeText(r.data.name) || label}»** — файл существует в Drive (id ${fileId})`,
+      detail: "exists",
+    };
+  } catch (e) {
+    return {
+      outcome: "warn",
+      line: `- ⚠️ **«${label}»** — не удалось перепроверить файл в Drive (${safeText(e instanceof Error ? e.message : String(e), 60)})`,
+      detail: "read failed",
+    };
+  }
+}
+
+/** Post-verify: a draft exists (by id), with a SEPARATE drafts.get read. */
+async function postVerifyDraftExists(
+  g: GoogleClients,
+  draftId: string | null | undefined,
+  subjectHint: string,
+): Promise<VerifyLine & { detail: string }> {
+  const label = safeText(subjectHint) || "(без темы)";
+  if (!draftId) {
+    return { outcome: "warn", line: `- ⚠️ **«${label}»** — id черновика неизвестен, перепроверить нечем`, detail: "no draft id" };
+  }
+  try {
+    const r = await g.gmail.users.drafts.get({ userId: "me", id: draftId, format: "metadata" });
+    const h = r.data.message?.payload?.headers;
+    const to = header(h, "To");
+    const subj = header(h, "Subject");
+    return {
+      outcome: "ok",
+      line: `- ✅ **«${safeText(subj) || label}»** — черновик существует, Кому: ${safeText(to) || "(?)"}`,
+      detail: "exists",
+    };
+  } catch (e) {
+    return {
+      outcome: "warn",
+      line: `- ⚠️ **«${label}»** — не удалось перепроверить черновик (${safeText(e instanceof Error ? e.message : String(e), 60)})`,
+      detail: "read failed",
+    };
+  }
+}
+
+/**
+ * Aggregates a T1 batch mutation's per-item results with REAL independent
+ * post-verify reads (mirrors `buildSendResult`'s approach for the 4 send
+ * tools): every item without an execute-time `error` gets a fresh `verify`
+ * read, the response header reflects the WORST outcome (never smoothed to ✅
+ * on a ❌ — §5.3), and the audit row's phase-2 outcome is filled in via
+ * `updateConsentAuditOutcome` so `gmail_consent_audit` shows what actually
+ * happened, not just that the human said yes (the exact gap that kept
+ * incident 1 invisible).
+ */
+async function buildMutationResult<T extends { error?: string }>(opts: {
+  results: T[];
+  total: number;
+  verb: string;
+  summaryIcon: string;
+  verify: (item: T) => Promise<VerifyLine & { detail: string }>;
+  reportTitle: string;
+  reportSubtitle: string;
+  consentStore?: ConsentStore;
+  auditId?: string;
+  preSnapshot?: unknown;
+}): Promise<ReturnType<typeof ok>> {
+  const { results, total, verb, summaryIcon, verify, reportTitle, reportSubtitle, consentStore, auditId, preSnapshot } = opts;
+  const succeeded = results.filter((r) => !r.error);
+  const pv = await mapWithLimit(succeeded, (r) => verify(r));
+  const okN = succeeded.length;
+  const failN = total - okN;
+  const worst = worstOutcome(pv);
+  let icon = summaryIcon;
+  let tail = "";
+  if (worst === "mismatch") {
+    icon = "❌";
+    tail = " — РАСХОЖДЕНИЕ при проверке, см. отчёт";
+  } else if (worst === "warn" || failN > 0) {
+    icon = "⚠️";
+    if (failN > 0) tail = ` (${failN} с ошибкой)`;
+  }
+  if (consentStore && auditId) {
+    const errs = results
+      .filter((r): r is T & { error: string } => !!r.error)
+      .map((r) => r.error)
+      .join("; ");
+    await consentStore
+      .updateConsentAuditOutcome(auditId, {
+        outcome: okN > 0 ? "confirmed" : "failed",
+        postVerify:
+          `${icon} ${verb} ${okN}/${total}${tail}` + (pv.length ? ` · post-verify: ${pv.map((p) => p.detail).join("; ")}` : ""),
+        error: errs || null,
+        ...(preSnapshot !== undefined ? { preSnapshot } : {}),
+      })
+      .catch((e) => {
+        console.error(
+          "[consent audit] updateConsentAuditOutcome failed:",
+          e instanceof Error ? e.message : String(e),
+        );
+      });
+  }
+  return ok({
+    summary: `${icon} ${verb} ${okN}/${total}${tail}`,
+    results,
+    ...(pv.length ? { verification: renderVerifyReport(reportTitle, reportSubtitle, pv) } : {}),
+  });
 }
 
 /**
@@ -636,6 +1019,112 @@ interface ForwardPlanItem {
 interface ForwardBatchPayload {
   account: string;
   items: ForwardPlanItem[];
+}
+
+// ---- Payload shapes for the T1 gated tools ---------------------------------
+
+interface DraftBatchPayload {
+  account: string;
+  drafts: {
+    to: string;
+    subject: string;
+    body: string;
+    cc?: string;
+    bcc?: string;
+    attachments?: AttachmentInput[];
+  }[];
+}
+
+interface ModifyLabelsItem {
+  messageId: string;
+  subject: string;
+  from: string;
+  addLabelIds: string[];
+  removeLabelIds: string[];
+}
+interface ModifyLabelsPayload {
+  account: string;
+  items: ModifyLabelsItem[];
+}
+/** Same binding-projection convention as `idBatchHashPayload` — identity only
+ * (messageId/subject/from), NOT the addLabelIds/removeLabelIds action itself
+ * (that comes from the manifest's payload, protected the same way as
+ * gmail_send's `messages`). */
+function modifyLabelsHashPayload(p: ModifyLabelsPayload) {
+  return { account: p.account, items: p.items.map(({ messageId, subject, from }) => ({ messageId, subject, from })) };
+}
+
+interface SnoozeItem extends IdBatchItem {
+  unsnoozeAt: string;
+}
+interface SnoozeBatchPayload {
+  account: string;
+  items: SnoozeItem[];
+}
+
+interface CreateLabelPayload {
+  account: string;
+  labels: {
+    name: string;
+    labelListVisibility?: "labelShow" | "labelShowIfUnread" | "labelHide";
+    messageListVisibility?: "show" | "hide";
+    backgroundColor?: string;
+    textColor?: string;
+  }[];
+}
+
+interface UpdateLabelItem {
+  labelId: string;
+  currentName: string;
+  name?: string;
+  labelListVisibility?: "labelShow" | "labelShowIfUnread" | "labelHide";
+  messageListVisibility?: "show" | "hide";
+  backgroundColor?: string;
+  textColor?: string;
+}
+interface UpdateLabelPayload {
+  account: string;
+  items: UpdateLabelItem[];
+}
+
+interface DeleteLabelItem {
+  id: string;
+  name: string;
+  messageCount: number;
+}
+interface DeleteLabelPayload {
+  account: string;
+  labels: DeleteLabelItem[];
+}
+
+interface SaveAttachmentItem {
+  messageId: string;
+  attachmentId: string;
+  filename: string;
+  size: number;
+  fileName?: string;
+  folderId?: string;
+  mimeType?: string;
+}
+interface SaveAttachmentPayload {
+  account: string;
+  items: SaveAttachmentItem[];
+}
+
+interface ExportThreadPayload {
+  account: string;
+  threadId: string;
+  subject: string;
+  messageCount: number;
+  folderId?: string;
+  folderName?: string;
+  format: "eml_files" | "mbox";
+  scope: "all" | "last" | "first";
+}
+
+interface UploadSessionPayload {
+  account: string;
+  files: { name: string; mimeType?: string; sizeBytes?: number }[];
 }
 
 /**
@@ -1850,7 +2339,12 @@ export function registerGmailTools(
     "gmail_create_draft",
     {
       title: "Create drafts",
-      description: "Create one or more draft emails (not sent) for the user to review/send later.",
+      description:
+        "Create one or more draft emails (not sent) for the user to review/send later. Two-mode consent-gated " +
+        "tool (mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with " +
+        "`drafts`) to build a plan and return a preview — nothing is created yet. Show the preview to the user " +
+        "verbatim and wait for their reply. Call again with the returned `manifest_id` and the user's VERBATIM " +
+        "`user_reply` to actually create the draft(s).",
       inputSchema: {
         account,
         drafts: z
@@ -1864,12 +2358,69 @@ export function registerGmailTools(
               attachments: attachmentsField,
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: false },
     },
-    guard(async ({ account, drafts }) => {
+    guard(async ({ account, drafts, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = snoozeCtx;
+      if (!consentStore) {
+        return fail(
+          "Создание черновика недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
+            "может провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results = await mapWithLimit(drafts, async (d) => {
+      const accountName = clients.canonicalName(account);
+      const selfEmail = await accountEmail(g, accountName);
+      const fromLabel = selfEmail ? `${accountName} (${selfEmail})` : accountName;
+
+      const decision = await requireConsent<DraftBatchPayload>({
+        tool: "gmail_create_draft",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: () => {
+          if (!drafts || !drafts.length) {
+            throw new Error("Нужен непустой `drafts`, чтобы построить план создания черновика.");
+          }
+          const payload: DraftBatchPayload = { account: accountName, drafts };
+          const preview = renderSendPreview({
+            verb: "Создание черновика",
+            fromLabel,
+            items: drafts.map((d) => ({
+              to: d.to,
+              cc: d.cc,
+              bcc: d.bcc,
+              subject: d.subject,
+              body: d.body,
+              attachments: d.attachments?.length,
+            })),
+          });
+          return { payload, objectHash: sha256(payload), preview, batchSize: drafts.length };
+        },
+        // Degenerate binding (same reasoning as gmail_send/gmail_create_label):
+        // a not-yet-existing draft has no live object to re-read — the
+        // protection is `payload` coming from the manifest, not this hash.
+        rehash: (addressing) => sha256(addressing),
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const results = await mapWithLimit(payload.drafts, async (d) => {
           try {
             const atts = d.attachments?.length ? await resolveAttachments(g, d.attachments) : undefined;
             const raw = buildRawEmail({ to: d.to, subject: d.subject, body: d.body, cc: d.cc, bcc: d.bcc, attachments: atts });
@@ -1877,15 +2428,21 @@ export function registerGmailTools(
               userId: "me",
               requestBody: { message: { raw } },
             });
-            return { draftId: res.data.id };
+            return { draftId: res.data.id, to: d.to, subject: d.subject };
           } catch (e) {
-            return { error: String(e instanceof Error ? e.message : e) };
+            return { to: d.to, subject: d.subject, error: String(e instanceof Error ? e.message : e) };
           }
         });
-      const ok_ = results.filter((r) => !("error" in r));
-      return ok({
-        summary: `📝 Created ${ok_.length}/${drafts.length} draft(s)`,
+      return buildMutationResult({
         results,
+        total: payload.drafts.length,
+        verb: "Created",
+        summaryIcon: "📝",
+        verify: (r) => postVerifyDraftExists(g, r.draftId, r.subject),
+        reportTitle: "Независимая проверка создания черновика",
+        reportSubtitle: "запрошено ⇄ живые черновики Gmail",
+        consentStore,
+        auditId,
       });
     }),
   );
@@ -1897,33 +2454,76 @@ export function registerGmailTools(
     {
       title: "Archive emails",
       description:
-        "Archive one or more messages by removing them from the Inbox (they stay searchable). " +
-        "Pass an array of message ids.",
+        "Archive one or more messages by removing them from the Inbox (they stay searchable). Two-mode " +
+        "consent-gated tool (mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` " +
+        "(with `messageIds`) to build a plan and return a preview — nothing is archived yet. Show the preview to " +
+        "the user verbatim and wait for their reply. Call again with the returned `manifest_id` and the user's " +
+        "VERBATIM `user_reply` to actually archive.",
       inputSchema: {
         account,
-        messageIds: z.array(z.string()).min(1).describe("Message id(s) to archive."),
+        messageIds: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Message id(s) to archive. Required to build a plan (first call, no manifest_id/user_reply). " +
+              "Ignored on the execute call — the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: false },
     },
-    guard(async ({ account, messageIds }) => {
+    guard(async ({ account, messageIds, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = snoozeCtx;
+      if (!consentStore) {
+        return fail(
+          "Архивирование недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const meta = await fetchMeta(g, messageIds);
-      const results = await mapWithLimit(messageIds, async (id) => {
+      const accountName = clients.canonicalName(account);
+
+      const decision = await requireConsent<IdBatchPayload>({
+        tool: "gmail_archive",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: () => buildIdBatchPlan(g, accountName, messageIds, "Архивирование писем", "archive"),
+        rehash: (addressing) => rehashIdBatch(g, addressing as IdBatchPayload),
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const results = await mapWithLimit(payload.items, async (item) => {
           try {
             await g.gmail.users.messages.modify({
               userId: "me",
-              id,
+              id: item.id,
               requestBody: { removeLabelIds: ["INBOX"] },
             });
-            return { id, ...(meta.get(id) ?? {}) };
+            return { id: item.id, subject: item.subject, from: item.from };
           } catch (e) {
-            return { id, error: String(e instanceof Error ? e.message : e) };
+            return { id: item.id, subject: item.subject, from: item.from, error: String(e instanceof Error ? e.message : e) };
           }
         });
-      const ok_ = results.filter((r) => !("error" in r));
-      return ok({
-        summary: `📥 Archived ${ok_.length}/${messageIds.length} message(s)`,
-        archived: describeLines(results, "📥"),
+      return buildMutationResult({
         results,
+        total: payload.items.length,
+        verb: "Archived",
+        summaryIcon: "📥",
+        verify: (r) => postVerifyNotInInbox(g, r.id, r.subject),
+        reportTitle: "Независимая проверка архивирования",
+        reportSubtitle: "запрошено ⇄ живые метки Gmail",
+        consentStore,
+        auditId,
       });
     }),
   );
@@ -1935,30 +2535,76 @@ export function registerGmailTools(
     {
       title: "Delete emails (to Trash)",
       description:
-        "Move one or more messages to Trash (reversible; auto-purges after ~30 days). " +
-        "Pass an array of message ids.",
+        "Move one or more messages to Trash (reversible; auto-purges after ~30 days). Two-mode consent-gated " +
+        "tool (mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with " +
+        "`messageIds`) to build a plan and return a preview — nothing is trashed yet. Show the preview to the " +
+        "user verbatim and wait for their reply. Call again with the returned `manifest_id` and the user's " +
+        "VERBATIM `user_reply` to actually trash.",
       inputSchema: {
         account,
-        messageIds: z.array(z.string()).min(1).describe("Message id(s) to trash."),
+        messageIds: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Message id(s) to trash. Required to build a plan (first call, no manifest_id/user_reply). " +
+              "Ignored on the execute call — the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, messageIds }) => {
+    guard(async ({ account, messageIds, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = snoozeCtx;
+      if (!consentStore) {
+        return fail(
+          "Удаление в Корзину недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
+            "может провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const meta = await fetchMeta(g, messageIds);
-      const results = await mapWithLimit(messageIds, async (id) => {
+      const accountName = clients.canonicalName(account);
+
+      const decision = await requireConsent<IdBatchPayload>({
+        tool: "gmail_trash",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: () => buildIdBatchPlan(g, accountName, messageIds, "Удаление писем в Корзину", "trash"),
+        rehash: (addressing) => rehashIdBatch(g, addressing as IdBatchPayload),
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const results = await mapWithLimit(payload.items, async (item) => {
           try {
-            await g.gmail.users.messages.trash({ userId: "me", id });
-            return { id, ...(meta.get(id) ?? {}) };
+            await g.gmail.users.messages.trash({ userId: "me", id: item.id });
+            return { id: item.id, subject: item.subject, from: item.from };
           } catch (e) {
-            return { id, error: String(e instanceof Error ? e.message : e) };
+            return { id: item.id, subject: item.subject, from: item.from, error: String(e instanceof Error ? e.message : e) };
           }
         });
-      const ok_ = results.filter((r) => !("error" in r));
-      return ok({
-        summary: `🗑 Trashed ${ok_.length}/${messageIds.length} message(s)`,
-        deleted: describeLines(results, "🗑"),
+      // Pre-snapshot (identity-postverify.md §5.2): the plan-time read of
+      // id/subject/from/labelIds IS the "before" state — no extra call needed,
+      // it is simply what the manifest already stored before the mutation ran.
+      return buildMutationResult({
         results,
+        total: payload.items.length,
+        verb: "Trashed",
+        summaryIcon: "🗑",
+        verify: (r) => postVerifyInTrash(g, r.id, r.subject),
+        reportTitle: "Независимая проверка удаления в Корзину",
+        reportSubtitle: "запрошено ⇄ живые метки Gmail",
+        consentStore,
+        auditId,
+        preSnapshot: payload.items.map((it) => ({ id: it.id, subject: it.subject, from: it.from, labelIds: it.labelIds })),
       });
     }),
   );
@@ -1971,8 +2617,11 @@ export function registerGmailTools(
       title: "Modify labels (read/unread/star/...)",
       description:
         "Add and/or remove labels on one or more messages. System labels include UNREAD, STARRED, IMPORTANT, INBOX, SPAM. " +
-        "Mark as read = remove UNREAD; star = add STARRED. Use gmail_list_labels for custom label ids. " +
-        "Pass an array of {messageId, addLabelIds?, removeLabelIds?} items.",
+        "Mark as read = remove UNREAD; star = add STARRED. Use gmail_list_labels for custom label ids. Two-mode " +
+        "consent-gated tool (mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` " +
+        "(with `items`, each {messageId, addLabelIds?, removeLabelIds?}) to build a plan and return a preview — " +
+        "nothing is modified yet. Show the preview to the user verbatim and wait for their reply. Call again with " +
+        "the returned `manifest_id` and the user's VERBATIM `user_reply` to actually modify.",
       inputSchema: {
         account,
         items: z
@@ -1983,29 +2632,119 @@ export function registerGmailTools(
               removeLabelIds: z.array(z.string()).optional(),
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: false },
     },
-    guard(async ({ account, items }) => {
+    guard(async ({ account, items, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = snoozeCtx;
+      if (!consentStore) {
+        return fail(
+          "Изменение меток недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const meta = await fetchMeta(g, items.map((i) => i.messageId));
-      const results = await mapWithLimit(items, async (item) => {
+      const accountName = clients.canonicalName(account);
+
+      const decision = await requireConsent<ModifyLabelsPayload>({
+        tool: "gmail_modify_labels",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!items || !items.length) {
+            throw new Error("Нужен непустой `items`, чтобы построить план изменения меток.");
+          }
+          const idn = await fetchMsgIdentity(g, items.map((i) => i.messageId));
+          const unreadable = items.filter((i) => idn.get(i.messageId) == null).map((i) => i.messageId);
+          if (unreadable.length) {
+            throw new Error(`Не удалось прочитать письмо(а) ${unreadable.join(", ")} — проверьте id. Ничего не изменено.`);
+          }
+          const built: ModifyLabelsItem[] = items.map((i) => {
+            const m = idn.get(i.messageId)!;
+            return {
+              messageId: i.messageId,
+              subject: m.subject,
+              from: m.from,
+              addLabelIds: i.addLabelIds ?? [],
+              removeLabelIds: i.removeLabelIds ?? [],
+            };
+          });
+          const payload: ModifyLabelsPayload = { account: accountName, items: built };
+          const lines = built.map((it) => {
+            const delta = [
+              it.addLabelIds.length ? `+${it.addLabelIds.join(",")}` : "",
+              it.removeLabelIds.length ? `-${it.removeLabelIds.join(",")}` : "",
+            ]
+              .filter(Boolean)
+              .join(" ");
+            return `- «${safeText(it.subject) || "(без темы)"}» (${it.messageId}) — ${safeText(it.from) || "?"}: ${delta || "(без изменений)"}`;
+          });
+          const preview = `### 📤 План: Изменение меток — ${built.length}\n\n${lines.join("\n")}`;
+          return { payload, objectHash: sha256(modifyLabelsHashPayload(payload)), preview, batchSize: built.length };
+        },
+        // Real binding: re-reads subject/from for every messageId right now
+        // (addLabelIds/removeLabelIds are the ACTION, not the identity being
+        // bound — they come from the manifest's payload, protected the same
+        // way gmail_send's messages are).
+        rehash: async (addressing) => {
+          const a = addressing as ModifyLabelsPayload;
+          const idn = await fetchMsgIdentity(g, a.items.map((it) => it.messageId));
+          const fresh = a.items.map((it) => {
+            const m = idn.get(it.messageId);
+            return m
+              ? { messageId: it.messageId, subject: m.subject, from: m.from }
+              : { messageId: it.messageId, subject: "__UNREADABLE__", from: "__UNREADABLE__" };
+          });
+          return sha256({ account: a.account, items: fresh });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const results = await mapWithLimit(payload.items, async (item) => {
           try {
             await g.gmail.users.messages.modify({
               userId: "me",
               id: item.messageId,
               requestBody: { addLabelIds: item.addLabelIds, removeLabelIds: item.removeLabelIds },
             });
-            return { id: item.messageId, ...(meta.get(item.messageId) ?? {}) };
+            return { id: item.messageId, subject: item.subject, from: item.from, addLabelIds: item.addLabelIds, removeLabelIds: item.removeLabelIds };
           } catch (e) {
-            return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
+            return {
+              id: item.messageId,
+              subject: item.subject,
+              from: item.from,
+              addLabelIds: item.addLabelIds,
+              removeLabelIds: item.removeLabelIds,
+              error: String(e instanceof Error ? e.message : e),
+            };
           }
         });
-      const ok_ = results.filter((r) => !("error" in r));
-      return ok({
-        summary: `🏷️ Modified labels on ${ok_.length}/${items.length} message(s)`,
-        modified: describeLines(results, "🏷️"),
+      return buildMutationResult({
         results,
+        total: payload.items.length,
+        verb: "Modified",
+        summaryIcon: "🏷️",
+        verify: (r) => postVerifyLabelsApplied(g, r.id, r.subject, r.addLabelIds, r.removeLabelIds),
+        reportTitle: "Независимая проверка изменения меток",
+        reportSubtitle: "запрошено ⇄ живые метки Gmail",
+        consentStore,
+        auditId,
       });
     }),
   );
@@ -2020,8 +2759,12 @@ export function registerGmailTools(
         "Archive one or more messages now and automatically return them to the Inbox at a specified time " +
         "(requires DATABASE_URL — Railway Postgres; a background check runs every minute). Without Postgres " +
         "the messages are still archived but auto-restore is unavailable — the result's `persisted` field " +
-        "says which happened, so this is never silently false advertising. " +
-        "Pass `unsnoozeAt` as an ISO 8601 datetime, e.g. '2024-01-15T09:00:00'.",
+        "says which happened, so this is never silently false advertising. Pass `unsnoozeAt` as an ISO 8601 " +
+        "datetime, e.g. '2024-01-15T09:00:00'. Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with `items`) " +
+        "to build a plan and return a preview — nothing is snoozed yet. Show the preview to the user verbatim " +
+        "and wait for their reply. Call again with the returned `manifest_id` and the user's VERBATIM " +
+        "`user_reply` to actually snooze.",
       inputSchema: {
         account,
         items: z
@@ -2033,51 +2776,110 @@ export function registerGmailTools(
                 .describe("ISO 8601 datetime when to wake up. Must be in the future."),
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: false },
     },
-    guard(async ({ account, items }) => {
+    guard(async ({ account, items, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = snoozeCtx;
+      if (!consentStore) {
+        return fail(
+          "Отложенный возврат в inbox недоступен: не настроено хранилище согласия (DATABASE_URL). Без него " +
+            "сервер не может провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results = await mapWithLimit(items, async (item) => {
+      const accountName = clients.canonicalName(account);
+
+      const decision = await requireConsent<SnoozeBatchPayload>({
+        tool: "gmail_snooze",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!items || !items.length) {
+            throw new Error("Нужен непустой `items`, чтобы построить план отложенного возврата в inbox.");
+          }
+          const idn = await fetchMsgIdentity(g, items.map((i) => i.messageId));
+          const unreadable = items.filter((i) => idn.get(i.messageId) == null).map((i) => i.messageId);
+          if (unreadable.length) {
+            throw new Error(`Не удалось прочитать письмо(а) ${unreadable.join(", ")} — проверьте id. Ничего не изменено.`);
+          }
+          const built: SnoozeItem[] = items.map((i) => {
+            const m = idn.get(i.messageId)!;
+            return { id: i.messageId, subject: m.subject, from: m.from, labelIds: m.labelIds, unsnoozeAt: i.unsnoozeAt };
+          });
+          const payload: SnoozeBatchPayload = { account: accountName, items: built };
+          const lines = built.map((it) => {
+            const d = new Date(it.unsnoozeAt);
+            const when = isNaN(d.getTime()) ? `«${it.unsnoozeAt}» (не парсится!)` : `${formatLaTime(d.getTime())} PT`;
+            return `- «${safeText(it.subject) || "(без темы)"}» (${it.id}) — ${safeText(it.from) || "?"}: разбудить ${when}`;
+          });
+          const preview = `### 📤 План: Отложенный возврат в inbox — ${built.length}\n\n${lines.join("\n")}`;
+          return { payload, objectHash: sha256(idBatchHashPayload(payload)), preview, batchSize: built.length };
+        },
+        rehash: (addressing) => rehashIdBatch(g, addressing as IdBatchPayload),
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const { store, userToken } = snoozeCtx;
+      const results = await mapWithLimit(payload.items, async (item) => {
           try {
             const unsnoozeAt = new Date(item.unsnoozeAt);
             if (isNaN(unsnoozeAt.getTime())) {
-              return { id: item.messageId, error: `Cannot parse date "${item.unsnoozeAt}". Use ISO 8601.` };
+              return { id: item.id, subject: item.subject, error: `Cannot parse date "${item.unsnoozeAt}". Use ISO 8601.` };
             }
             if (unsnoozeAt <= new Date()) {
-              return { id: item.messageId, error: `Snooze time "${item.unsnoozeAt}" is already in the past.` };
+              return { id: item.id, subject: item.subject, error: `Snooze time "${item.unsnoozeAt}" is already in the past.` };
             }
             await g.gmail.users.messages.modify({
               userId: "me",
-              id: item.messageId,
+              id: item.id,
               requestBody: { removeLabelIds: ["INBOX"] },
             });
-            const { store, userToken } = snoozeCtx;
-            // userToken is null for onboarded (native-OAuth) deployments — that's
-            // expected, not a reason to skip persisting; accountName alone is
-            // enough for the scheduler to find the right Google account later.
+            // userToken is null for onboarded (native-OAuth) deployments —
+            // that's expected, not a reason to skip persisting; accountName
+            // alone is enough for the scheduler to find the right account later.
             if (store) {
-              const accountName = clients.canonicalName(account);
-              await store.addSnooze({
-                userToken,
-                accountName,
-                messageId: item.messageId,
-                unsnoozeAt,
-              });
+              await store.addSnooze({ userToken, accountName, messageId: item.id, unsnoozeAt });
             }
             return {
-              id: item.messageId,
+              id: item.id,
+              subject: item.subject,
               unsnoozeAt: unsnoozeAt.toISOString(),
               persisted: !!store,
             };
           } catch (e) {
-            return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
+            return { id: item.id, subject: item.subject, error: String(e instanceof Error ? e.message : e) };
           }
         });
-      const ok_ = results.filter((r) => !("error" in r));
-      return ok({
-        summary: `⏰ Snoozed ${ok_.length}/${items.length} message(s)`,
+      return buildMutationResult({
         results,
+        total: payload.items.length,
+        verb: "Snoozed",
+        summaryIcon: "⏰",
+        // Post-verify only confirms the immediate mutation (INBOX removed);
+        // the scheduled restore itself runs later in the background (out of
+        // this call's scope) — same honesty as schedule_send's queuing note.
+        verify: (r) => postVerifyNotInInbox(g, r.id, r.subject),
+        reportTitle: "Независимая проверка отложенного возврата",
+        reportSubtitle: "запрошено ⇄ живые метки Gmail (сам возврат в inbox проверяется позже, фоном)",
+        consentStore,
+        auditId,
       });
     }),
   );
@@ -2433,13 +3235,29 @@ export function registerGmailTools(
               ocrLanguage: item.ocrLanguage,
               fields: "id",
             });
-            const docId = created.data.id!;
+            // No gate here (this tool is read/OCR, not a mutation of anything
+            // the user owns going forward) — but the temp Google Doc it creates
+            // for OCR IS a real Drive write that must never linger. Guard the id
+            // itself (never call delete with an undefined fileId) and make the
+            // cleanup's own failure VISIBLE (logged), not a silently-swallowed
+            // `.catch(() => {})` — a delete that keeps failing (permissions,
+            // quota, transient 5xx) must show up in the logs instead of quietly
+            // accumulating "gmcp-ocr-tmp" garbage in the account's Drive forever.
+            const docId = created.data.id;
+            if (!docId) {
+              throw new Error("Google Drive did not return a file id for the temporary OCR document.");
+            }
             try {
               const doc = await g.docs.documents.get({ documentId: docId });
               const text = documentToPlainText(doc.data);
               return { messageId: item.messageId, attachmentId: item.attachmentId, text };
             } finally {
-              await g.drive.files.delete({ fileId: docId }).catch(() => {});
+              await g.drive.files.delete({ fileId: docId }).catch((e) => {
+                console.error(
+                  `[gmail_get_attachment_text] failed to delete temp OCR doc ${docId} — it will linger in Drive:`,
+                  e instanceof Error ? e.message : String(e),
+                );
+              });
             }
           } catch (e) {
             return { messageId: item.messageId, attachmentId: item.attachmentId, error: String(e instanceof Error ? e.message : e) };
@@ -2461,7 +3279,11 @@ export function registerGmailTools(
       title: "Save email attachments to Drive",
       description:
         "Download one or more attachments and upload them straight to Google Drive (cloud-to-cloud, no size limit). " +
-        "Get `attachmentId`/`filename` from gmail_get_message.",
+        "Get `attachmentId`/`filename` from gmail_get_message. Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with `items`) to " +
+        "build a plan and return a preview — nothing is copied yet. Show the preview to the user verbatim and " +
+        "wait for their reply. Call again with the returned `manifest_id` and the user's VERBATIM `user_reply` to " +
+        "actually save to Drive.",
       inputSchema: {
         account,
         items: z
@@ -2474,12 +3296,104 @@ export function registerGmailTools(
               mimeType: z.string().optional(),
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: false },
     },
-    guard(async ({ account, items }) => {
+    guard(async ({ account, items, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = snoozeCtx;
+      if (!consentStore) {
+        return fail(
+          "Сохранение в Drive недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
+            "может провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results = await mapWithLimit(items, async (item) => {
+      const accountName = clients.canonicalName(account);
+
+      const decision = await requireConsent<SaveAttachmentPayload>({
+        tool: "gmail_save_attachment_to_drive",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        // Plan reads the MIME tree (format=full) to locate the attachment's
+        // real filename/size for identity — it does NOT download the
+        // attachment's bytes (those live behind a separate attachments.get
+        // call, only made at execute), so a plan that never gets confirmed
+        // never pulls a heavy blob for nothing.
+        plan: async () => {
+          if (!items || !items.length) {
+            throw new Error("Нужен непустой `items`, чтобы построить план сохранения вложений в Drive.");
+          }
+          const built: SaveAttachmentItem[] = await mapWithLimit(items, async (item) => {
+            const msg = await g.gmail.users.messages.get({ userId: "me", id: item.messageId, format: "full" });
+            const found = collectAttachments(msg.data.payload).find((a) => a.attachmentId === item.attachmentId);
+            if (!found) {
+              throw new Error(
+                `Вложение ${item.attachmentId} не найдено в письме ${item.messageId} — ничего не сохранено.`,
+              );
+            }
+            return {
+              messageId: item.messageId,
+              attachmentId: item.attachmentId,
+              filename: found.filename,
+              size: found.size,
+              fileName: item.fileName,
+              folderId: item.folderId,
+              mimeType: item.mimeType,
+            };
+          });
+          const payload: SaveAttachmentPayload = { account: accountName, items: built };
+          const lines = built.map(
+            (it) =>
+              `- «${safeText(it.filename)}» (${it.size} байт) из письма ${it.messageId} → Drive` +
+              (it.folderId ? ` (папка ${it.folderId})` : "") +
+              (it.fileName ? `, сохранить как «${safeText(it.fileName)}»` : ""),
+          );
+          const preview = `### 📤 План: Сохранение вложений в Drive — ${built.length}\n\n${lines.join("\n")}`;
+          return {
+            payload,
+            objectHash: sha256({ account: accountName, items: built.map(({ messageId, attachmentId, filename, size }) => ({ messageId, attachmentId, filename, size })) }),
+            preview,
+            batchSize: built.length,
+          };
+        },
+        // Real binding: re-reads each message's MIME tree right now and
+        // re-locates the attachment — a vanished message/attachment or a
+        // changed filename/size forces a mismatch instead of trusting the plan.
+        rehash: async (addressing) => {
+          const a = addressing as SaveAttachmentPayload;
+          const fresh = await mapWithLimit(a.items, async (it) => {
+            try {
+              const msg = await g.gmail.users.messages.get({ userId: "me", id: it.messageId, format: "full" });
+              const found = collectAttachments(msg.data.payload).find((x) => x.attachmentId === it.attachmentId);
+              return found
+                ? { messageId: it.messageId, attachmentId: it.attachmentId, filename: found.filename, size: found.size }
+                : { messageId: it.messageId, attachmentId: it.attachmentId, filename: "__UNREADABLE__", size: -1 };
+            } catch {
+              return { messageId: it.messageId, attachmentId: it.attachmentId, filename: "__UNREADABLE__", size: -1 };
+            }
+          });
+          return sha256({ account: a.account, items: fresh });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const results = await mapWithLimit(payload.items, async (item) => {
           try {
             const att = await g.gmail.users.messages.attachments.get({
               userId: "me",
@@ -2487,21 +3401,27 @@ export function registerGmailTools(
               id: item.attachmentId,
             });
             const buffer = Buffer.from(att.data.data ?? "", "base64url");
-            const filename = item.fileName ?? "attachment";
+            const filename = item.fileName ?? item.filename ?? "attachment";
             const res = await g.drive.files.create({
               requestBody: { name: filename, parents: item.folderId ? [item.folderId] : undefined },
               media: { mimeType: item.mimeType ?? "application/octet-stream", body: Readable.from(buffer) },
               fields: "id,name,mimeType,size,webViewLink",
             });
-            return { fileId: res.data.id, fileName: res.data.name };
+            return { fileId: res.data.id, fileName: res.data.name, messageId: item.messageId, attachmentId: item.attachmentId };
           } catch (e) {
             return { messageId: item.messageId, attachmentId: item.attachmentId, error: String(e instanceof Error ? e.message : e) };
           }
         });
-      const ok_ = results.filter((r) => !("error" in r));
-      return ok({
-        summary: `💾 Saved ${ok_.length}/${items.length} attachment(s) to Drive`,
+      return buildMutationResult({
         results,
+        total: payload.items.length,
+        verb: "Saved",
+        summaryIcon: "💾",
+        verify: (r) => postVerifyDriveFileExists(g, r.fileId, r.fileName),
+        reportTitle: "Независимая проверка сохранения в Drive",
+        reportSubtitle: "запрошено ⇄ живой Drive",
+        consentStore,
+        auditId,
       });
     }),
   );
@@ -2537,7 +3457,11 @@ export function registerGmailTools(
       title: "Create labels",
       description:
         "Create one or more new Gmail labels. Returns each created label's id. " +
-        "Tip: call gmail_list_labels first to check if a label with the same name already exists.",
+        "Tip: call gmail_list_labels first to check if a label with the same name already exists. Two-mode " +
+        "consent-gated tool (mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` " +
+        "(with `labels`) to build a plan and return a preview — nothing is created yet. Show the preview to the " +
+        "user verbatim and wait for their reply. Call again with the returned `manifest_id` and the user's " +
+        "VERBATIM `user_reply` to actually create.",
       inputSchema: {
         account,
         labels: z
@@ -2553,12 +3477,57 @@ export function registerGmailTools(
               textColor: z.string().optional(),
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: false },
     },
-    guard(async ({ account, labels }) => {
+    guard(async ({ account, labels, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = snoozeCtx;
+      if (!consentStore) {
+        return fail(
+          "Создание метки недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results = await mapWithLimit(labels, async (l) => {
+      const accountName = clients.canonicalName(account);
+
+      const decision = await requireConsent<CreateLabelPayload>({
+        tool: "gmail_create_label",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: () => {
+          if (!labels || !labels.length) {
+            throw new Error("Нужен непустой `labels`, чтобы построить план создания меток.");
+          }
+          const payload: CreateLabelPayload = { account: accountName, labels };
+          const lines = labels.map((l) => `- «${safeText(l.name, 200)}»`);
+          const preview = `### 📤 План: Создание меток — ${labels.length}\n\n${lines.join("\n")}`;
+          return { payload, objectHash: sha256(payload), preview, batchSize: labels.length };
+        },
+        // Degenerate binding (same reasoning as gmail_send): a not-yet-existing
+        // label has no live object to re-read — protection is `payload` coming
+        // from the manifest, not this hash.
+        rehash: (addressing) => sha256(addressing),
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const results = await mapWithLimit(payload.labels, async (l) => {
           try {
             const res = await g.gmail.users.labels.create({
               userId: "me",
@@ -2571,15 +3540,21 @@ export function registerGmailTools(
                   : undefined,
               },
             });
-            return { id: res.data.id, name: res.data.name };
+            return { id: res.data.id, name: res.data.name ?? l.name };
           } catch (e) {
-            return { error: String(e instanceof Error ? e.message : e) };
+            return { name: l.name, error: String(e instanceof Error ? e.message : e) };
           }
         });
-      const ok_ = results.filter((r) => !("error" in r));
-      return ok({
-        summary: `🏷️ Created ${ok_.length}/${labels.length} label(s)`,
+      return buildMutationResult({
         results,
+        total: payload.labels.length,
+        verb: "Created",
+        summaryIcon: "🏷️",
+        verify: (r) => postVerifyLabelExists(g, r.id ?? "", r.name),
+        reportTitle: "Независимая проверка создания меток",
+        reportSubtitle: "запрошено ⇄ живые метки Gmail",
+        consentStore,
+        auditId,
       });
     }),
   );
@@ -2590,7 +3565,12 @@ export function registerGmailTools(
     "gmail_update_label",
     {
       title: "Update labels",
-      description: "Rename one or more labels or change their visibility/color.",
+      description:
+        "Rename one or more labels or change their visibility/color. Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with `items`) " +
+        "to build a plan and return a preview — nothing is changed yet. Show the preview to the user verbatim " +
+        "and wait for their reply. Call again with the returned `manifest_id` and the user's VERBATIM " +
+        "`user_reply` to actually update.",
       inputSchema: {
         account,
         items: z
@@ -2604,12 +3584,94 @@ export function registerGmailTools(
               textColor: z.string().optional(),
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: false },
     },
-    guard(async ({ account, items }) => {
+    guard(async ({ account, items, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = snoozeCtx;
+      if (!consentStore) {
+        return fail(
+          "Изменение метки недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results = await mapWithLimit(items, async (item) => {
+      const accountName = clients.canonicalName(account);
+
+      const decision = await requireConsent<UpdateLabelPayload>({
+        tool: "gmail_update_label",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        // Plan reads the CURRENT name of every label — the identity-guard
+        // pair (id + name) identity-postverify.md §4 requires: a caller
+        // passing only an id gets the current name filled in by the server,
+        // never asked to supply it (same convention as archive/trash above).
+        plan: async () => {
+          if (!items || !items.length) {
+            throw new Error("Нужен непустой `items`, чтобы построить план изменения меток.");
+          }
+          const found = await mapWithLimit(items, (item) => fetchLabel(g, item.labelId));
+          const missing = items.filter((_, i) => found[i] == null).map((i) => i.labelId);
+          if (missing.length) {
+            throw new Error(`Метка(и) ${missing.join(", ")} не найдена(ы) — проверьте id. Ничего не изменено.`);
+          }
+          const built: UpdateLabelItem[] = items.map((item, i) => ({
+            labelId: item.labelId,
+            currentName: found[i]!.name,
+            name: item.name,
+            labelListVisibility: item.labelListVisibility,
+            messageListVisibility: item.messageListVisibility,
+            backgroundColor: item.backgroundColor,
+            textColor: item.textColor,
+          }));
+          const payload: UpdateLabelPayload = { account: accountName, items: built };
+          const lines = built.map((it) => {
+            const changes = [
+              it.name && it.name !== it.currentName ? `имя → «${safeText(it.name, 200)}»` : undefined,
+              it.labelListVisibility ? `видимость в списке → ${it.labelListVisibility}` : undefined,
+              it.messageListVisibility ? `видимость у писем → ${it.messageListVisibility}` : undefined,
+              it.backgroundColor || it.textColor ? "цвет" : undefined,
+            ].filter((x): x is string => !!x);
+            return `- Метка «${safeText(it.currentName)}» (${it.labelId}) → ${changes.join(", ") || "(без изменений)"}`;
+          });
+          const preview = `### 📤 План: Изменение меток — ${built.length}\n\n${lines.join("\n")}`;
+          return {
+            payload,
+            objectHash: sha256({ account: accountName, items: built.map(({ labelId, currentName }) => ({ labelId, currentName })) }),
+            preview,
+            batchSize: built.length,
+          };
+        },
+        // Real binding: re-reads each label's live name right now — catches a
+        // concurrent rename between plan and execute.
+        rehash: async (addressing) => {
+          const a = addressing as UpdateLabelPayload;
+          const fresh = await mapWithLimit(a.items, async (it) => {
+            const live = await fetchLabel(g, it.labelId);
+            return { labelId: it.labelId, currentName: live?.name ?? "__UNREADABLE__" };
+          });
+          return sha256({ account: a.account, items: fresh });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const results = await mapWithLimit(payload.items, async (item) => {
           try {
             const patch: Record<string, unknown> = {};
             if (item.name) patch.name = item.name;
@@ -2621,15 +3683,21 @@ export function registerGmailTools(
               id: item.labelId,
               requestBody: patch,
             });
-            return { id: res.data.id, name: res.data.name };
+            return { id: res.data.id ?? item.labelId, name: res.data.name ?? item.name ?? item.currentName };
           } catch (e) {
-            return { id: item.labelId, error: String(e instanceof Error ? e.message : e) };
+            return { id: item.labelId, name: item.name ?? item.currentName, error: String(e instanceof Error ? e.message : e) };
           }
         });
-      const ok_ = results.filter((r) => !("error" in r));
-      return ok({
-        summary: `✏️ Updated ${ok_.length}/${items.length} label(s)`,
+      return buildMutationResult({
         results,
+        total: payload.items.length,
+        verb: "Updated",
+        summaryIcon: "✏️",
+        verify: (r) => postVerifyLabelExists(g, r.id, r.name),
+        reportTitle: "Независимая проверка изменения меток",
+        reportSubtitle: "запрошено ⇄ живые метки Gmail",
+        consentStore,
+        auditId,
       });
     }),
   );
@@ -2643,26 +3711,115 @@ export function registerGmailTools(
       description:
         "Permanently delete one or more user-created Gmail labels. " +
         "The labels are removed from all messages (messages themselves are NOT deleted). " +
-        "System labels (INBOX, SENT, etc.) cannot be deleted.",
+        "System labels (INBOX, SENT, etc.) cannot be deleted. Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with `labelIds`) " +
+        "to build a plan and return a preview — nothing is deleted yet. Show the preview to the user verbatim " +
+        "and wait for their reply. Call again with the returned `manifest_id` and the user's VERBATIM " +
+        "`user_reply` to actually delete.",
       inputSchema: {
         account,
-        labelIds: z.array(z.string()).min(1).describe("Label ID(s) to delete."),
+        labelIds: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Label ID(s) to delete. Required to build a plan (first call, no manifest_id/user_reply). Ignored " +
+              "on the execute call — the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: true },
     },
-    guard(async ({ account, labelIds }) => {
+    guard(async ({ account, labelIds, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = snoozeCtx;
+      if (!consentStore) {
+        return fail(
+          "Удаление метки недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results = await mapWithLimit(labelIds, async (id) => {
+      const accountName = clients.canonicalName(account);
+
+      const decision = await requireConsent<DeleteLabelPayload>({
+        tool: "gmail_delete_label",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        // Plan reads each label's current name AND a best-effort message
+        // count (identity-postverify.md §5.2 pre-snapshot requirement for
+        // this irreversible op) — a failed count never blocks the plan, it
+        // just shows 0 (informational only, never part of the hash below).
+        plan: async () => {
+          if (!labelIds || !labelIds.length) {
+            throw new Error("Нужен непустой `labelIds`, чтобы построить план удаления меток.");
+          }
+          const built: DeleteLabelItem[] = await mapWithLimit(labelIds, async (id) => {
+            const live = await fetchLabel(g, id);
+            if (!live) throw new Error(`Метка ${id} не найдена — проверьте id. Ничего не изменено.`);
+            let messageCount = 0;
+            try {
+              const r = await g.gmail.users.messages.list({ userId: "me", labelIds: [id], maxResults: 1 });
+              messageCount = r.data.resultSizeEstimate ?? 0;
+            } catch {
+              /* best-effort — count is informational, never blocks the plan */
+            }
+            return { id, name: live.name, messageCount };
+          });
+          const payload: DeleteLabelPayload = { account: accountName, labels: built };
+          const lines = built.map(
+            (it) => `- Метка «${safeText(it.name)}» (${it.id}) — писем с этой меткой: ${it.messageCount}`,
+          );
+          const preview = `### 📤 План: Удаление меток — ${built.length}\n\n${lines.join("\n")}`;
+          return {
+            payload,
+            objectHash: sha256({ account: accountName, labels: built.map(({ id, name }) => ({ id, name })) }),
+            preview,
+            batchSize: built.length,
+          };
+        },
+        // Real binding: re-reads each label's live name right now — a
+        // deleted/renamed label forces a mismatch instead of trusting the plan.
+        rehash: async (addressing) => {
+          const a = addressing as DeleteLabelPayload;
+          const fresh = await mapWithLimit(a.labels, async (it) => {
+            const live = await fetchLabel(g, it.id);
+            return { id: it.id, name: live?.name ?? "__UNREADABLE__" };
+          });
+          return sha256({ account: a.account, labels: fresh });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const results = await mapWithLimit(payload.labels, async (l) => {
           try {
-            await g.gmail.users.labels.delete({ userId: "me", id });
-            return { id };
+            await g.gmail.users.labels.delete({ userId: "me", id: l.id });
+            return { id: l.id, name: l.name };
           } catch (e) {
-            return { id, error: String(e instanceof Error ? e.message : e) };
+            return { id: l.id, name: l.name, error: String(e instanceof Error ? e.message : e) };
           }
         });
-      const ok_ = results.filter((r) => !("error" in r));
-      return ok({
-        summary: `🗑️ Deleted ${ok_.length}/${labelIds.length} label(s)`,
+      return buildMutationResult({
         results,
+        total: payload.labels.length,
+        verb: "Deleted",
+        summaryIcon: "🗑️",
+        verify: (r) => postVerifyLabelGone(g, r.id, r.name),
+        reportTitle: "Независимая проверка удаления меток",
+        reportSubtitle: "запрошено ⇄ живые метки Gmail",
+        consentStore,
+        auditId,
+        // Pre-snapshot (identity-postverify.md §5.2) for this irreversible op:
+        // name/id/message-count as they were AT PLAN TIME, before deletion.
+        preSnapshot: payload.labels.map((l) => ({ id: l.id, name: l.name, messageCount: l.messageCount })),
       });
     }),
   );
@@ -2677,10 +3834,20 @@ export function registerGmailTools(
         "Export every message in a Gmail thread as a TRUE, unmodified RFC 822 .eml file " +
         "(via Gmail API format=raw) and save them to Google Drive — the legally-clean original " +
         "with all headers intact, not a reconstruction. Optionally combine the whole thread into " +
-        "one .mbox archive. Get threadId from gmail_search or gmail_get_thread.",
+        "one .mbox archive. Get threadId from gmail_search or gmail_get_thread. Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with " +
+        "`threadId` etc.) to build a plan and return a preview — nothing is exported yet. Show the preview to " +
+        "the user verbatim and wait for their reply. Call again with the returned `manifest_id` and the user's " +
+        "VERBATIM `user_reply` to actually export.",
       inputSchema: {
         account,
-        threadId: z.string().describe("Gmail thread id to export (also accepts a single message's threadId)."),
+        threadId: z
+          .string()
+          .optional()
+          .describe(
+            "Gmail thread id to export (also accepts a single message's threadId). Required to build a plan " +
+              "(first call, no manifest_id/user_reply). Ignored on the execute call — read back from the manifest.",
+          ),
         folderId: z.string().optional().describe("Destination Drive folder id (defaults to Drive root)."),
         folderName: z
           .string()
@@ -2703,69 +3870,155 @@ export function registerGmailTools(
               "'last' = only the most recent message; 'first' = only the original message. " +
               "With 'last'/'first' a single .eml is written, named without the NN_ prefix.",
           ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: false },
     },
-    guard(async ({ account, threadId, folderId, folderName, format, scope }) => {
+    guard(async ({ account, threadId, folderId, folderName, format, scope, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = snoozeCtx;
+      if (!consentStore) {
+        return fail(
+          "Экспорт треда недоступен: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
+      const accountName = clients.canonicalName(account);
+      const fmt = format ?? "eml_files";
+      const scp = scope ?? "all";
+
+      // Cheap identity read for plan/rehash: threads.get(format="metadata")
+      // gives the message count AND the first message's Subject in ONE call —
+      // no raw bytes fetched here (those only happen at execute).
+      const readThreadIdentity = async (id: string) => {
+        const stub = await g.gmail.users.threads.get({
+          userId: "me",
+          id,
+          format: "metadata",
+          metadataHeaders: ["Subject"],
+        });
+        const msgs = stub.data.messages ?? [];
+        if (!msgs.length) throw new Error(`Тред ${id} не найден или пуст.`);
+        const subject = header(msgs[0].payload?.headers, "Subject") || "(без темы)";
+        return { subject, messageCount: msgs.length };
+      };
+
+      const decision = await requireConsent<ExportThreadPayload>({
+        tool: "gmail_export_thread_eml",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!threadId) {
+            throw new Error("Нужен непустой `threadId`, чтобы построить план экспорта.");
+          }
+          const { subject, messageCount } = await readThreadIdentity(threadId);
+          const payload: ExportThreadPayload = {
+            account: accountName,
+            threadId,
+            subject,
+            messageCount,
+            folderId,
+            folderName,
+            format: fmt,
+            scope: scp,
+          };
+          const dest = folderName ? `новая папка «${safeText(folderName, 100)}»` : folderId ? `папка ${folderId}` : "корень Drive";
+          const preview =
+            `### 📤 План: Экспорт треда — 1\n\n` +
+            `- «${safeText(subject)}» (${threadId}), сообщений: ${messageCount}, формат: ${fmt}, охват: ${scp} → ${dest}`;
+          return { payload, objectHash: sha256(payload), preview };
+        },
+        // Real binding: re-reads the thread's live subject/message count right
+        // now — a thread that vanished/grew/shrank since the plan forces a
+        // mismatch instead of exporting whatever is still there.
+        rehash: async (addressing) => {
+          const a = addressing as ExportThreadPayload;
+          try {
+            const { subject, messageCount } = await readThreadIdentity(a.threadId);
+            return sha256({ ...a, subject, messageCount });
+          } catch {
+            return sha256({ ...a, subject: "__UNREADABLE__", messageCount: -1 });
+          }
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
       // threads.get does NOT support format=raw (only messages.get does), so do
       // it in two steps: list the thread's message ids, then pull each message
       // with format=raw. That raw field is the full RFC 822 source (base64url) —
       // the real bytes Google received, headers and all — which is what makes
       // the export a genuine original rather than a re-serialised reconstruction.
-      const stub = await g.gmail.users.threads.get({ userId: "me", id: threadId, format: "minimal" });
+      const stub = await g.gmail.users.threads.get({ userId: "me", id: payload.threadId, format: "minimal" });
       const ids = (stub.data.messages ?? []).map((m) => m.id).filter((x): x is string => !!x);
-      if (!ids.length) return fail(`Thread ${threadId} has no messages (check the threadId).`);
+      if (!ids.length) {
+        await consentStore
+          .updateConsentAuditOutcome(auditId, { outcome: "failed", error: `thread ${payload.threadId} has no messages` })
+          .catch(() => {});
+        return fail(`Thread ${payload.threadId} has no messages (check the threadId).`);
+      }
       const allMessages = await mapWithLimit(ids, (id) =>
           g.gmail.users.messages.get({ userId: "me", id, format: "raw" }).then((r) => r.data),);
       // threads.get returns messages oldest-first, so [0] is the original and
       // the last element is the most recent.
       const messages =
-        scope === "last"
+        payload.scope === "last"
           ? [allMessages[allMessages.length - 1]]
-          : scope === "first"
+          : payload.scope === "first"
             ? [allMessages[0]]
             : allMessages;
 
       // Optionally drop everything into a fresh Drive subfolder.
-      let parentId = folderId;
-      if (folderName) {
+      let parentId = payload.folderId;
+      if (payload.folderName) {
         const folder = await g.drive.files.create({
           requestBody: {
-            name: folderName,
+            name: payload.folderName,
             mimeType: "application/vnd.google-apps.folder",
-            parents: folderId ? [folderId] : undefined,
+            parents: payload.folderId ? [payload.folderId] : undefined,
           },
           fields: "id",
         });
-        parentId = folder.data.id ?? folderId;
+        parentId = folder.data.id ?? payload.folderId;
       }
 
       const rawBuf = (m: gmail_v1.Schema$Message) => Buffer.from(m.raw ?? "", "base64url");
+      // Uniform per-file result shape regardless of format, so a single
+      // post-verify pass + buildMutationResult covers both branches below.
+      const produced: { fileId?: string | null; fileName?: string | null; error?: string }[] = [];
 
-      if (format === "mbox") {
-        const parts: Buffer[] = [];
-        for (const m of messages) {
-          const raw = rawBuf(m);
-          parts.push(Buffer.from(mboxFromLine(raw.toString("latin1")), "latin1"));
-          parts.push(escapeMboxFrom(raw));
-          parts.push(Buffer.from("\n", "latin1"));
+      if (payload.format === "mbox") {
+        try {
+          const parts: Buffer[] = [];
+          for (const m of messages) {
+            const raw = rawBuf(m);
+            parts.push(Buffer.from(mboxFromLine(raw.toString("latin1")), "latin1"));
+            parts.push(escapeMboxFrom(raw));
+            parts.push(Buffer.from("\n", "latin1"));
+          }
+          const mbox = Buffer.concat(parts);
+          const subj = decodeMimeWords(headerFromRaw(rawBuf(messages[0]).toString("latin1"), "Subject")) || payload.subject;
+          const res = await g.drive.files.create({
+            requestBody: { name: `${sanitizeName(subj)}.mbox`, parents: parentId ? [parentId] : undefined },
+            media: { mimeType: "application/mbox", body: Readable.from(mbox) },
+            fields: "id,name,webViewLink,size",
+          });
+          produced.push({ fileId: res.data.id, fileName: res.data.name });
+        } catch (e) {
+          produced.push({ error: String(e instanceof Error ? e.message : e) });
         }
-        const mbox = Buffer.concat(parts);
-        const subj = decodeMimeWords(headerFromRaw(rawBuf(messages[0]).toString("latin1"), "Subject")) || threadId;
-        const res = await g.drive.files.create({
-          requestBody: { name: `${sanitizeName(subj)}.mbox`, parents: parentId ? [parentId] : undefined },
-          media: { mimeType: "application/mbox", body: Readable.from(mbox) },
-          fields: "id,name,webViewLink,size",
-        });
-        return ok({
-          summary: `📧 Exported thread ${threadId} (${messages.length} message(s)) as one .mbox to Drive`,
-          folderId: parentId ?? null,
-          file: { id: res.data.id, name: res.data.name, link: res.data.webViewLink, bytes: res.data.size },
-        });
-      }
-
-      // eml_files: one standalone .eml per message.
-      const files = await mapWithLimit(messages, async (m, i) => {
+      } else {
+        // eml_files: one standalone .eml per message.
+        const files = await mapWithLimit(messages, async (m, i) => {
           try {
             const buf = rawBuf(m);
             const raw = buf.toString("latin1");
@@ -2780,17 +4033,29 @@ export function registerGmailTools(
               media: { mimeType: "message/rfc822", body: Readable.from(buf) },
               fields: "id,name,webViewLink,size",
             });
-            return { messageId: m.id, name: res.data.name, id: res.data.id, link: res.data.webViewLink, bytes: res.data.size };
+            return { fileId: res.data.id, fileName: res.data.name };
           } catch (e) {
-            return { messageId: m.id, error: String(e instanceof Error ? e.message : e) };
+            return { error: String(e instanceof Error ? e.message : e) };
           }
         });
-      const good = files.filter((f) => !("error" in f));
-      return ok({
-        summary: `📧 Exported ${good.length}/${messages.length} message(s) of thread ${threadId} as .eml originals to Drive`,
-        folderId: parentId ?? null,
-        files,
+        produced.push(...files);
+      }
+
+      const result = await buildMutationResult({
+        results: produced,
+        total: produced.length,
+        verb: "Exported",
+        summaryIcon: "📧",
+        verify: (r) => postVerifyDriveFileExists(g, r.fileId, r.fileName ?? payload.subject),
+        reportTitle: "Независимая проверка экспорта треда",
+        reportSubtitle: "запрошено ⇄ живой Drive",
+        consentStore,
+        auditId,
+        preSnapshot: { threadId: payload.threadId, subject: payload.subject, messageCount: payload.messageCount },
       });
+      // Fold in the destination folder id, matching the pre-gate response shape.
+      const parsed = JSON.parse((result.content[0] as { text: string }).text);
+      return ok({ ...parsed, folderId: parentId ?? null });
     }),
   );
 
@@ -2931,16 +4196,60 @@ export function registerGmailTools(
                 .describe("Total size in bytes, if known — lets Google reject an oversized upload up front."),
             }),
           )
-          .min(1)
-          .describe("Array of files to open upload sessions for."),
+          .optional()
+          .describe(
+            "Array of files to open upload sessions for. Required to build a plan (first call, no " +
+              "manifest_id/user_reply). Ignored on the execute call — read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, files }) => {
+    guard(async ({ account, files, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = snoozeCtx;
+      if (!consentStore) {
+        return fail(
+          "Загрузочная сессия недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
+            "может провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
+      const accountName = clients.canonicalName(account);
+
+      const decision = await requireConsent<UploadSessionPayload>({
+        tool: "gmail_create_upload_session",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: () => {
+          if (!files || !files.length) {
+            throw new Error("Нужен непустой `files`, чтобы построить план открытия загрузочных сессий.");
+          }
+          const payload: UploadSessionPayload = { account: accountName, files };
+          const lines = files.map(
+            (f) => `- «${safeText(f.name, 200)}»${f.sizeBytes ? ` (${f.sizeBytes} байт)` : ""} → Drive/${UPLOAD_FOLDER_NAME}`,
+          );
+          const preview = `### 📤 План: Открытие загрузочных сессий — ${files.length}\n\n${lines.join("\n")}`;
+          return { payload, objectHash: sha256(payload), preview, batchSize: files.length };
+        },
+        // Degenerate binding (same reasoning as gmail_send): a not-yet-existing
+        // upload session/placeholder has no live object to re-read.
+        rehash: (addressing) => sha256(addressing),
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
       const token = await g.accessToken();
       const folderId = await ensureUploadFolder(g);
-      const results = await mapWithLimit(files, async ({ name, mimeType, sizeBytes }) => {
+      const results = await mapWithLimit(payload.files, async ({ name, mimeType, sizeBytes }) => {
         try {
           const contentType = mimeType ?? "application/octet-stream";
           // Create the (empty) file first so its id is known up front — the model
@@ -2992,10 +4301,24 @@ export function registerGmailTools(
           return { name, error: String(e instanceof Error ? e.message : e) };
         }
       });
-      const good = results.filter((r) => !("error" in r));
-      return ok({
-        summary: `🚀 Opened ${good.length}/${files.length} upload session(s)`,
+      const result = await buildMutationResult({
         results,
+        total: payload.files.length,
+        verb: "Opened",
+        summaryIcon: "🚀",
+        // Post-verify only confirms the PLACEHOLDER exists — it can never
+        // confirm the client actually PUT the bytes (that happens later, out
+        // of band); gmail_confirm_upload (unchanged, read-only) is the tool
+        // for that, called out explicitly below so this isn't overclaimed.
+        verify: (r) => postVerifyDriveFileExists(g, r.driveFileId, r.name),
+        reportTitle: "Независимая проверка загрузочных сессий",
+        reportSubtitle: "запрошено ⇄ живой Drive (плейсхолдер; сама загрузка байт клиентом здесь НЕ проверяется)",
+        consentStore,
+        auditId,
+      });
+      const parsed = JSON.parse((result.content[0] as { text: string }).text);
+      return ok({
+        ...parsed,
         note:
           "Gmail will only carry the attachment once the client has PUT the bytes — a message sent before that " +
           "would go out with an empty file. Check with gmail_confirm_upload when in doubt. " +
