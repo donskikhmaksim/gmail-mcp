@@ -103,6 +103,33 @@ function secretMatches(provided: string, expected: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+/**
+ * Package S5 (`[R:приоритеты-3]`, plan §0.13): fail-closed `/mcp` when no
+ * auth mechanism is configured. `config.requireAuth` is false exactly when a
+ * deployment sets neither `MCP_AUTH_TOKEN` nor onboarding OAuth — before this
+ * fix, `handleMcp` served every caller as `config.users[0]` with ZERO
+ * authentication, including the 4 consent-gated send tools: an external
+ * caller could invoke `gmail_send` and simply supply its own `user_reply`,
+ * walking straight through the gate (STANDARD §1.2 obход, §1.5 fail-closed by
+ * default). Refuse with 503 instead. The only escape hatch is an explicit env
+ * opt-out for local development, logged loudly every time it's read so it
+ * can't go unnoticed in a deploy's logs.
+ *
+ * Read fresh (not cached at module scope) so a single process can run
+ * multiple server instances with different env — see
+ * scripts/test-s5-failclosed.mjs, which does exactly that.
+ */
+function allowUnauthenticated(): boolean {
+  return process.env.MCP_ALLOW_UNAUTHENTICATED?.trim().toLowerCase() === "true";
+}
+
+const NO_AUTH_CONFIGURED_MESSAGE =
+  "No authentication is configured for this server (no MCP_AUTH_TOKEN, no onboarding OAuth). " +
+  "Refusing unauthenticated access to /mcp, since that would let ANY caller invoke every tool " +
+  "unauthenticated -- including the 4 consent-gated send tools, where the caller could simply " +
+  "supply its own user_reply and walk through the gate. Set MCP_AUTH_TOKEN, enable onboarding " +
+  "OAuth, or (LOCAL DEVELOPMENT ONLY) set MCP_ALLOW_UNAUTHENTICATED=true.";
+
 export async function startHttpServer(config: Config): Promise<void> {
   const app = express();
   // Railway (and most PaaS) terminate TLS behind a reverse proxy; trust its
@@ -270,6 +297,15 @@ export async function startHttpServer(config: Config): Promise<void> {
       // Bearer token validated by requireBearerAuth; resolve the linked Google accounts.
       user = await userFromGoogleAccounts(config);
     } else if (!config.requireAuth) {
+      // No auth is configured at all -- fail closed by default (package S5).
+      if (!allowUnauthenticated()) {
+        res.status(503).json({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: NO_AUTH_CONFIGURED_MESSAGE },
+          id: null,
+        });
+        return;
+      }
       user = config.users[0] ?? null;
     } else {
       const legacyUser = resolveLegacyUser(req, config);
@@ -321,7 +357,21 @@ export async function startHttpServer(config: Config): Promise<void> {
   await new Promise<void>((resolve) => {
     app.listen(config.port, () => {
       console.error(`MCP listening on :${config.port}  auth=${config.requireAuth ? "on" : "OFF"}  instance=${randomUUID().slice(0, 8)}`);
-      if (!config.requireAuth && !config.onboarding.enabled) console.error("WARNING: no MCP_AUTH_TOKEN — endpoint is PUBLIC");
+      if (!config.requireAuth) {
+        if (allowUnauthenticated()) {
+          console.warn(
+            "WARNING: MCP_ALLOW_UNAUTHENTICATED=true — /mcp is serving EVERY request with ZERO " +
+              "authentication, including the 4 consent-gated send tools. Local development ONLY " +
+              "— never deploy this way.",
+          );
+        } else {
+          console.error(
+            "No MCP_AUTH_TOKEN and no onboarding OAuth configured — /mcp will refuse every " +
+              "request with 503 (fail-closed, package S5). Set MCP_AUTH_TOKEN or enable onboarding " +
+              "to serve requests, or MCP_ALLOW_UNAUTHENTICATED=true for local development only.",
+          );
+        }
+      }
       resolve();
     });
   });
