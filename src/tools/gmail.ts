@@ -1722,6 +1722,965 @@ function escapeMboxFrom(buf: Buffer): Buffer {
   return Buffer.from(buf.toString("latin1").replace(/\nFrom /g, "\n>From "), "latin1");
 }
 
+// ---- Авто-исполнение по кнопке в Telegram: ядра + регистрация ------------
+//
+// Максим, 2026-08-05: «нажал кнопку — должно сразу исполниться на бэке, не
+// ждать повторного вызова моделью». Паттерн (см. `executeSendBatchCore` +
+// `registerAutoExecutor("gmail_send", …)` выше) распространён здесь на
+// остальные гейтованные тулы: тело "confirmed"-ветки каждого тула вынесено в
+// одноимённую `execute<Тул>Core` функцию, которую дергает и обычный
+// MCP-хендлер (второй вызов моделью), и фоновый поллер напрямую. Регистрация
+// — на уровне МОДУЛЯ (не внутри `registerGmailTools`, которая перевызывается
+// на каждый MCP-запрос — см. `autoExecute.ts`'s doc-comment).
+//
+// Ничего в логике самих мутаций не изменилось — это чистое извлечение в
+// функции, byte-for-byte то же поведение, что было в теле тула.
+
+/** Оборачивает `(g, addressing)`-rehash (та же функция, что уходит в
+ * `requireConsent` для этого тула — НЕ упрощённая копия) в
+ * `autoExecute.ts`'s `RehashFn`: резолвит живой `g` из `ctx.clients` по
+ * `account`-метке, которая есть в каждом payload (rehash самого поллера не
+ * получает per-request `g`, только `ctx`, см. `AutoExecutorCtx`). */
+function autoRehash<P extends { account: string }>(
+  core: (g: GoogleClients, addressing: P) => string | Promise<string>,
+): (addressing: unknown, ctx: AutoExecutorCtx) => string | Promise<string> {
+  return (addressing, ctx) => {
+    const p = addressing as P;
+    return core(ctx.clients.resolve(p.account), p);
+  };
+}
+
+// ---- gmail_reply -----------------------------------------------------------
+
+/** Real binding для gmail_reply: та же логика, что раньше жила инлайн в
+ * `rehash` этого тула — re-reads каждого оригинала's From header. */
+async function rehashReplyBatch(g: GoogleClients, addressing: ReplyBatchPayload): Promise<string> {
+  const fresh = await mapWithLimit(addressing.replies, async (r) => {
+    try {
+      const orig = await g.gmail.users.messages.get({
+        userId: "me",
+        id: r.messageId,
+        format: "metadata",
+        metadataHeaders: ["From"],
+      });
+      const freshFrom = header(orig.data.payload?.headers, "From");
+      return { ...r, fromAddr: freshFrom, resolvedTo: extractEmail(freshFrom) };
+    } catch {
+      return { ...r, fromAddr: "__UNREADABLE__", resolvedTo: "__UNREADABLE__" };
+    }
+  });
+  return sha256({ account: addressing.account, replies: fresh });
+}
+
+async function executeReplyBatchCore(
+  g: GoogleClients,
+  accountName: string,
+  selfEmail: string | undefined,
+  payload: ReplyBatchPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const results = await mapWithLimit(payload.replies, async (item) => {
+    try {
+      const atts = item.attachments?.length ? await resolveAttachments(g, item.attachments) : undefined;
+      const raw = buildRawEmail({
+        to: item.fromAddr,
+        cc: item.cc,
+        subject: item.subject,
+        body: item.body,
+        inReplyTo: item.messageIdHeader || undefined,
+        references: item.references || undefined,
+        attachments: atts,
+      });
+      logSendPreSnapshot(accountName, { to: item.fromAddr, cc: item.cc, subject: item.subject, body: item.body });
+      const draft = await g.gmail.users.drafts.create({
+        userId: "me",
+        requestBody: { message: { raw, threadId: item.threadId } },
+      });
+      const res = await g.gmail.users.drafts.send({
+        userId: "me",
+        requestBody: { id: draft.data.id! },
+      });
+      return { messageId: res.data.id, expectedTo: item.fromAddr };
+    } catch (e) {
+      return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+  return buildSendResult(g, results, payload.replies.length, selfEmail, "Ответов отправлено", {
+    consentStore,
+    auditId,
+    preSnapshot: outboundPreSnapshot(payload.replies.map((r) => ({ to: r.fromAddr, cc: r.cc, subject: r.subject, body: r.body }))),
+  });
+}
+
+registerAutoExecutor("gmail_reply", {
+  rehash: autoRehash(rehashReplyBatch),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as ReplyBatchPayload;
+    const g = ctx.clients.resolve(p.account);
+    const selfEmail = await accountEmail(g, p.account);
+    const result = await executeReplyBatchCore(g, p.account, selfEmail, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ---- gmail_forward ----------------------------------------------------------
+
+async function rehashForwardBatch(g: GoogleClients, addressing: ForwardBatchPayload): Promise<string> {
+  const fresh = await mapWithLimit(addressing.items, async (it) => {
+    try {
+      const orig = await g.gmail.users.messages.get({
+        userId: "me",
+        id: it.messageId,
+        format: "metadata",
+        metadataHeaders: ["From", "Subject"],
+      });
+      const h = orig.data.payload?.headers;
+      return { ...it, origFrom: header(h, "From"), origSubject: header(h, "Subject") };
+    } catch {
+      return { ...it, origFrom: "__UNREADABLE__", origSubject: "__UNREADABLE__" };
+    }
+  });
+  return sha256({ account: addressing.account, items: fresh });
+}
+
+async function executeForwardBatchCore(
+  g: GoogleClients,
+  accountName: string,
+  selfEmail: string | undefined,
+  payload: ForwardBatchPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const results = await mapWithLimit(payload.items, async (item) => {
+    try {
+      const orig = await g.gmail.users.messages.get({ userId: "me", id: item.messageId, format: "full" });
+      const h = orig.data.payload?.headers;
+      const forwardedHeader =
+        "---------- Forwarded message ----------\r\n" +
+        `From: ${header(h, "From")}\r\n` +
+        `Date: ${header(h, "Date")}\r\n` +
+        `Subject: ${header(h, "Subject")}\r\n` +
+        `To: ${header(h, "To")}\r\n\r\n`;
+      const body = (item.body ? item.body + "\r\n\r\n" : "") + forwardedHeader + extractBody(orig.data.payload);
+      const atts: MailAttachment[] = [];
+      for (const a of collectAttachments(orig.data.payload)) {
+        const att = await g.gmail.users.messages.attachments.get({
+          userId: "me",
+          messageId: item.messageId,
+          id: a.attachmentId,
+        });
+        atts.push({
+          filename: a.filename,
+          mimeType: a.mimeType,
+          base64: Buffer.from(att.data.data ?? "", "base64url").toString("base64"),
+        });
+      }
+      const raw = buildRawEmail({ to: item.to, subject: item.subject, body, attachments: atts.length ? atts : undefined });
+      logSendPreSnapshot(accountName, { to: item.to, subject: item.subject, body: item.body });
+      const res = await g.gmail.users.messages.send({ userId: "me", requestBody: { raw } });
+      return { messageId: res.data.id, expectedTo: item.to };
+    } catch (e) {
+      return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+  return buildSendResult(g, results, payload.items.length, selfEmail, "Переслано", {
+    consentStore,
+    auditId,
+    preSnapshot: outboundPreSnapshot(payload.items.map((it) => ({ to: it.to, subject: it.subject, body: it.body }))),
+  });
+}
+
+registerAutoExecutor("gmail_forward", {
+  rehash: autoRehash(rehashForwardBatch),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as ForwardBatchPayload;
+    const g = ctx.clients.resolve(p.account);
+    const selfEmail = await accountEmail(g, p.account);
+    const result = await executeForwardBatchCore(g, p.account, selfEmail, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ---- gmail_create_draft ------------------------------------------------------
+
+async function executeDraftBatchCore(
+  g: GoogleClients,
+  payload: DraftBatchPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const results = await mapWithLimit(payload.drafts, async (d) => {
+    try {
+      const atts = d.attachments?.length ? await resolveAttachments(g, d.attachments) : undefined;
+      const raw = buildRawEmail({ to: d.to, subject: d.subject, body: d.body, cc: d.cc, bcc: d.bcc, attachments: atts });
+      const res = await g.gmail.users.drafts.create({
+        userId: "me",
+        requestBody: { message: { raw } },
+      });
+      return { draftId: res.data.id, to: d.to, subject: d.subject };
+    } catch (e) {
+      return { to: d.to, subject: d.subject, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+  return buildMutationResult({
+    results,
+    total: payload.drafts.length,
+    verb: "Created",
+    summaryIcon: "📝",
+    verify: (r) => postVerifyDraftExists(g, r.draftId, r.subject),
+    reportTitle: "Независимая проверка создания черновика",
+    reportSubtitle: "запрошено ⇄ живые черновики Gmail",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("gmail_create_draft", {
+  rehash: (addressing) => sha256(addressing),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as DraftBatchPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeDraftBatchCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ---- gmail_archive / gmail_trash (both IdBatchPayload) ----------------------
+// rehash reused as-is: `rehashIdBatch` (module-level already, precedent this
+// whole extraction follows for the other tools below).
+
+async function executeArchiveCore(
+  g: GoogleClients,
+  payload: IdBatchPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const results = await mapWithLimit(payload.items, async (item) => {
+    try {
+      await g.gmail.users.messages.modify({
+        userId: "me",
+        id: item.id,
+        requestBody: { removeLabelIds: ["INBOX"] },
+      });
+      return { id: item.id, subject: item.subject, from: item.from };
+    } catch (e) {
+      return { id: item.id, subject: item.subject, from: item.from, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Archived",
+    summaryIcon: "📥",
+    verify: (r) => postVerifyNotInInbox(g, r.id, r.subject),
+    reportTitle: "Независимая проверка архивирования",
+    reportSubtitle: "запрошено ⇄ живые метки Gmail",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("gmail_archive", {
+  rehash: autoRehash(rehashIdBatch),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as IdBatchPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeArchiveCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+async function executeTrashCore(
+  g: GoogleClients,
+  payload: IdBatchPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const results = await mapWithLimit(payload.items, async (item) => {
+    try {
+      await g.gmail.users.messages.trash({ userId: "me", id: item.id });
+      return { id: item.id, subject: item.subject, from: item.from };
+    } catch (e) {
+      return { id: item.id, subject: item.subject, from: item.from, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Trashed",
+    summaryIcon: "🗑",
+    verify: (r) => postVerifyInTrash(g, r.id, r.subject),
+    reportTitle: "Независимая проверка удаления в Корзину",
+    reportSubtitle: "запрошено ⇄ живые метки Gmail",
+    consentStore,
+    auditId,
+    preSnapshot: payload.items.map((it) => ({ id: it.id, subject: it.subject, from: it.from, labelIds: it.labelIds })),
+  });
+}
+
+registerAutoExecutor("gmail_trash", {
+  rehash: autoRehash(rehashIdBatch),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as IdBatchPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeTrashCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ---- gmail_modify_labels ------------------------------------------------------
+
+async function rehashModifyLabels(g: GoogleClients, addressing: ModifyLabelsPayload): Promise<string> {
+  const idn = await fetchMsgIdentity(g, addressing.items.map((it) => it.messageId));
+  const fresh = addressing.items.map((it) => {
+    const m = idn.get(it.messageId);
+    return m
+      ? { messageId: it.messageId, subject: m.subject, from: m.from }
+      : { messageId: it.messageId, subject: "__UNREADABLE__", from: "__UNREADABLE__" };
+  });
+  return sha256({ account: addressing.account, items: fresh });
+}
+
+async function executeModifyLabelsCore(
+  g: GoogleClients,
+  payload: ModifyLabelsPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const results = await mapWithLimit(payload.items, async (item) => {
+    try {
+      await g.gmail.users.messages.modify({
+        userId: "me",
+        id: item.messageId,
+        requestBody: { addLabelIds: item.addLabelIds, removeLabelIds: item.removeLabelIds },
+      });
+      return { id: item.messageId, subject: item.subject, from: item.from, addLabelIds: item.addLabelIds, removeLabelIds: item.removeLabelIds };
+    } catch (e) {
+      return {
+        id: item.messageId,
+        subject: item.subject,
+        from: item.from,
+        addLabelIds: item.addLabelIds,
+        removeLabelIds: item.removeLabelIds,
+        error: String(e instanceof Error ? e.message : e),
+      };
+    }
+  });
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Modified",
+    summaryIcon: "🏷️",
+    verify: (r) => postVerifyLabelsApplied(g, r.id, r.subject, r.addLabelIds, r.removeLabelIds),
+    reportTitle: "Независимая проверка изменения меток",
+    reportSubtitle: "запрошено ⇄ живые метки Gmail",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("gmail_modify_labels", {
+  rehash: autoRehash(rehashModifyLabels),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as ModifyLabelsPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeModifyLabelsCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ---- gmail_snooze -------------------------------------------------------------
+// rehash reused as-is: `rehashIdBatch` (SnoozeItem structurally extends
+// IdBatchItem — same convention the manual tool handler already uses via
+// `rehashIdBatch(g, addressing as IdBatchPayload)`).
+
+async function executeSnoozeCore(
+  g: GoogleClients,
+  accountName: string,
+  payload: SnoozeBatchPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+  store: Pick<PgStore, "addSnooze"> | null,
+  userToken: string | null,
+): Promise<CallToolResult> {
+  const results = await mapWithLimit(payload.items, async (item) => {
+    try {
+      const unsnoozeAt = new Date(item.unsnoozeAt);
+      if (isNaN(unsnoozeAt.getTime())) {
+        return { id: item.id, subject: item.subject, error: `Cannot parse date "${item.unsnoozeAt}". Use ISO 8601.` };
+      }
+      if (unsnoozeAt <= new Date()) {
+        return { id: item.id, subject: item.subject, error: `Snooze time "${item.unsnoozeAt}" is already in the past.` };
+      }
+      await g.gmail.users.messages.modify({
+        userId: "me",
+        id: item.id,
+        requestBody: { removeLabelIds: ["INBOX"] },
+      });
+      if (store) {
+        await store.addSnooze({ userToken, accountName, messageId: item.id, unsnoozeAt });
+      }
+      return {
+        id: item.id,
+        subject: item.subject,
+        unsnoozeAt: unsnoozeAt.toISOString(),
+        persisted: !!store,
+      };
+    } catch (e) {
+      return { id: item.id, subject: item.subject, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Snoozed",
+    summaryIcon: "⏰",
+    verify: (r) => postVerifyNotInInbox(g, r.id, r.subject),
+    reportTitle: "Независимая проверка отложенного возврата",
+    reportSubtitle: "запрошено ⇄ живые метки Gmail (сам возврат в inbox проверяется позже, фоном)",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("gmail_snooze", {
+  rehash: autoRehash(rehashIdBatch),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as SnoozeBatchPayload;
+    const g = ctx.clients.resolve(p.account);
+    // ctx.store — тот же адаптер, что per-request путь получает как
+    // snoozeCtx.store; null ровно когда DATABASE_URL не настроен (та же
+    // честная деградация, executeSnoozeCore просто не персистит).
+    const result = await executeSnoozeCore(g, p.account, p, auditId, ctx.consentStore, ctx.store, ctx.userToken);
+    return extractText(result);
+  },
+});
+
+// ---- gmail_schedule_send --------------------------------------------------
+
+async function executeScheduleSendCore(
+  g: GoogleClients,
+  accountName: string,
+  payload: ScheduleBatchPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+  store: Pick<PgStore, "addScheduledSend">,
+  userToken: string | null,
+): Promise<CallToolResult> {
+  const results = await mapWithLimit(payload.messages, async (msg) => {
+    try {
+      const sendAt = new Date(msg.sendAt);
+      if (isNaN(sendAt.getTime())) {
+        return { to: msg.to, subject: msg.subject, error: `Cannot parse date "${msg.sendAt}". Use ISO 8601.` };
+      }
+      if (sendAt <= new Date()) {
+        return { to: msg.to, subject: msg.subject, error: `sendAt "${msg.sendAt}" is already in the past.` };
+      }
+      const atts = msg.attachments?.length ? await resolveAttachments(g, msg.attachments) : undefined;
+      const raw = buildRawEmail({ to: msg.to, subject: msg.subject, body: msg.body, cc: msg.cc, bcc: msg.bcc, attachments: atts });
+      const id = await store.addScheduledSend({
+        userToken,
+        accountName,
+        rawMessage: raw,
+        toPreview: msg.to,
+        subjectPreview: msg.subject,
+        sendAt,
+      });
+      return { id, to: msg.to, subject: msg.subject, sendAt: sendAt.toISOString() };
+    } catch (e) {
+      return { to: msg.to, subject: msg.subject, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+  const ok_ = results.filter((r) => !("error" in r));
+  const errs = results
+    .filter((r): r is { to: string; subject: string; error: string } => "error" in r && !!r.error)
+    .map((r) => r.error)
+    .join("; ");
+  await consentStore
+    .updateConsentAuditOutcome(auditId, {
+      outcome: ok_.length > 0 ? "confirmed" : "failed",
+      postVerify:
+        `🕗 Поставлено в очередь ${ok_.length}/${results.length}; фактическая отправка произойдёт позже — ` +
+        "проверяйте через gmail_list_scheduled_sends.",
+      error: errs || null,
+      preSnapshot: outboundPreSnapshot(payload.messages),
+    })
+    .catch((e) => {
+      console.error(
+        "[consent audit] updateConsentAuditOutcome failed:",
+        e instanceof Error ? e.message : String(e),
+      );
+    });
+  return ok({
+    summary: `🕗 Scheduled ${ok_.length}/${results.length} message(s)`,
+    results,
+  });
+}
+
+registerAutoExecutor("gmail_schedule_send", {
+  rehash: (addressing) => sha256(addressing),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as ScheduleBatchPayload;
+    if (!ctx.store) {
+      // Тот же отказ, что manual-путь даёт синхронно на плане (`if (!store)
+      // return fail(...)`) — здесь манифест уже мог существовать (DATABASE_URL
+      // был на момент плана), но Postgres временно недоступен к моменту тика
+      // поллера; честно отказываем, а не молча теряем очередь на отправку.
+      throw new Error(
+        "Отложенная отправка недоступна: хранилище (DATABASE_URL) сейчас недоступно — попробуйте позже.",
+      );
+    }
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeScheduleSendCore(g, p.account, p, auditId, ctx.consentStore, ctx.store, ctx.userToken);
+    return extractText(result);
+  },
+});
+
+// ---- gmail_save_attachment_to_drive ----------------------------------------
+
+async function rehashSaveAttachment(g: GoogleClients, addressing: SaveAttachmentPayload): Promise<string> {
+  const fresh = await mapWithLimit(addressing.items, async (it) => {
+    try {
+      const msg = await g.gmail.users.messages.get({ userId: "me", id: it.messageId, format: "full" });
+      const found = collectAttachments(msg.data.payload).find((x) => x.attachmentId === it.attachmentId);
+      return found
+        ? { messageId: it.messageId, attachmentId: it.attachmentId, filename: found.filename, size: found.size }
+        : { messageId: it.messageId, attachmentId: it.attachmentId, filename: "__UNREADABLE__", size: -1 };
+    } catch {
+      return { messageId: it.messageId, attachmentId: it.attachmentId, filename: "__UNREADABLE__", size: -1 };
+    }
+  });
+  return sha256({ account: addressing.account, items: fresh });
+}
+
+async function executeSaveAttachmentCore(
+  g: GoogleClients,
+  payload: SaveAttachmentPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const results = await mapWithLimit(payload.items, async (item) => {
+    try {
+      const att = await g.gmail.users.messages.attachments.get({
+        userId: "me",
+        messageId: item.messageId,
+        id: item.attachmentId,
+      });
+      const buffer = Buffer.from(att.data.data ?? "", "base64url");
+      const filename = item.fileName ?? item.filename ?? "attachment";
+      const res = await g.drive.files.create({
+        requestBody: { name: filename, parents: item.folderId ? [item.folderId] : undefined },
+        media: { mimeType: item.mimeType ?? "application/octet-stream", body: Readable.from(buffer) },
+        fields: "id,name,mimeType,size,webViewLink",
+      });
+      return { fileId: res.data.id, fileName: res.data.name, messageId: item.messageId, attachmentId: item.attachmentId };
+    } catch (e) {
+      return { messageId: item.messageId, attachmentId: item.attachmentId, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Saved",
+    summaryIcon: "💾",
+    verify: (r) => postVerifyDriveFileExists(g, r.fileId, r.fileName),
+    reportTitle: "Независимая проверка сохранения в Drive",
+    reportSubtitle: "запрошено ⇄ живой Drive",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("gmail_save_attachment_to_drive", {
+  rehash: autoRehash(rehashSaveAttachment),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as SaveAttachmentPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeSaveAttachmentCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ---- gmail_create_label ------------------------------------------------------
+
+async function executeCreateLabelCore(
+  g: GoogleClients,
+  payload: CreateLabelPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const results = await mapWithLimit(payload.labels, async (l) => {
+    try {
+      const res = await g.gmail.users.labels.create({
+        userId: "me",
+        requestBody: {
+          name: l.name,
+          labelListVisibility: l.labelListVisibility ?? "labelShow",
+          messageListVisibility: l.messageListVisibility ?? "show",
+          color: l.backgroundColor || l.textColor
+            ? { backgroundColor: l.backgroundColor, textColor: l.textColor }
+            : undefined,
+        },
+      });
+      return { id: res.data.id, name: res.data.name ?? l.name };
+    } catch (e) {
+      return { name: l.name, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+  return buildMutationResult({
+    results,
+    total: payload.labels.length,
+    verb: "Created",
+    summaryIcon: "🏷️",
+    verify: (r) => postVerifyLabelExists(g, r.id ?? "", r.name),
+    reportTitle: "Независимая проверка создания меток",
+    reportSubtitle: "запрошено ⇄ живые метки Gmail",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("gmail_create_label", {
+  rehash: (addressing) => sha256(addressing),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as CreateLabelPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeCreateLabelCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ---- gmail_update_label -------------------------------------------------------
+
+async function rehashUpdateLabel(g: GoogleClients, addressing: UpdateLabelPayload): Promise<string> {
+  const fresh = await mapWithLimit(addressing.items, async (it) => {
+    const live = await fetchLabel(g, it.labelId);
+    return { labelId: it.labelId, currentName: live?.name ?? "__UNREADABLE__" };
+  });
+  return sha256({ account: addressing.account, items: fresh });
+}
+
+async function executeUpdateLabelCore(
+  g: GoogleClients,
+  payload: UpdateLabelPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const results = await mapWithLimit(payload.items, async (item) => {
+    try {
+      const patch: Record<string, unknown> = {};
+      if (item.name) patch.name = item.name;
+      if (item.labelListVisibility) patch.labelListVisibility = item.labelListVisibility;
+      if (item.messageListVisibility) patch.messageListVisibility = item.messageListVisibility;
+      if (item.backgroundColor || item.textColor) patch.color = { backgroundColor: item.backgroundColor, textColor: item.textColor };
+      const res = await g.gmail.users.labels.patch({
+        userId: "me",
+        id: item.labelId,
+        requestBody: patch,
+      });
+      return { id: res.data.id ?? item.labelId, name: res.data.name ?? item.name ?? item.currentName };
+    } catch (e) {
+      return { id: item.labelId, name: item.name ?? item.currentName, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Updated",
+    summaryIcon: "✏️",
+    verify: (r) => postVerifyLabelExists(g, r.id, r.name),
+    reportTitle: "Независимая проверка изменения меток",
+    reportSubtitle: "запрошено ⇄ живые метки Gmail",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("gmail_update_label", {
+  rehash: autoRehash(rehashUpdateLabel),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as UpdateLabelPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeUpdateLabelCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ---- gmail_delete_label -------------------------------------------------------
+
+async function rehashDeleteLabel(g: GoogleClients, addressing: DeleteLabelPayload): Promise<string> {
+  const fresh = await mapWithLimit(addressing.labels, async (it) => {
+    const live = await fetchLabel(g, it.id);
+    return { id: it.id, name: live?.name ?? "__UNREADABLE__" };
+  });
+  return sha256({ account: addressing.account, labels: fresh });
+}
+
+async function executeDeleteLabelCore(
+  g: GoogleClients,
+  payload: DeleteLabelPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const results = await mapWithLimit(payload.labels, async (l) => {
+    try {
+      await g.gmail.users.labels.delete({ userId: "me", id: l.id });
+      return { id: l.id, name: l.name };
+    } catch (e) {
+      return { id: l.id, name: l.name, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+  return buildMutationResult({
+    results,
+    total: payload.labels.length,
+    verb: "Deleted",
+    summaryIcon: "🗑️",
+    verify: (r) => postVerifyLabelGone(g, r.id, r.name),
+    reportTitle: "Независимая проверка удаления меток",
+    reportSubtitle: "запрошено ⇄ живые метки Gmail",
+    consentStore,
+    auditId,
+    preSnapshot: payload.labels.map((l) => ({ id: l.id, name: l.name, messageCount: l.messageCount })),
+  });
+}
+
+registerAutoExecutor("gmail_delete_label", {
+  rehash: autoRehash(rehashDeleteLabel),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as DeleteLabelPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeDeleteLabelCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ---- gmail_export_thread_eml ------------------------------------------------
+
+/** Cheap identity read for plan/rehash: shared by both (moved to module scope
+ * so `rehash` — now module-level for the auto-executor — can call the exact
+ * same function the `plan` phase uses; previously a local closure duplicated
+ * for each `registerGmailTools()` invocation, now a single top-level fn). */
+async function readThreadIdentity(g: GoogleClients, id: string): Promise<{ subject: string; messageCount: number }> {
+  const stub = await g.gmail.users.threads.get({
+    userId: "me",
+    id,
+    format: "metadata",
+    metadataHeaders: ["Subject"],
+  });
+  const msgs = stub.data.messages ?? [];
+  if (!msgs.length) throw new Error(`Тред ${id} не найден или пуст.`);
+  const subject = header(msgs[0].payload?.headers, "Subject") || "(без темы)";
+  return { subject, messageCount: msgs.length };
+}
+
+async function rehashExportThread(g: GoogleClients, addressing: ExportThreadPayload): Promise<string> {
+  try {
+    const { subject, messageCount } = await readThreadIdentity(g, addressing.threadId);
+    return sha256({ ...addressing, subject, messageCount });
+  } catch {
+    return sha256({ ...addressing, subject: "__UNREADABLE__", messageCount: -1 });
+  }
+}
+
+async function executeExportThreadCore(
+  g: GoogleClients,
+  payload: ExportThreadPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const stub = await g.gmail.users.threads.get({ userId: "me", id: payload.threadId, format: "minimal" });
+  const ids = (stub.data.messages ?? []).map((m) => m.id).filter((x): x is string => !!x);
+  if (!ids.length) {
+    await consentStore
+      .updateConsentAuditOutcome(auditId, { outcome: "failed", error: `thread ${payload.threadId} has no messages` })
+      .catch(() => {});
+    return fail(`Thread ${payload.threadId} has no messages (check the threadId).`);
+  }
+  const allMessages = await mapWithLimit(ids, (id) =>
+      g.gmail.users.messages.get({ userId: "me", id, format: "raw" }).then((r) => r.data),);
+  const messages =
+    payload.scope === "last"
+      ? [allMessages[allMessages.length - 1]]
+      : payload.scope === "first"
+        ? [allMessages[0]]
+        : allMessages;
+
+  let parentId = payload.folderId;
+  if (payload.folderName) {
+    const folder = await g.drive.files.create({
+      requestBody: {
+        name: payload.folderName,
+        mimeType: "application/vnd.google-apps.folder",
+        parents: payload.folderId ? [payload.folderId] : undefined,
+      },
+      fields: "id",
+    });
+    parentId = folder.data.id ?? payload.folderId;
+  }
+
+  const rawBuf = (m: gmail_v1.Schema$Message) => Buffer.from(m.raw ?? "", "base64url");
+  const produced: { fileId?: string | null; fileName?: string | null; error?: string }[] = [];
+
+  if (payload.format === "mbox") {
+    try {
+      const parts: Buffer[] = [];
+      for (const m of messages) {
+        const raw = rawBuf(m);
+        parts.push(Buffer.from(mboxFromLine(raw.toString("latin1")), "latin1"));
+        parts.push(escapeMboxFrom(raw));
+        parts.push(Buffer.from("\n", "latin1"));
+      }
+      const mbox = Buffer.concat(parts);
+      const subj = decodeMimeWords(headerFromRaw(rawBuf(messages[0]).toString("latin1"), "Subject")) || payload.subject;
+      const res = await g.drive.files.create({
+        requestBody: { name: `${sanitizeName(subj)}.mbox`, parents: parentId ? [parentId] : undefined },
+        media: { mimeType: "application/mbox", body: Readable.from(mbox) },
+        fields: "id,name,webViewLink,size",
+      });
+      produced.push({ fileId: res.data.id, fileName: res.data.name });
+    } catch (e) {
+      produced.push({ error: String(e instanceof Error ? e.message : e) });
+    }
+  } else {
+    const files = await mapWithLimit(messages, async (m, i) => {
+      try {
+        const buf = rawBuf(m);
+        const raw = buf.toString("latin1");
+        const stamp = dateStamp(headerFromRaw(raw, "Date"));
+        const subj = decodeMimeWords(headerFromRaw(raw, "Subject")) || "no-subject";
+        const prefix = messages.length > 1 ? `${String(i + 1).padStart(2, "0")}_` : "";
+        const name = `${prefix}${stamp ? stamp + "_" : ""}${sanitizeName(subj)}.eml`;
+        const res = await g.drive.files.create({
+          requestBody: { name, parents: parentId ? [parentId] : undefined },
+          media: { mimeType: "message/rfc822", body: Readable.from(buf) },
+          fields: "id,name,webViewLink,size",
+        });
+        return { fileId: res.data.id, fileName: res.data.name };
+      } catch (e) {
+        return { error: String(e instanceof Error ? e.message : e) };
+      }
+    });
+    produced.push(...files);
+  }
+
+  const result = await buildMutationResult({
+    results: produced,
+    total: produced.length,
+    verb: "Exported",
+    summaryIcon: "📧",
+    verify: (r) => postVerifyDriveFileExists(g, r.fileId, r.fileName ?? payload.subject),
+    reportTitle: "Независимая проверка экспорта треда",
+    reportSubtitle: "запрошено ⇄ живой Drive",
+    consentStore,
+    auditId,
+    preSnapshot: { threadId: payload.threadId, subject: payload.subject, messageCount: payload.messageCount },
+  });
+  const parsed = JSON.parse((result.content[0] as { text: string }).text);
+  return ok({ ...parsed, folderId: parentId ?? null });
+}
+
+registerAutoExecutor("gmail_export_thread_eml", {
+  rehash: autoRehash(rehashExportThread),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as ExportThreadPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeExportThreadCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ---- gmail_create_upload_session -------------------------------------------
+
+async function executeUploadSessionCore(
+  g: GoogleClients,
+  payload: UploadSessionPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const token = await g.accessToken();
+  const folderId = await ensureUploadFolder(g);
+  const results = await mapWithLimit(payload.files, async ({ name, mimeType, sizeBytes }) => {
+    try {
+      const contentType = mimeType ?? "application/octet-stream";
+      const placeholder = await g.drive.files.create({
+        requestBody: {
+          name,
+          parents: [folderId],
+          appProperties: { gmailMcpUpload: "1" },
+        },
+        fields: "id",
+      });
+      const fileId = placeholder.data.id;
+      if (!fileId) throw new Error("Drive did not return a file id for the staged upload.");
+
+      const res = await fetch(
+        `${DRIVE_UPLOAD_ENDPOINT}/${encodeURIComponent(fileId)}?uploadType=resumable&fields=id,name,size`,
+        {
+          method: "PATCH",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": contentType,
+            ...(sizeBytes ? { "X-Upload-Content-Length": String(sizeBytes) } : {}),
+          },
+          body: "{}",
+        },
+      );
+      if (!res.ok) {
+        return { name, error: `Google refused the session (HTTP ${res.status}): ${(await res.text()).slice(0, 500)}` };
+      }
+      const uploadUrl = res.headers.get("location");
+      if (!uploadUrl) {
+        return { name, error: "Google accepted the request but returned no Location header (no session URI)." };
+      }
+      return {
+        name,
+        driveFileId: fileId,
+        uploadUrl,
+        mimeType: contentType,
+        sizeBytes: sizeBytes ?? null,
+        howTo:
+          `PUT ${uploadUrl} with header "Content-Type: ${contentType}"` +
+          (sizeBytes ? ` and "Content-Length: ${sizeBytes}"` : "") +
+          ", body = the raw file bytes.",
+        thenSend: `Attach it with attachments: [{"driveFileId": "${fileId}"}].`,
+      };
+    } catch (e) {
+      return { name, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+  const result = await buildMutationResult({
+    results,
+    total: payload.files.length,
+    verb: "Opened",
+    summaryIcon: "🚀",
+    verify: (r) => postVerifyDriveFileExists(g, r.driveFileId, r.name),
+    reportTitle: "Независимая проверка загрузочных сессий",
+    reportSubtitle: "запрошено ⇄ живой Drive (плейсхолдер; сама загрузка байт клиентом здесь НЕ проверяется)",
+    consentStore,
+    auditId,
+  });
+  const parsed = JSON.parse((result.content[0] as { text: string }).text);
+  return ok({
+    ...parsed,
+    note:
+      "Gmail will only carry the attachment once the client has PUT the bytes — a message sent before that " +
+      "would go out with an empty file. Check with gmail_confirm_upload when in doubt. " +
+      "Gmail caps a whole message at 25 MB.",
+  });
+}
+
+registerAutoExecutor("gmail_create_upload_session", {
+  rehash: (addressing) => sha256(addressing),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as UploadSessionPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeUploadSessionCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
 export function registerGmailTools(
   server: McpServer,
   clients: UserClients,
@@ -2156,65 +3115,14 @@ export function registerGmailTools(
         // makes this a real re-read, not `sha256(addressing)` in disguise: the
         // comparison's outcome depends on live Gmail state, not just on what
         // was already in the manifest.
-        rehash: async (addressing) => {
-          const a = addressing as ReplyBatchPayload;
-          const fresh = await mapWithLimit(a.replies, async (r) => {
-            try {
-              const orig = await g.gmail.users.messages.get({
-                userId: "me",
-                id: r.messageId,
-                format: "metadata",
-                metadataHeaders: ["From"],
-              });
-              const freshFrom = header(orig.data.payload?.headers, "From");
-              return { ...r, fromAddr: freshFrom, resolvedTo: extractEmail(freshFrom) };
-            } catch {
-              // Unreadable (deleted?) — force a mismatch rather than silently
-              // trusting the stale plan.
-              return { ...r, fromAddr: "__UNREADABLE__", resolvedTo: "__UNREADABLE__" };
-            }
-          });
-          return sha256({ account: a.account, replies: fresh });
-        },
+        rehash: (addressing) => rehashReplyBatch(g, addressing as ReplyBatchPayload),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results = await mapWithLimit(payload.replies, async (item) => {
-          try {
-            const atts = item.attachments?.length ? await resolveAttachments(g, item.attachments) : undefined;
-            const raw = buildRawEmail({
-              to: item.fromAddr,
-              cc: item.cc,
-              subject: item.subject,
-              body: item.body,
-              inReplyTo: item.messageIdHeader || undefined,
-              references: item.references || undefined,
-              attachments: atts,
-            });
-            logSendPreSnapshot(accountName, { to: item.fromAddr, cc: item.cc, subject: item.subject, body: item.body });
-            const draft = await g.gmail.users.drafts.create({
-              userId: "me",
-              requestBody: { message: { raw, threadId: item.threadId } },
-            });
-            const res = await g.gmail.users.drafts.send({
-              userId: "me",
-              requestBody: { id: draft.data.id! },
-            });
-            // The reply's recipient is the original sender (fromAddr) — post-verify
-            // checks the sent copy did not come back to us (incident 2).
-            return { messageId: res.data.id, expectedTo: item.fromAddr };
-          } catch (e) {
-            return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
-          }
-        });
-      return buildSendResult(g, results, payload.replies.length, selfEmail, "Ответов отправлено", {
-        consentStore,
-        auditId,
-        preSnapshot: outboundPreSnapshot(payload.replies.map((r) => ({ to: r.fromAddr, cc: r.cc, subject: r.subject, body: r.body }))),
-      });
+      return executeReplyBatchCore(g, accountName, selfEmail, payload, auditId, consentStore);
     }),
   );
 
@@ -2315,70 +3223,14 @@ export function registerGmailTools(
         // since the plan, the recomputed hash differs from objectHash and the
         // gate refuses "state changed, build a new plan" rather than forwarding
         // whatever it can still find.
-        rehash: async (addressing) => {
-          const a = addressing as ForwardBatchPayload;
-          const fresh = await mapWithLimit(a.items, async (it) => {
-            try {
-              const orig = await g.gmail.users.messages.get({
-                userId: "me",
-                id: it.messageId,
-                format: "metadata",
-                metadataHeaders: ["From", "Subject"],
-              });
-              const h = orig.data.payload?.headers;
-              return { ...it, origFrom: header(h, "From"), origSubject: header(h, "Subject") };
-            } catch {
-              return { ...it, origFrom: "__UNREADABLE__", origSubject: "__UNREADABLE__" };
-            }
-          });
-          return sha256({ account: a.account, items: fresh });
-        },
+        rehash: (addressing) => rehashForwardBatch(g, addressing as ForwardBatchPayload),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results = await mapWithLimit(payload.items, async (item) => {
-          try {
-            // Execute re-fetches the original in full — the plan/rehash reads
-            // above are metadata-only (cheap, no attachment bytes); the actual
-            // body/attachments are only pulled once we are actually sending.
-            const orig = await g.gmail.users.messages.get({ userId: "me", id: item.messageId, format: "full" });
-            const h = orig.data.payload?.headers;
-            const forwardedHeader =
-              "---------- Forwarded message ----------\r\n" +
-              `From: ${header(h, "From")}\r\n` +
-              `Date: ${header(h, "Date")}\r\n` +
-              `Subject: ${header(h, "Subject")}\r\n` +
-              `To: ${header(h, "To")}\r\n\r\n`;
-            const body = (item.body ? item.body + "\r\n\r\n" : "") + forwardedHeader + extractBody(orig.data.payload);
-            const atts: MailAttachment[] = [];
-            for (const a of collectAttachments(orig.data.payload)) {
-              const att = await g.gmail.users.messages.attachments.get({
-                userId: "me",
-                messageId: item.messageId,
-                id: a.attachmentId,
-              });
-              atts.push({
-                filename: a.filename,
-                mimeType: a.mimeType,
-                base64: Buffer.from(att.data.data ?? "", "base64url").toString("base64"),
-              });
-            }
-            const raw = buildRawEmail({ to: item.to, subject: item.subject, body, attachments: atts.length ? atts : undefined });
-            logSendPreSnapshot(accountName, { to: item.to, subject: item.subject, body: item.body });
-            const res = await g.gmail.users.messages.send({ userId: "me", requestBody: { raw } });
-            return { messageId: res.data.id, expectedTo: item.to };
-          } catch (e) {
-            return { id: item.messageId, error: String(e instanceof Error ? e.message : e) };
-          }
-        });
-      return buildSendResult(g, results, payload.items.length, selfEmail, "Переслано", {
-        consentStore,
-        auditId,
-        preSnapshot: outboundPreSnapshot(payload.items.map((it) => ({ to: it.to, subject: it.subject, body: it.body }))),
-      });
+      return executeForwardBatchCore(g, accountName, selfEmail, payload, auditId, consentStore);
     }),
   );
 
@@ -2470,30 +3322,7 @@ export function registerGmailTools(
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results = await mapWithLimit(payload.drafts, async (d) => {
-          try {
-            const atts = d.attachments?.length ? await resolveAttachments(g, d.attachments) : undefined;
-            const raw = buildRawEmail({ to: d.to, subject: d.subject, body: d.body, cc: d.cc, bcc: d.bcc, attachments: atts });
-            const res = await g.gmail.users.drafts.create({
-              userId: "me",
-              requestBody: { message: { raw } },
-            });
-            return { draftId: res.data.id, to: d.to, subject: d.subject };
-          } catch (e) {
-            return { to: d.to, subject: d.subject, error: String(e instanceof Error ? e.message : e) };
-          }
-        });
-      return buildMutationResult({
-        results,
-        total: payload.drafts.length,
-        verb: "Created",
-        summaryIcon: "📝",
-        verify: (r) => postVerifyDraftExists(g, r.draftId, r.subject),
-        reportTitle: "Независимая проверка создания черновика",
-        reportSubtitle: "запрошено ⇄ живые черновики Gmail",
-        consentStore,
-        auditId,
-      });
+      return executeDraftBatchCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -2553,29 +3382,7 @@ export function registerGmailTools(
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results = await mapWithLimit(payload.items, async (item) => {
-          try {
-            await g.gmail.users.messages.modify({
-              userId: "me",
-              id: item.id,
-              requestBody: { removeLabelIds: ["INBOX"] },
-            });
-            return { id: item.id, subject: item.subject, from: item.from };
-          } catch (e) {
-            return { id: item.id, subject: item.subject, from: item.from, error: String(e instanceof Error ? e.message : e) };
-          }
-        });
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Archived",
-        summaryIcon: "📥",
-        verify: (r) => postVerifyNotInInbox(g, r.id, r.subject),
-        reportTitle: "Независимая проверка архивирования",
-        reportSubtitle: "запрошено ⇄ живые метки Gmail",
-        consentStore,
-        auditId,
-      });
+      return executeArchiveCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -2635,29 +3442,7 @@ export function registerGmailTools(
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results = await mapWithLimit(payload.items, async (item) => {
-          try {
-            await g.gmail.users.messages.trash({ userId: "me", id: item.id });
-            return { id: item.id, subject: item.subject, from: item.from };
-          } catch (e) {
-            return { id: item.id, subject: item.subject, from: item.from, error: String(e instanceof Error ? e.message : e) };
-          }
-        });
-      // Pre-snapshot (identity-postverify.md §5.2): the plan-time read of
-      // id/subject/from/labelIds IS the "before" state — no extra call needed,
-      // it is simply what the manifest already stored before the mutation ran.
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Trashed",
-        summaryIcon: "🗑",
-        verify: (r) => postVerifyInTrash(g, r.id, r.subject),
-        reportTitle: "Независимая проверка удаления в Корзину",
-        reportSubtitle: "запрошено ⇄ живые метки Gmail",
-        consentStore,
-        auditId,
-        preSnapshot: payload.items.map((it) => ({ id: it.id, subject: it.subject, from: it.from, labelIds: it.labelIds })),
-      });
+      return executeTrashCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -2752,53 +3537,14 @@ export function registerGmailTools(
         // (addLabelIds/removeLabelIds are the ACTION, not the identity being
         // bound — they come from the manifest's payload, protected the same
         // way gmail_send's messages are).
-        rehash: async (addressing) => {
-          const a = addressing as ModifyLabelsPayload;
-          const idn = await fetchMsgIdentity(g, a.items.map((it) => it.messageId));
-          const fresh = a.items.map((it) => {
-            const m = idn.get(it.messageId);
-            return m
-              ? { messageId: it.messageId, subject: m.subject, from: m.from }
-              : { messageId: it.messageId, subject: "__UNREADABLE__", from: "__UNREADABLE__" };
-          });
-          return sha256({ account: a.account, items: fresh });
-        },
+        rehash: (addressing) => rehashModifyLabels(g, addressing as ModifyLabelsPayload),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results = await mapWithLimit(payload.items, async (item) => {
-          try {
-            await g.gmail.users.messages.modify({
-              userId: "me",
-              id: item.messageId,
-              requestBody: { addLabelIds: item.addLabelIds, removeLabelIds: item.removeLabelIds },
-            });
-            return { id: item.messageId, subject: item.subject, from: item.from, addLabelIds: item.addLabelIds, removeLabelIds: item.removeLabelIds };
-          } catch (e) {
-            return {
-              id: item.messageId,
-              subject: item.subject,
-              from: item.from,
-              addLabelIds: item.addLabelIds,
-              removeLabelIds: item.removeLabelIds,
-              error: String(e instanceof Error ? e.message : e),
-            };
-          }
-        });
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Modified",
-        summaryIcon: "🏷️",
-        verify: (r) => postVerifyLabelsApplied(g, r.id, r.subject, r.addLabelIds, r.removeLabelIds),
-        reportTitle: "Независимая проверка изменения меток",
-        reportSubtitle: "запрошено ⇄ живые метки Gmail",
-        consentStore,
-        auditId,
-      });
+      return executeModifyLabelsCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -2891,50 +3637,10 @@ export function registerGmailTools(
 
       const { payload, auditId } = decision;
       const { store, userToken } = snoozeCtx;
-      const results = await mapWithLimit(payload.items, async (item) => {
-          try {
-            const unsnoozeAt = new Date(item.unsnoozeAt);
-            if (isNaN(unsnoozeAt.getTime())) {
-              return { id: item.id, subject: item.subject, error: `Cannot parse date "${item.unsnoozeAt}". Use ISO 8601.` };
-            }
-            if (unsnoozeAt <= new Date()) {
-              return { id: item.id, subject: item.subject, error: `Snooze time "${item.unsnoozeAt}" is already in the past.` };
-            }
-            await g.gmail.users.messages.modify({
-              userId: "me",
-              id: item.id,
-              requestBody: { removeLabelIds: ["INBOX"] },
-            });
-            // userToken is null for onboarded (native-OAuth) deployments —
-            // that's expected, not a reason to skip persisting; accountName
-            // alone is enough for the scheduler to find the right account later.
-            if (store) {
-              await store.addSnooze({ userToken, accountName, messageId: item.id, unsnoozeAt });
-            }
-            return {
-              id: item.id,
-              subject: item.subject,
-              unsnoozeAt: unsnoozeAt.toISOString(),
-              persisted: !!store,
-            };
-          } catch (e) {
-            return { id: item.id, subject: item.subject, error: String(e instanceof Error ? e.message : e) };
-          }
-        });
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Snoozed",
-        summaryIcon: "⏰",
-        // Post-verify only confirms the immediate mutation (INBOX removed);
-        // the scheduled restore itself runs later in the background (out of
-        // this call's scope) — same honesty as schedule_send's queuing note.
-        verify: (r) => postVerifyNotInInbox(g, r.id, r.subject),
-        reportTitle: "Независимая проверка отложенного возврата",
-        reportSubtitle: "запрошено ⇄ живые метки Gmail (сам возврат в inbox проверяется позже, фоном)",
-        consentStore,
-        auditId,
-      });
+      // userToken is null for onboarded (native-OAuth) deployments — that's
+      // expected, not a reason to skip persisting; accountName alone is
+      // enough for the scheduler to find the right account later.
+      return executeSnoozeCore(g, accountName, payload, auditId, consentStore, store, userToken);
     }),
   );
 
@@ -3057,59 +3763,10 @@ export function registerGmailTools(
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results = await mapWithLimit(payload.messages, async (msg) => {
-        try {
-          const sendAt = new Date(msg.sendAt);
-          if (isNaN(sendAt.getTime())) {
-            return { to: msg.to, subject: msg.subject, error: `Cannot parse date "${msg.sendAt}". Use ISO 8601.` };
-          }
-          if (sendAt <= new Date()) {
-            return { to: msg.to, subject: msg.subject, error: `sendAt "${msg.sendAt}" is already in the past.` };
-          }
-          // Resolve attachments and build the raw MIME NOW, so a bad driveFileId
-          // or an over-quota Drive fails this call instead of silently rotting
-          // in the queue until sendAt.
-          const atts = msg.attachments?.length ? await resolveAttachments(g, msg.attachments) : undefined;
-          const raw = buildRawEmail({ to: msg.to, subject: msg.subject, body: msg.body, cc: msg.cc, bcc: msg.bcc, attachments: atts });
-          const id = await store.addScheduledSend({
-            userToken,
-            accountName,
-            rawMessage: raw,
-            toPreview: msg.to,
-            subjectPreview: msg.subject,
-            sendAt,
-          });
-          return { id, to: msg.to, subject: msg.subject, sendAt: sendAt.toISOString() };
-        } catch (e) {
-          return { to: msg.to, subject: msg.subject, error: String(e instanceof Error ? e.message : e) };
-        }
-      });
-      const ok_ = results.filter((r) => !("error" in r));
-      const errs = results
-        .filter((r): r is { to: string; subject: string; error: string } => "error" in r && !!r.error)
-        .map((r) => r.error)
-        .join("; ");
-      // Queuing itself IS the observable mutation here (actual delivery happens
-      // later, out of band, via the scheduler — B2/B3's job, not this call's).
-      await consentStore
-        .updateConsentAuditOutcome(auditId, {
-          outcome: ok_.length > 0 ? "confirmed" : "failed",
-          postVerify:
-            `🕗 Поставлено в очередь ${ok_.length}/${results.length}; фактическая отправка произойдёт позже — ` +
-            "проверяйте через gmail_list_scheduled_sends.",
-          error: errs || null,
-          preSnapshot: outboundPreSnapshot(payload.messages),
-        })
-        .catch((e) => {
-          console.error(
-            "[consent audit] updateConsentAuditOutcome failed:",
-            e instanceof Error ? e.message : String(e),
-          );
-        });
-      return ok({
-        summary: `🕗 Scheduled ${ok_.length}/${results.length} message(s)`,
-        results,
-      });
+      // Resolving attachments/building the raw MIME (inside the core fn) NOW,
+      // rather than at sendAt, means a bad driveFileId or an over-quota Drive
+      // fails this call instead of silently rotting in the queue.
+      return executeScheduleSendCore(g, accountName, payload, auditId, consentStore, store, userToken);
     }),
   );
 
@@ -3428,57 +4085,14 @@ export function registerGmailTools(
         // Real binding: re-reads each message's MIME tree right now and
         // re-locates the attachment — a vanished message/attachment or a
         // changed filename/size forces a mismatch instead of trusting the plan.
-        rehash: async (addressing) => {
-          const a = addressing as SaveAttachmentPayload;
-          const fresh = await mapWithLimit(a.items, async (it) => {
-            try {
-              const msg = await g.gmail.users.messages.get({ userId: "me", id: it.messageId, format: "full" });
-              const found = collectAttachments(msg.data.payload).find((x) => x.attachmentId === it.attachmentId);
-              return found
-                ? { messageId: it.messageId, attachmentId: it.attachmentId, filename: found.filename, size: found.size }
-                : { messageId: it.messageId, attachmentId: it.attachmentId, filename: "__UNREADABLE__", size: -1 };
-            } catch {
-              return { messageId: it.messageId, attachmentId: it.attachmentId, filename: "__UNREADABLE__", size: -1 };
-            }
-          });
-          return sha256({ account: a.account, items: fresh });
-        },
+        rehash: (addressing) => rehashSaveAttachment(g, addressing as SaveAttachmentPayload),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results = await mapWithLimit(payload.items, async (item) => {
-          try {
-            const att = await g.gmail.users.messages.attachments.get({
-              userId: "me",
-              messageId: item.messageId,
-              id: item.attachmentId,
-            });
-            const buffer = Buffer.from(att.data.data ?? "", "base64url");
-            const filename = item.fileName ?? item.filename ?? "attachment";
-            const res = await g.drive.files.create({
-              requestBody: { name: filename, parents: item.folderId ? [item.folderId] : undefined },
-              media: { mimeType: item.mimeType ?? "application/octet-stream", body: Readable.from(buffer) },
-              fields: "id,name,mimeType,size,webViewLink",
-            });
-            return { fileId: res.data.id, fileName: res.data.name, messageId: item.messageId, attachmentId: item.attachmentId };
-          } catch (e) {
-            return { messageId: item.messageId, attachmentId: item.attachmentId, error: String(e instanceof Error ? e.message : e) };
-          }
-        });
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Saved",
-        summaryIcon: "💾",
-        verify: (r) => postVerifyDriveFileExists(g, r.fileId, r.fileName),
-        reportTitle: "Независимая проверка сохранения в Drive",
-        reportSubtitle: "запрошено ⇄ живой Drive",
-        consentStore,
-        auditId,
-      });
+      return executeSaveAttachmentCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -3584,35 +4198,7 @@ export function registerGmailTools(
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results = await mapWithLimit(payload.labels, async (l) => {
-          try {
-            const res = await g.gmail.users.labels.create({
-              userId: "me",
-              requestBody: {
-                name: l.name,
-                labelListVisibility: l.labelListVisibility ?? "labelShow",
-                messageListVisibility: l.messageListVisibility ?? "show",
-                color: l.backgroundColor || l.textColor
-                  ? { backgroundColor: l.backgroundColor, textColor: l.textColor }
-                  : undefined,
-              },
-            });
-            return { id: res.data.id, name: res.data.name ?? l.name };
-          } catch (e) {
-            return { name: l.name, error: String(e instanceof Error ? e.message : e) };
-          }
-        });
-      return buildMutationResult({
-        results,
-        total: payload.labels.length,
-        verb: "Created",
-        summaryIcon: "🏷️",
-        verify: (r) => postVerifyLabelExists(g, r.id ?? "", r.name),
-        reportTitle: "Независимая проверка создания меток",
-        reportSubtitle: "запрошено ⇄ живые метки Gmail",
-        consentStore,
-        auditId,
-      });
+      return executeCreateLabelCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -3715,48 +4301,14 @@ export function registerGmailTools(
         },
         // Real binding: re-reads each label's live name right now — catches a
         // concurrent rename between plan and execute.
-        rehash: async (addressing) => {
-          const a = addressing as UpdateLabelPayload;
-          const fresh = await mapWithLimit(a.items, async (it) => {
-            const live = await fetchLabel(g, it.labelId);
-            return { labelId: it.labelId, currentName: live?.name ?? "__UNREADABLE__" };
-          });
-          return sha256({ account: a.account, items: fresh });
-        },
+        rehash: (addressing) => rehashUpdateLabel(g, addressing as UpdateLabelPayload),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results = await mapWithLimit(payload.items, async (item) => {
-          try {
-            const patch: Record<string, unknown> = {};
-            if (item.name) patch.name = item.name;
-            if (item.labelListVisibility) patch.labelListVisibility = item.labelListVisibility;
-            if (item.messageListVisibility) patch.messageListVisibility = item.messageListVisibility;
-            if (item.backgroundColor || item.textColor) patch.color = { backgroundColor: item.backgroundColor, textColor: item.textColor };
-            const res = await g.gmail.users.labels.patch({
-              userId: "me",
-              id: item.labelId,
-              requestBody: patch,
-            });
-            return { id: res.data.id ?? item.labelId, name: res.data.name ?? item.name ?? item.currentName };
-          } catch (e) {
-            return { id: item.labelId, name: item.name ?? item.currentName, error: String(e instanceof Error ? e.message : e) };
-          }
-        });
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Updated",
-        summaryIcon: "✏️",
-        verify: (r) => postVerifyLabelExists(g, r.id, r.name),
-        reportTitle: "Независимая проверка изменения меток",
-        reportSubtitle: "запрошено ⇄ живые метки Gmail",
-        consentStore,
-        auditId,
-      });
+      return executeUpdateLabelCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -3844,42 +4396,14 @@ export function registerGmailTools(
         },
         // Real binding: re-reads each label's live name right now — a
         // deleted/renamed label forces a mismatch instead of trusting the plan.
-        rehash: async (addressing) => {
-          const a = addressing as DeleteLabelPayload;
-          const fresh = await mapWithLimit(a.labels, async (it) => {
-            const live = await fetchLabel(g, it.id);
-            return { id: it.id, name: live?.name ?? "__UNREADABLE__" };
-          });
-          return sha256({ account: a.account, labels: fresh });
-        },
+        rehash: (addressing) => rehashDeleteLabel(g, addressing as DeleteLabelPayload),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results = await mapWithLimit(payload.labels, async (l) => {
-          try {
-            await g.gmail.users.labels.delete({ userId: "me", id: l.id });
-            return { id: l.id, name: l.name };
-          } catch (e) {
-            return { id: l.id, name: l.name, error: String(e instanceof Error ? e.message : e) };
-          }
-        });
-      return buildMutationResult({
-        results,
-        total: payload.labels.length,
-        verb: "Deleted",
-        summaryIcon: "🗑️",
-        verify: (r) => postVerifyLabelGone(g, r.id, r.name),
-        reportTitle: "Независимая проверка удаления меток",
-        reportSubtitle: "запрошено ⇄ живые метки Gmail",
-        consentStore,
-        auditId,
-        // Pre-snapshot (identity-postverify.md §5.2) for this irreversible op:
-        // name/id/message-count as they were AT PLAN TIME, before deletion.
-        preSnapshot: payload.labels.map((l) => ({ id: l.id, name: l.name, messageCount: l.messageCount })),
-      });
+      return executeDeleteLabelCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -3952,19 +4476,9 @@ export function registerGmailTools(
 
       // Cheap identity read for plan/rehash: threads.get(format="metadata")
       // gives the message count AND the first message's Subject in ONE call —
-      // no raw bytes fetched here (those only happen at execute).
-      const readThreadIdentity = async (id: string) => {
-        const stub = await g.gmail.users.threads.get({
-          userId: "me",
-          id,
-          format: "metadata",
-          metadataHeaders: ["Subject"],
-        });
-        const msgs = stub.data.messages ?? [];
-        if (!msgs.length) throw new Error(`Тред ${id} не найден или пуст.`);
-        const subject = header(msgs[0].payload?.headers, "Subject") || "(без темы)";
-        return { subject, messageCount: msgs.length };
-      };
+      // no raw bytes fetched here (those only happen at execute). Module-level
+      // `readThreadIdentity(g, id)` now (moved so `rehash` — module-level for
+      // the auto-executor — can call the exact same function `plan` uses).
 
       const decision = await requireConsent<ExportThreadPayload>({
         tool: "gmail_export_thread_eml",
@@ -3978,7 +4492,7 @@ export function registerGmailTools(
           if (!threadId) {
             throw new Error("Нужен непустой `threadId`, чтобы построить план экспорта.");
           }
-          const { subject, messageCount } = await readThreadIdentity(threadId);
+          const { subject, messageCount } = await readThreadIdentity(g, threadId);
           const payload: ExportThreadPayload = {
             account: accountName,
             threadId,
@@ -3998,124 +4512,14 @@ export function registerGmailTools(
         // Real binding: re-reads the thread's live subject/message count right
         // now — a thread that vanished/grew/shrank since the plan forces a
         // mismatch instead of exporting whatever is still there.
-        rehash: async (addressing) => {
-          const a = addressing as ExportThreadPayload;
-          try {
-            const { subject, messageCount } = await readThreadIdentity(a.threadId);
-            return sha256({ ...a, subject, messageCount });
-          } catch {
-            return sha256({ ...a, subject: "__UNREADABLE__", messageCount: -1 });
-          }
-        },
+        rehash: (addressing) => rehashExportThread(g, addressing as ExportThreadPayload),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      // threads.get does NOT support format=raw (only messages.get does), so do
-      // it in two steps: list the thread's message ids, then pull each message
-      // with format=raw. That raw field is the full RFC 822 source (base64url) —
-      // the real bytes Google received, headers and all — which is what makes
-      // the export a genuine original rather than a re-serialised reconstruction.
-      const stub = await g.gmail.users.threads.get({ userId: "me", id: payload.threadId, format: "minimal" });
-      const ids = (stub.data.messages ?? []).map((m) => m.id).filter((x): x is string => !!x);
-      if (!ids.length) {
-        await consentStore
-          .updateConsentAuditOutcome(auditId, { outcome: "failed", error: `thread ${payload.threadId} has no messages` })
-          .catch(() => {});
-        return fail(`Thread ${payload.threadId} has no messages (check the threadId).`);
-      }
-      const allMessages = await mapWithLimit(ids, (id) =>
-          g.gmail.users.messages.get({ userId: "me", id, format: "raw" }).then((r) => r.data),);
-      // threads.get returns messages oldest-first, so [0] is the original and
-      // the last element is the most recent.
-      const messages =
-        payload.scope === "last"
-          ? [allMessages[allMessages.length - 1]]
-          : payload.scope === "first"
-            ? [allMessages[0]]
-            : allMessages;
-
-      // Optionally drop everything into a fresh Drive subfolder.
-      let parentId = payload.folderId;
-      if (payload.folderName) {
-        const folder = await g.drive.files.create({
-          requestBody: {
-            name: payload.folderName,
-            mimeType: "application/vnd.google-apps.folder",
-            parents: payload.folderId ? [payload.folderId] : undefined,
-          },
-          fields: "id",
-        });
-        parentId = folder.data.id ?? payload.folderId;
-      }
-
-      const rawBuf = (m: gmail_v1.Schema$Message) => Buffer.from(m.raw ?? "", "base64url");
-      // Uniform per-file result shape regardless of format, so a single
-      // post-verify pass + buildMutationResult covers both branches below.
-      const produced: { fileId?: string | null; fileName?: string | null; error?: string }[] = [];
-
-      if (payload.format === "mbox") {
-        try {
-          const parts: Buffer[] = [];
-          for (const m of messages) {
-            const raw = rawBuf(m);
-            parts.push(Buffer.from(mboxFromLine(raw.toString("latin1")), "latin1"));
-            parts.push(escapeMboxFrom(raw));
-            parts.push(Buffer.from("\n", "latin1"));
-          }
-          const mbox = Buffer.concat(parts);
-          const subj = decodeMimeWords(headerFromRaw(rawBuf(messages[0]).toString("latin1"), "Subject")) || payload.subject;
-          const res = await g.drive.files.create({
-            requestBody: { name: `${sanitizeName(subj)}.mbox`, parents: parentId ? [parentId] : undefined },
-            media: { mimeType: "application/mbox", body: Readable.from(mbox) },
-            fields: "id,name,webViewLink,size",
-          });
-          produced.push({ fileId: res.data.id, fileName: res.data.name });
-        } catch (e) {
-          produced.push({ error: String(e instanceof Error ? e.message : e) });
-        }
-      } else {
-        // eml_files: one standalone .eml per message.
-        const files = await mapWithLimit(messages, async (m, i) => {
-          try {
-            const buf = rawBuf(m);
-            const raw = buf.toString("latin1");
-            const stamp = dateStamp(headerFromRaw(raw, "Date"));
-            const subj = decodeMimeWords(headerFromRaw(raw, "Subject")) || "no-subject";
-            // Single-message export (scope last/first, or a one-message thread):
-            // no NN_ index prefix, so there's no lone "01_" on a single file.
-            const prefix = messages.length > 1 ? `${String(i + 1).padStart(2, "0")}_` : "";
-            const name = `${prefix}${stamp ? stamp + "_" : ""}${sanitizeName(subj)}.eml`;
-            const res = await g.drive.files.create({
-              requestBody: { name, parents: parentId ? [parentId] : undefined },
-              media: { mimeType: "message/rfc822", body: Readable.from(buf) },
-              fields: "id,name,webViewLink,size",
-            });
-            return { fileId: res.data.id, fileName: res.data.name };
-          } catch (e) {
-            return { error: String(e instanceof Error ? e.message : e) };
-          }
-        });
-        produced.push(...files);
-      }
-
-      const result = await buildMutationResult({
-        results: produced,
-        total: produced.length,
-        verb: "Exported",
-        summaryIcon: "📧",
-        verify: (r) => postVerifyDriveFileExists(g, r.fileId, r.fileName ?? payload.subject),
-        reportTitle: "Независимая проверка экспорта треда",
-        reportSubtitle: "запрошено ⇄ живой Drive",
-        consentStore,
-        auditId,
-        preSnapshot: { threadId: payload.threadId, subject: payload.subject, messageCount: payload.messageCount },
-      });
-      // Fold in the destination folder id, matching the pre-gate response shape.
-      const parsed = JSON.parse((result.content[0] as { text: string }).text);
-      return ok({ ...parsed, folderId: parentId ?? null });
+      return executeExportThreadCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -4308,83 +4712,7 @@ export function registerGmailTools(
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const token = await g.accessToken();
-      const folderId = await ensureUploadFolder(g);
-      const results = await mapWithLimit(payload.files, async ({ name, mimeType, sizeBytes }) => {
-        try {
-          const contentType = mimeType ?? "application/octet-stream";
-          // Create the (empty) file first so its id is known up front — the model
-          // can then write the email without waiting for the bytes to arrive.
-          const placeholder = await g.drive.files.create({
-            requestBody: {
-              name,
-              parents: [folderId],
-              appProperties: { gmailMcpUpload: "1" },
-            },
-            fields: "id",
-          });
-          const fileId = placeholder.data.id;
-          if (!fileId) throw new Error("Drive did not return a file id for the staged upload.");
-
-          const res = await fetch(
-            `${DRIVE_UPLOAD_ENDPOINT}/${encodeURIComponent(fileId)}?uploadType=resumable&fields=id,name,size`,
-            {
-              method: "PATCH",
-              headers: {
-                Authorization: `Bearer ${token}`,
-                "Content-Type": "application/json; charset=UTF-8",
-                "X-Upload-Content-Type": contentType,
-                ...(sizeBytes ? { "X-Upload-Content-Length": String(sizeBytes) } : {}),
-              },
-              body: "{}",
-            },
-          );
-          if (!res.ok) {
-            return { name, error: `Google refused the session (HTTP ${res.status}): ${(await res.text()).slice(0, 500)}` };
-          }
-          const uploadUrl = res.headers.get("location");
-          if (!uploadUrl) {
-            return { name, error: "Google accepted the request but returned no Location header (no session URI)." };
-          }
-          return {
-            name,
-            driveFileId: fileId,
-            uploadUrl,
-            mimeType: contentType,
-            sizeBytes: sizeBytes ?? null,
-            howTo:
-              `PUT ${uploadUrl} with header "Content-Type: ${contentType}"` +
-              (sizeBytes ? ` and "Content-Length: ${sizeBytes}"` : "") +
-              ", body = the raw file bytes.",
-            thenSend: `Attach it with attachments: [{"driveFileId": "${fileId}"}].`,
-          };
-        } catch (e) {
-          return { name, error: String(e instanceof Error ? e.message : e) };
-        }
-      });
-      const result = await buildMutationResult({
-        results,
-        total: payload.files.length,
-        verb: "Opened",
-        summaryIcon: "🚀",
-        // Post-verify only confirms the PLACEHOLDER exists — it can never
-        // confirm the client actually PUT the bytes (that happens later, out
-        // of band); gmail_confirm_upload (unchanged, read-only) is the tool
-        // for that, called out explicitly below so this isn't overclaimed.
-        verify: (r) => postVerifyDriveFileExists(g, r.driveFileId, r.name),
-        reportTitle: "Независимая проверка загрузочных сессий",
-        reportSubtitle: "запрошено ⇄ живой Drive (плейсхолдер; сама загрузка байт клиентом здесь НЕ проверяется)",
-        consentStore,
-        auditId,
-      });
-      const parsed = JSON.parse((result.content[0] as { text: string }).text);
-      return ok({
-        ...parsed,
-        note:
-          "Gmail will only carry the attachment once the client has PUT the bytes — a message sent before that " +
-          "would go out with an empty file. Check with gmail_confirm_upload when in doubt. " +
-          "Gmail caps a whole message at 25 MB.",
-      });
+      return executeUploadSessionCore(g, payload, auditId, consentStore);
     }),
   );
 

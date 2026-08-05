@@ -29,8 +29,12 @@ import {
   claimStaleDecidedApprovals,
 } from "./store.js";
 
-/** Adapts store.ts's module functions to the shape gmail.ts's tools expect. */
-const pgStoreAdapter = {
+/** Adapts store.ts's module functions to the shape gmail.ts's tools expect.
+ * Exported (2026-08-05, auto-execute package) so `http.ts`'s poller can pass
+ * the SAME real adapter into `AutoExecutorCtx.store` for gmail_snooze/
+ * gmail_schedule_send's auto-executors — one adapter, both paths, instead of
+ * a second module-level copy hardwired inside `tools/gmail.ts`. */
+export const pgStoreAdapter = {
   addSnooze: (args: { userToken: string | null; accountName: string; messageId: string; subject?: string; unsnoozeAt: Date }) =>
     addSnooze({
       userToken: args.userToken,

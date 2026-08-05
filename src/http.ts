@@ -13,14 +13,15 @@ import {
   setDefaultAccount,
   renameAccount,
   listApprovedUnexecuted,
+  storeReady,
 } from "./store.js";
 import { renderDashboard } from "./dashboard.js";
 import { initDownloads, resolveDownloadLink } from "./downloads.js";
 import { buildUserClients } from "./accounts.js";
-import { tgApprovalConfig, tgApprovalStoreAdapter, consentStoreAdapter, consentServerConfig } from "./server.js";
+import { tgApprovalConfig, tgApprovalStoreAdapter, consentStoreAdapter, consentServerConfig, pgStoreAdapter } from "./server.js";
 import { handleWebhook, registerWebhook, runApprovalSweep, reportAutoExecutionResult, secretTokenMatches } from "./tg_approval.js";
 import { tryAutoExecute } from "./consent.js";
-import { getAutoExecutor } from "./autoExecute.js";
+import { getAutoExecutor, type AutoExecutorCtx } from "./autoExecute.js";
 
 const JSONRPC_UNAUTHORIZED = {
   jsonrpc: "2.0" as const,
@@ -161,6 +162,18 @@ async function runAutoExecutePoller(config: Config): Promise<void> {
     return;
   }
   const clients = buildUserClients(user);
+  // Один ctx на весь тик — тот же объект уходит и в rehash (для тулов с
+  // настоящим биндингом, которым нужен живой `g`), и в execute, см.
+  // `autoExecute.ts`'s `AutoExecutorCtx` doc-comment. `store` — ТОТ ЖЕ
+  // адаптер, что per-request путь получает как `snoozeCtx.store`
+  // (server.ts's `buildMcpServer`) — `null` ровно когда DATABASE_URL не
+  // настроен, честно как и там.
+  const ctx: AutoExecutorCtx = {
+    clients,
+    consentStore: consentStoreAdapter,
+    userToken: user.token ?? null,
+    store: storeReady() ? pgStoreAdapter : null,
+  };
 
   for (const c of candidates) {
     const executor = getAutoExecutor(c.tool);
@@ -177,9 +190,10 @@ async function runAutoExecutePoller(config: Config): Promise<void> {
         executor.rehash,
         consentStoreAdapter,
         consentServerConfig,
+        ctx,
       );
       if (!result) continue; // гонка/дрейф/истёк — тихо пропускаем, это не ошибка
-      const reportText = await executor.execute(result.payload, result.auditId, { clients, consentStore: consentStoreAdapter });
+      const reportText = await executor.execute(result.payload, result.auditId, ctx);
       await reportAutoExecutionResult(tgApprovalConfig, c.chatId, c.messageId, reportText);
     } catch (err) {
       console.error(`TG auto-execute: ошибка при исполнении ${c.tool}/${c.manifestId}:`, err);

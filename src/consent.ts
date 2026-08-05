@@ -776,11 +776,25 @@ export interface AutoExecuteResult<T = unknown> {
  * должен пройти обычную классификацию `classifyReply` как настоящее «да». */
 export const TG_AUTO_REPLY_MARKER = "[авто: подтверждено кнопкой в Telegram]";
 
-export async function tryAutoExecute<T = unknown>(
+/**
+ * `ctx` (5-й аргумент, генерик `C`) — контекст, нужный тем rehash-функциям,
+ * которые реально сходят за живым состоянием (gmail_reply/forward/labels/…),
+ * а не вырождены в `sha256(addressing)` (gmail_send/create_draft/…) — им
+ * нужен живой клиент Gmail на аккаунт, а его нет в самом `addressing`
+ * (только `account`-метка). Поллер (`http.ts`'s `runAutoExecutePoller`)
+ * строит этот ctx один раз на тик и передаёт его же в `executor.execute`
+ * (см. `autoExecute.ts`'s `AutoExecutorCtx`) — здесь тип оставлен генериком
+ * `unknown` по умолчанию, чтобы `consent.ts` не импортировал `autoExecute.ts`
+ * (циклический импорт: `autoExecute.ts` уже импортирует типы отсюда).
+ * Опционален — старые вызовы (4 аргумента, offline-тесты с rehash без
+ * ctx-параметра) продолжают работать байт-в-байт.
+ */
+export async function tryAutoExecute<T = unknown, C = unknown>(
   candidate: { manifestId: string; tool: string; accountLabel: string },
-  rehash: (addressing: ConsentAddressing) => string | Promise<string>,
+  rehash: (addressing: ConsentAddressing, ctx: C) => string | Promise<string>,
   store: ConsentStore,
   cfg: ConsentConfig,
+  ctx?: C,
 ): Promise<AutoExecuteResult<T> | null> {
   const now = cfg.now ?? Date.now;
 
@@ -796,7 +810,7 @@ export async function tryAutoExecute<T = unknown>(
 
   // Binding — та же проверка, что в requireConsent (4): живой мир не уехал
   // между планом и нажатием кнопки.
-  const currentHash = await rehash(row.payload);
+  const currentHash = await rehash(row.payload, ctx as C);
   if (currentHash !== row.objectHash) {
     return null;
   }
