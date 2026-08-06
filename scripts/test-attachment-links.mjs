@@ -230,10 +230,18 @@ check("plan phase returns a plan, not a result", planText.includes("### 📤 П�
 check("plan phase leaked NO link", !/\/dl\//.test(planText), planText.slice(0, 200));
 // The consent text must describe what actually happens — a person confirms
 // what they understood, so "получить ссылку" would be a lie of omission.
-check("consent text: anyone holding it can download", /скачает файл БЕЗ входа|любой, у кого она/i.test(planText), planText.slice(0, 400));
-check("consent text: cannot be revoked", /отозвать[^.]{0,40}нельзя/i.test(planText), planText.slice(0, 400));
-check("consent text: states how long it lives", /\d+\s*мин/.test(planText), planText.slice(0, 400));
-check("consent text: spells out what the button does", /Кнопка «✅ Подтвердить» означает/.test(planText), planText.slice(-300));
+// Проверяются ОБА места отдельно (плашка-предупреждение И строка про кнопку):
+// одной общей проверки на весь текст мало — вырежи правду из одного места, и
+// она осталась бы во втором, а тест бы этого не заметил.
+const warningBlock = planText.split("\n").find((l) => l.includes("Ссылка — это и есть доступ")) ?? "";
+const buttonLine = planText.split("\n").find((l) => l.includes("Кнопка «✅ Подтвердить» означает")) ?? "";
+check("consent text: есть плашка-предупреждение", warningBlock.length > 0, planText.slice(0, 300));
+check("предупреждение: скачает любой, без входа", /скачает файл БЕЗ входа/i.test(warningBlock), warningBlock);
+check("предупреждение: отозвать нельзя", /Отозвать выданную ссылку нельзя/i.test(warningBlock), warningBlock);
+check("предупреждение: назван срок жизни", /\d+\s*мин/.test(warningBlock), warningBlock);
+check("строка кнопки: сказано, что именно она делает", buttonLine.length > 0, planText.slice(-300));
+check("строка кнопки: отозвать нельзя", /отозвать нельзя/i.test(buttonLine), buttonLine);
+check("строка кнопки: назван срок жизни", /\d+\s*мин/.test(buttonLine), buttonLine);
 
 console.log("\n[3] link for an attachment, metadata looked up automatically");
 out = await planThenExecute("gmail_get_download_url", { items: [{ messageId: "MSG1", attachmentId: "ATT1" }] });
