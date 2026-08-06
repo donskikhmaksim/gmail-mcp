@@ -1564,6 +1564,73 @@ export async function readCappedStream(
   return Buffer.concat(chunks, total);
 }
 
+// ---- allowlist for the resumable-upload session URI -------------------------
+//
+// `gmail_confirm_upload` takes a URL **from the model** and PUTs to it. That is
+// the same SSRF class as the url-attachment path above, but with a much
+// narrower legitimate target: the only address that may ever be probed is a
+// Google Drive resumable-upload session URI — i.e. exactly what
+// `gmail_create_upload_session` handed out (`DRIVE_UPLOAD_ENDPOINT` + the
+// session's own query). This server reads mail, so the URL can easily
+// originate in text written by a stranger; an allowlist (not a blocklist, not
+// a substring test) is the only honest defence here.
+//
+// The expected path prefix is DERIVED from `DRIVE_UPLOAD_ENDPOINT` so the two
+// can never drift apart (`references/security-checklist.md` §2).
+
+const DRIVE_UPLOAD_PATH_PREFIX = new URL(DRIVE_UPLOAD_ENDPOINT).pathname;
+
+/**
+ * Validates a resumable-upload session URI before ANY outbound request.
+ * Every check is structural (`new URL()` parsing) — never a substring match,
+ * which is what lets `https://evil.example.com/googleapis.com/upload` or
+ * `https://googleapis.com.evil.com/x` through a naive filter.
+ *
+ * Refuses: unparseable URLs, any scheme but https, embedded credentials
+ * (`user:pass@`), any port but 443, any host outside `*.googleapis.com`
+ * (exact match on the apex, suffix match on subdomains), and any path outside
+ * the Drive upload endpoint. Throws a 🛑-style refusal; returns the parsed URL
+ * when clean. Exported for tests.
+ */
+export function assertGoogleUploadUrl(raw: string): URL {
+  let url: URL;
+  try {
+    url = new URL(String(raw));
+  } catch {
+    throw new Error("🛑 Адрес загрузочной сессии неразборчив — запрос не отправлен.");
+  }
+  if (url.protocol !== "https:") {
+    throw new Error(
+      `🛑 Адрес загрузочной сессии должен быть https (получено «${url.protocol}») — запрос не отправлен.`,
+    );
+  }
+  if (url.username || url.password) {
+    throw new Error("🛑 Адрес загрузочной сессии содержит логин/пароль — такой адрес отвергнут, запрос не отправлен.");
+  }
+  if (url.port !== "" && url.port !== "443") {
+    throw new Error(
+      `🛑 Адрес загрузочной сессии указывает нестандартный порт (${url.port}) — запрос не отправлен.`,
+    );
+  }
+  // Exact allowlist: the apex itself, or a real subdomain of it. A trailing
+  // dot ("www.googleapis.com.") addresses the same host, so it is stripped
+  // first; everything is compared lowercased.
+  const host = url.hostname.toLowerCase().replace(/\.$/, "");
+  const hostAllowed = host === "googleapis.com" || host === "www.googleapis.com" || host.endsWith(".googleapis.com");
+  if (!hostAllowed) {
+    throw new Error(
+      "🛑 Адрес загрузочной сессии ведёт не на googleapis.com — запрос не отправлен (защита от подмены адреса).",
+    );
+  }
+  const path = url.pathname;
+  if (path !== DRIVE_UPLOAD_PATH_PREFIX && !path.startsWith(`${DRIVE_UPLOAD_PATH_PREFIX}/`)) {
+    throw new Error(
+      `🛑 Адрес загрузочной сессии ведёт не на загрузочный эндпоинт Drive (${DRIVE_UPLOAD_PATH_PREFIX}) — запрос не отправлен.`,
+    );
+  }
+  return url;
+}
+
 /** Resolves attachment inputs (Drive file ids or inline base64) into mail attachments. */
 async function resolveAttachments(
   g: GoogleClients,
@@ -4723,7 +4790,10 @@ export function registerGmailTools(
       description:
         "Ask Google how an upload started by gmail_create_upload_session is doing. Reports `complete` (the file is " +
         "ready to attach), `in_progress` (how many bytes arrived, so the client knows where to resume), or " +
-        "`expired` (session gone — open a new one). Uploads nothing itself.",
+        "`expired` (session gone — open a new one). Uploads nothing itself. " +
+        "Only a Google Drive upload session URI is accepted (https, googleapis.com, the Drive upload path); any " +
+        "other address is refused without a request being made, and the body of an unexpected answer is never " +
+        "echoed back.",
       inputSchema: {
         uploads: z
           .array(
@@ -4739,17 +4809,44 @@ export function registerGmailTools(
           )
           .min(1),
       },
-      annotations: { readOnlyHint: true },
+      // NOT readOnlyHint: this tool makes an outbound request to an address
+      // supplied by the model. Marking it read-only hid it from the gate
+      // coverage test and from the client's permission grouping.
+      annotations: { destructiveHint: false, openWorldHint: true },
     },
     guard(async ({ uploads }) => {
       const results = await mapWithLimit(uploads, async ({ uploadUrl, sizeBytes }) => {
+        // SSRF gate FIRST: an address that is not a Google Drive upload session
+        // URI is refused here, before any socket is opened.
+        let target: URL;
+        try {
+          target = assertGoogleUploadUrl(uploadUrl);
+        } catch (e) {
+          return { uploadUrl, error: e instanceof Error ? e.message : String(e) };
+        }
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
         try {
           // An empty PUT with "bytes */total" asks for status instead of sending
           // content; the session URI carries its own authorisation.
-          const res = await fetch(uploadUrl, {
+          // `redirect: "manual"` — a redirect would move the request to a host
+          // that never passed the check above, so it is refused, not followed.
+          // Note: the normal "keep uploading" answer is 308 WITHOUT a Location
+          // header, so it is unaffected by this.
+          const res = await fetch(target, {
             method: "PUT",
             headers: { "Content-Range": `bytes */${sizeBytes ?? "*"}` },
+            redirect: "manual",
+            signal: ctrl.signal,
           });
+          if (res.status >= 300 && res.status < 400 && res.headers.get("location")) {
+            return {
+              uploadUrl,
+              error:
+                "🛑 Google ответил перенаправлением на другой адрес — сервер за ним не идёт (защита от подмены адреса). " +
+                "Статус загрузки не получен.",
+            };
+          }
           if (res.status === 200 || res.status === 201) {
             let file: { id?: string; name?: string; size?: string } = {};
             try {
@@ -4779,9 +4876,23 @@ export function registerGmailTools(
               error: "Google no longer knows this session (expired, cancelled, or finished long ago). Open a new one.",
             };
           }
-          return { uploadUrl, error: `Unexpected status ${res.status}: ${(await res.text()).slice(0, 500)}` };
+          // The body of an unexpected answer NEVER leaves this server: an
+          // attacker-chosen address (had it passed the allowlist) would turn
+          // this into an exfiltration channel straight into the transcript.
+          // Only the numeric status goes out (security-checklist.md §6).
+          return {
+            uploadUrl,
+            error:
+              `🛑 Неожиданный ответ на проверку загрузки: HTTP ${res.status}. ` +
+              "Тело ответа наружу не передаётся; при повторении — открыть новую загрузочную сессию.",
+          };
         } catch (e) {
-          return { uploadUrl, error: String(e instanceof Error ? e.message : e) };
+          if ((e as { name?: string })?.name === "AbortError") {
+            return { uploadUrl, error: "🛑 Google не ответил вовремя (таймаут) — статус загрузки неизвестен." };
+          }
+          return { uploadUrl, error: "🛑 Не удалось соединиться с Google для проверки загрузки." };
+        } finally {
+          clearTimeout(timer);
         }
       });
       return ok({

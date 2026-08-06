@@ -29,7 +29,7 @@ const calls = [];
 let responder = null;
 
 globalThis.fetch = async (url, init = {}) => {
-  calls.push({ url: String(url), method: init.method, headers: init.headers ?? {}, body: init.body });
+  calls.push({ url: String(url), method: init.method, headers: init.headers ?? {}, body: init.body, redirect: init.redirect });
   return responder(String(url), init);
 };
 
@@ -252,30 +252,34 @@ check("missing Location reported", /no Location header/.test(out.results[0].erro
 // --- 9. confirm -------------------------------------------------------------
 
 console.log("\n[9] confirm upload");
+// The session URI must now survive the allowlist (see scripts/test-confirm-upload-ssrf.mjs
+// for the refusal side) — a bare "https://upload/S1" no longer reaches the network.
+const SESSION_URI = "https://www.googleapis.com/upload/drive/v3/files/STAGED1?uploadType=resumable&upload_id=S1";
 calls.length = 0;
 responder = () => res({ status: 308, headers: { range: "bytes=0-999999" } });
-out = await call("gmail_confirm_upload", { uploads: [{ uploadUrl: "https://upload/S1", sizeBytes: 20_000_000 }] });
+out = await call("gmail_confirm_upload", { uploads: [{ uploadUrl: SESSION_URI, sizeBytes: 20_000_000 }] });
 check("status query is a PUT", calls[0].method === "PUT", calls[0].method);
 check("Content-Range asks for status", calls[0].headers["Content-Range"] === "bytes */20000000", calls[0].headers["Content-Range"]);
-check("status = in_progress", out.results[0].status === "in_progress", out.results[0].status);
+check("redirects are never followed automatically", calls[0].redirect === "manual", String(calls[0].redirect));
+check("status = in_progress (308 without Location still works)", out.results[0].status === "in_progress", out.results[0].status);
 check("bytesReceived = last + 1", out.results[0].bytesReceived === 1_000_000, String(out.results[0].bytesReceived));
 
 responder = () => res({ status: 200, body: JSON.stringify({ id: "STAGED1", name: "holiday.mp4", size: "20000000" }) });
-out = await call("gmail_confirm_upload", { uploads: [{ uploadUrl: "https://upload/S1" }] });
+out = await call("gmail_confirm_upload", { uploads: [{ uploadUrl: SESSION_URI }] });
 check("status = complete", out.results[0].status === "complete", out.results[0].status);
 check("drive file id returned", out.results[0].driveFileId === "STAGED1", String(out.results[0].driveFileId));
 
 responder = () => res({ status: 410, body: "gone" });
-out = await call("gmail_confirm_upload", { uploads: [{ uploadUrl: "https://upload/S1" }] });
+out = await call("gmail_confirm_upload", { uploads: [{ uploadUrl: SESSION_URI }] });
 check("410 → expired", out.results[0].status === "expired", out.results[0].status);
 
 responder = () => {
   throw new Error("socket hang up");
 };
-out = await call("gmail_confirm_upload", { uploads: [{ uploadUrl: "https://upload/A" }, { uploadUrl: "https://upload/B" }] });
+out = await call("gmail_confirm_upload", { uploads: [{ uploadUrl: SESSION_URI }, { uploadUrl: SESSION_URI }] });
 check(
-  "network failure contained per session",
-  out.results.length === 2 && out.results.every((x) => /socket hang up/.test(x.error ?? "")),
+  "network failure contained per session, classified (no raw client error text)",
+  out.results.length === 2 && out.results.every((x) => /Не удалось соединиться/.test(x.error ?? "") && !/socket hang up/.test(x.error ?? "")),
   JSON.stringify(out.results),
 );
 

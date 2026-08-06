@@ -52,6 +52,9 @@ const text = (r) => r.content[0].text;
 const UNGATED_WRITE_ALLOWLIST = {
   gmail_cancel_scheduled_send: "защитное действие (отмена отправки), сознательно вне гейта",
   gmail_get_attachment_text: "по сути read (OCR), Drive-файл временный — надёжный finally-cleanup, не гейт",
+  gmail_confirm_upload:
+    "ничего не мутирует — статус-запрос; исходящий адрес жёстко ограничен allowlist'ом " +
+    "(assertGoogleUploadUrl: только https://*.googleapis.com + путь Drive-upload), тело ответа наружу не идёт",
 };
 
 /** Every tool the gate covers (A3's 4 send tools + T1's 11 priority-2 tools),
@@ -293,7 +296,7 @@ for (const [name, spec] of Object.entries(GATED_TOOLS)) {
 }
 
 console.log("\n[5] read tools genuinely carry readOnlyHint (spot-check, not exhaustive)");
-for (const name of ["gmail_list_scheduled_sends", "gmail_get_download_url", "gmail_confirm_upload", "list_accounts"]) {
+for (const name of ["gmail_list_scheduled_sends", "gmail_get_download_url", "gmail_list_labels", "list_accounts"]) {
   const t = tools.find((x) => x.name === name);
   check(`${name} readOnlyHint: true`, t?.annotations?.readOnlyHint === true, JSON.stringify(t?.annotations));
 }
