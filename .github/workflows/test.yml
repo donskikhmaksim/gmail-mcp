@@ -1,0 +1,27 @@
+name: Typecheck and tests
+
+# The gate-coverage test (scripts/test-gate-coverage.mjs) is what stops a write
+# tool from shipping without a consent gate — but until now nothing ran it in
+# CI, so it only ever failed on someone's laptop. Same for the SSRF and
+# consent-gate suites. Everything below is offline: no network beyond loopback,
+# no secrets, no database (Google/Telegram clients and `fetch` are stubbed,
+# Postgres is a fake in-memory store) — verified by running the whole suite
+# with external DNS/TCP blocked.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

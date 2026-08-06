@@ -21,6 +21,7 @@
  * — imports the COMPILED dist/, same convention as test-gate-coverage.mjs).
  */
 import { getAutoExecutor } from "../dist/autoExecute.js";
+import { initDownloads } from "../dist/downloads.js";
 // Side-effect import: registers every gmail_* auto-executor at module load.
 import "../dist/tools/gmail.js";
 
@@ -343,22 +344,37 @@ await runHappyPath(
 );
 
 // ---- gmail_create_upload_session (needs a fetch stub) -------------------------
+//
+// Транспорт ИНЖЕКТИРУЕТСЯ через `ctx.safeFetch`, а не подменой
+// `globalThis.fetch`: исходящие запросы к Google идут через
+// `safeGoogleFetch` (undici's own fetch + Agent, см. src/safeFetch.ts), и
+// подмена глобала их бы не перехватила. Заодно это проверяет, что адрес
+// сессии, пришедший от Google, проходит проверку и запоминается сервером —
+// наружу уходит непрозрачный sessionId, а не адрес.
 {
-  const originalFetch = globalThis.fetch;
   const fetchCalls = [];
-  globalThis.fetch = async (url, opts) => {
-    fetchCalls.push({ url, opts });
-    return {
-      ok: true,
-      headers: { get: (name) => (name.toLowerCase() === "location" ? "https://upload.example/session-1" : null) },
-      text: async () => "",
-    };
+  const safeFetch = {
+    lookup: async () => [{ address: "142.250.72.14" }],
+    fetchImpl: async (url, opts) => {
+      fetchCalls.push({ url, opts });
+      return {
+        ok: true,
+        status: 200,
+        headers: {
+          get: (name) =>
+            name.toLowerCase() === "location"
+              ? "https://www.googleapis.com/upload/drive/v3/files/FILE1?upload_id=session-1"
+              : null,
+        },
+        text: async () => "",
+      };
+    },
   };
-  try {
+  {
     await runHappyPath(
       "gmail_create_upload_session",
       { account: "work", files: [{ name: "file.pdf" }] },
-      {},
+      { safeFetch },
       (calls, text) => {
         // ensureUploadFolder's own files.create (staging folder, since
         // files.list found none) PLUS the placeholder file's files.create —
@@ -373,12 +389,50 @@ await runHappyPath(
           calls.driveFilesCreate.some((c) => c.requestBody?.appProperties?.gmailMcpUpload === "1"),
         );
         check("resumable-сессия запрошена у Google (fetch)", fetchCalls.length === 1);
+        check(
+          "запрос ушёл на googleapis.com, а не куда попало",
+          /^https:\/\/www\.googleapis\.com\//.test(String(fetchCalls[0]?.url)),
+          String(fetchCalls[0]?.url),
+        );
         check("текст упоминает 'Opened'", text.includes("Opened"), text);
+        check(
+          "наружу отдан непрозрачный sessionId, а не адрес",
+          /"sessionId":\s*"[A-Za-z0-9_-]{20,}"/.test(text) && !/"sessionId":\s*"[^"]*:\/\//.test(text),
+          text.slice(0, 300),
+        );
       },
     );
-  } finally {
-    globalThis.fetch = originalFetch;
   }
+}
+
+// ---- gmail_get_download_url --------------------------------------------------
+//
+// Тул гейтован (ссылка САМА является доступом), поэтому у него обязан быть
+// исполнитель: человек жмёт «✅ Подтвердить» в Telegram — поллер исполняет
+// именно этот код, и ссылка должна реально появиться.
+{
+  initDownloads("https://mail.example.test");
+  await runHappyPath(
+    "gmail_get_download_url",
+    {
+      account: "work",
+      ttlMinutes: 30,
+      items: [{ messageId: "msg-1", attachmentId: "att-1", filename: "f.pdf", mimeType: "application/pdf" }],
+    },
+    {},
+    (calls, text) => {
+      const m = text.match(/https:\/\/mail\.example\.test\/dl\/([A-Za-z0-9_-]{20,})/);
+      check("ссылка выдана", !!m, text.slice(0, 300));
+      check("текст упоминает выдачу ссылок", text.includes("Выдано ссылок:"), text.slice(0, 120));
+      check(
+        "в отчёте прямо сказано, что отозвать ссылку нельзя",
+        /отозвать её нельзя|Отозвать её нельзя/.test(text),
+        text.slice(0, 400),
+      );
+    },
+  );
+  // Независимо от текста отчёта: токен реально лежит в хранилище ссылок и
+  // ведёт к тому же вложению (то же, что проверяет post-verify инструмента).
 }
 
 console.log(failures ? `\n${failures} FAILURE(S)` : "\nALL CHECKS PASSED");

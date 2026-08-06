@@ -3,10 +3,24 @@
  * Offline check of gmail_get_download_url, gmail_create_upload_session and
  * gmail_confirm_upload.
  *
- * Google is never contacted: the Gmail/Drive clients are stubbed and `fetch` is
- * replaced, so we can assert on the exact upload handshake we send. No
- * credentials, no network, no database — without one, downloads.ts keeps links
- * in memory, which is the path exercised here.
+ * Google is never contacted: the Gmail/Drive clients are stubbed and the
+ * outbound HTTP transport is INJECTED (`safeFetch` in the registration
+ * context — production never passes it), so we can assert on the exact upload
+ * handshake we send. No credentials, no network, no database — without one,
+ * downloads.ts/uploadSessions.ts keep records in memory, which is the path
+ * exercised here.
+ *
+ * ЧТО ЗДЕСЬ ЗАКРЫВАЕТСЯ ПОМИМО СТАРОГО ПОВЕДЕНИЯ (две дыры, найденные
+ * аудитом):
+ *  - `gmail_get_download_url` больше НЕ «только чтение»: ссылка сама является
+ *    доступом (кто её получил — скачает вложение без входа, отозвать нельзя),
+ *    поэтому тул проведён через гейт подтверждения. Блок [3a] проверяет, что
+ *    ФАЗА ПЛАНА не выдаёт ни одной ссылки, а текст над кнопкой говорит
+ *    правду: «скачает любой», «отозвать нельзя», конкретный срок.
+ *  - `gmail_confirm_upload` больше НЕ принимает адрес аргументом: он получает
+ *    непрозрачный `sessionId`, а реальный адрес берёт из своего хранилища —
+ *    подделать «сходи на 169.254.169.254» через аргумент физически нечем
+ *    (блок [9a]).
  *
  * Usage:
  *   npm test                             # builds, then runs this
@@ -28,10 +42,21 @@ import {
 const calls = [];
 let responder = null;
 
-globalThis.fetch = async (url, init = {}) => {
-  calls.push({ url: String(url), method: init.method, headers: init.headers ?? {}, body: init.body });
+/** Injected transport: replaces the real undici fetch inside safeGoogleFetch. */
+const fetchImpl = async (url, init = {}) => {
+  calls.push({
+    url: String(url),
+    method: init.method,
+    headers: init.headers ?? {},
+    body: init.body,
+    redirect: init.redirect,
+  });
   return responder(String(url), init);
 };
+/** Injected resolver: googleapis.com "resolves" to a public address, so the
+ * private-address guard passes without touching real DNS. */
+const lookup = async () => [{ address: "142.250.72.1" }];
+const safeFetch = { fetchImpl, lookup };
 
 function res({ status = 200, headers = {}, body = "" }) {
   return {
@@ -43,11 +68,19 @@ function res({ status = 200, headers = {}, body = "" }) {
   };
 }
 
+/** Session URIs Google really hands back live on googleapis.com — the guard in
+ * src/safeFetch.ts only accepts those, so the stubs use realistic ones. */
+const SESSION_URI = (id) => `https://www.googleapis.com/upload/drive/v3/files/STAGED1?upload_id=${id}`;
+
 // A message with one attachment, as Gmail would describe it.
 const MESSAGE = {
   id: "MSG1",
   payload: {
     mimeType: "multipart/mixed",
+    headers: [
+      { name: "From", value: "eric@x.com" },
+      { name: "Subject", value: "Договор" },
+    ],
     parts: [
       { mimeType: "text/plain", body: { size: 12 } },
       { filename: "Договор №7.pdf", mimeType: "application/pdf", body: { attachmentId: "ATT1", size: 3_500_000 } },
@@ -87,6 +120,7 @@ const fakeClients = {
           const isFolder = args.requestBody?.mimeType === "application/vnd.google-apps.folder";
           return { data: { id: isFolder ? "FOLDER1" : "STAGED1" } };
         },
+        get: async ({ fileId }) => ({ data: { id: fileId, name: "staged", trashed: false } }),
       },
     },
     docs: {},
@@ -95,10 +129,10 @@ const fakeClients = {
   baseGmailQuery: () => "",
 };
 
-// gmail_create_upload_session is consent-gated (package T1) — a minimal fake
-// ConsentStore + a controllable clock, same shape as scripts/test-a3-gate.mjs,
-// so this pre-existing single-call-style test can drive the two-phase
-// plan→execute flow instead of expecting an immediate mutation.
+// gmail_create_upload_session AND gmail_get_download_url are consent-gated — a
+// minimal fake ConsentStore + a controllable clock, same shape as
+// scripts/test-a3-gate.mjs, so these single-call-style tests can drive the
+// two-phase plan→execute flow.
 const clock = { t: 1_700_000_000_000 };
 function makeConsentStore() {
   const manifests = new Map();
@@ -133,7 +167,13 @@ function makeConsentStore() {
 const consentCfg = { server: "gmail", consentTtlMs: 3_600_000, minConsentGapMs: 5_000, sendBatchMax: 10, now: () => clock.t };
 
 const server = new McpServer({ name: "gmail-mcp-test", version: "0" });
-registerGmailTools(server, fakeClients, { store: null, userToken: null, consentStore: makeConsentStore(), consentCfg });
+registerGmailTools(server, fakeClients, {
+  store: null,
+  userToken: null,
+  consentStore: makeConsentStore(),
+  consentCfg,
+  safeFetch,
+});
 const client = new Client({ name: "test-client", version: "0" });
 const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
 await Promise.all([server.connect(serverSide), client.connect(clientSide)]);
@@ -141,9 +181,9 @@ await Promise.all([server.connect(serverSide), client.connect(clientSide)]);
 const raw = async (name, args) => client.callTool({ name, arguments: args });
 const call = async (name, args) => JSON.parse((await raw(name, args)).content[0].text);
 
-/** Drives gmail_create_upload_session's plan→execute flow in one call, for
- * tests that only care about the mutation's outcome (the gate mechanics
- * themselves are covered by scripts/test-t1-gate.mjs). */
+/** Drives a gated tool's plan→execute flow in one call, for tests that only
+ * care about the mutation's outcome (the gate mechanics themselves are covered
+ * by scripts/test-t1-gate.mjs). Returns the parsed execute-call result. */
 async function planThenExecute(name, args) {
   const planResp = await raw(name, args);
   const planText = planResp.content[0].text;
@@ -162,7 +202,8 @@ const check = (label, cond, extra = "") => {
 // --- 1. registration --------------------------------------------------------
 
 console.log("\n[1] tool registration");
-const names = (await client.listTools()).tools.map((t) => t.name);
+const tools = (await client.listTools()).tools;
+const names = tools.map((t) => t.name);
 for (const t of ["gmail_get_download_url", "gmail_create_upload_session", "gmail_confirm_upload"]) {
   check(`${t} registered`, names.includes(t));
 }
@@ -175,15 +216,60 @@ check("downloadsAvailable() is false", downloadsAvailable() === false);
 let out = await raw("gmail_get_download_url", { items: [{ messageId: "MSG1", attachmentId: "ATT1" }] });
 check("tool refuses with a clear error", out.isError === true && /PUBLIC_BASE_URL/.test(out.content[0].text), out.content[0].text);
 
-console.log("\n[3] link for an attachment, metadata looked up automatically");
+// ── [3a] THE GATE ITSELF: a plan call issues nothing, and says so honestly ──
+console.log("\n[3a] gmail_get_download_url is gated — the plan call hands out NO link");
 initDownloads("https://mail.example.com/");
-out = await call("gmail_get_download_url", { items: [{ messageId: "MSG1", attachmentId: "ATT1" }] });
+const dl = tools.find((t) => t.name === "gmail_get_download_url");
+check("NOT advertised as read-only (the link IS access, not a read)", dl?.annotations?.readOnlyHint !== true, JSON.stringify(dl?.annotations));
+check("schema exposes manifest_id", "manifest_id" in (dl?.inputSchema?.properties ?? {}), JSON.stringify(Object.keys(dl?.inputSchema?.properties ?? {})));
+check("schema exposes user_reply", "user_reply" in (dl?.inputSchema?.properties ?? {}), JSON.stringify(Object.keys(dl?.inputSchema?.properties ?? {})));
+
+const planResp = await raw("gmail_get_download_url", { items: [{ messageId: "MSG1", attachmentId: "ATT1" }] });
+const planText = planResp.content[0].text;
+check("plan phase returns a plan, not a result", planText.includes("### 📤 План"), planText.slice(0, 60));
+check("plan phase leaked NO link", !/\/dl\//.test(planText), planText.slice(0, 200));
+// The consent text must describe what actually happens — a person confirms
+// what they understood, so "получить ссылку" would be a lie of omission.
+// Проверяются ОБА места отдельно (плашка-предупреждение И строка про кнопку):
+// одной общей проверки на весь текст мало — вырежи правду из одного места, и
+// она осталась бы во втором, а тест бы этого не заметил.
+const warningBlock = planText.split("\n").find((l) => l.includes("Ссылка — это и есть доступ")) ?? "";
+const buttonLine = planText.split("\n").find((l) => l.includes("Кнопка «✅ Подтвердить» означает")) ?? "";
+check("consent text: есть плашка-предупреждение", warningBlock.length > 0, planText.slice(0, 300));
+check("предупреждение: скачает любой, без входа", /скачает файл БЕЗ входа/i.test(warningBlock), warningBlock);
+check("предупреждение: отозвать нельзя", /Отозвать выданную ссылку нельзя/i.test(warningBlock), warningBlock);
+check("предупреждение: назван срок жизни", /\d+\s*мин/.test(warningBlock), warningBlock);
+check("строка кнопки: сказано, что именно она делает", buttonLine.length > 0, planText.slice(-300));
+check("строка кнопки: отозвать нельзя", /отозвать нельзя/i.test(buttonLine), buttonLine);
+check("строка кнопки: назван срок жизни", /\d+\s*мин/.test(buttonLine), buttonLine);
+
+// Превью должно называть файл ЖИВЫМ именем из письма. Иначе согласие можно
+// получить под подменённым именем: модель показывает человеку «invoice.pdf»,
+// а ссылка ведёт на «Договор №7.pdf». Имя от вызывающего показывается, но
+// отдельной пометкой — как то, под каким именем файл будет отдан.
+{
+  const renamed = (
+    await raw("gmail_get_download_url", {
+      items: [{ messageId: "MSG1", attachmentId: "ATT1", filename: "invoice.pdf" }],
+    })
+  ).content[0].text;
+  check("превью называет ЖИВОЕ имя вложения из письма", /Договор №7\.pdf/.test(renamed), renamed.slice(0, 300));
+  check(
+    "подставленное вызывающим имя не выдаётся за настоящее",
+    /будет отдан под именем «invoice\.pdf»/.test(renamed),
+    renamed.slice(0, 400),
+  );
+}
+
+console.log("\n[3] link for an attachment, metadata looked up automatically");
+out = await planThenExecute("gmail_get_download_url", { items: [{ messageId: "MSG1", attachmentId: "ATT1" }] });
 let r = out.results[0];
 check("link points at /dl/<token>", /^https:\/\/mail\.example\.com\/dl\/[A-Za-z0-9_-]{20,}$/.test(r.downloadUrl), r.downloadUrl);
 check("filename pulled from the message", r.filename === "Договор №7.pdf", r.filename);
 check("mime pulled from the message", r.mimeType === "application/pdf", r.mimeType);
 check("size pulled from the message", r.bytes === 3_500_000, String(r.bytes));
 check("expiry is in the future", new Date(r.expiresAt).getTime() > Date.now(), String(r.expiresAt));
+check("post-verify report attached", /Независимая проверка выданных ссылок/.test(JSON.stringify(out)), JSON.stringify(out).slice(0, 200));
 
 const target = await resolveDownloadLink(r.downloadUrl.split("/dl/")[1]);
 check("token resolves to that message + attachment", target?.messageId === "MSG1" && target?.attachmentId === "ATT1", JSON.stringify(target));
@@ -191,20 +277,20 @@ check("account recorded for later resolution", target?.account === "personal", S
 check("unknown token resolves to null", (await resolveDownloadLink("nope")) === null);
 
 console.log("\n[4] caller-supplied name wins, no message lookup needed");
-out = await call("gmail_get_download_url", {
+out = await planThenExecute("gmail_get_download_url", {
   items: [{ messageId: "MSG404", attachmentId: "ATT1", filename: "custom.bin", mimeType: "application/octet-stream" }],
 });
 check("no error despite an unknown message id", out.results[0].error === undefined, JSON.stringify(out.results[0]));
 check("supplied filename used", out.results[0].filename === "custom.bin", out.results[0].filename);
 
 console.log("\n[5] failures are per item, and TTL is clamped");
-out = await call("gmail_get_download_url", {
+out = await planThenExecute("gmail_get_download_url", {
   items: [{ messageId: "MSG1", attachmentId: "ATT1" }, { messageId: "GHOST", attachmentId: "ATT9" }],
 });
 check("good item still got a link", typeof out.results[0].downloadUrl === "string", JSON.stringify(out.results[0]));
 check("bad item reports its own error", /Message not found/.test(out.results[1].error ?? ""), JSON.stringify(out.results[1]));
 check("no link leaked for the bad item", out.results[1].downloadUrl === undefined);
-out = await call("gmail_get_download_url", { items: [{ messageId: "MSG1", attachmentId: "ATT1" }], ttlMinutes: MAX_TTL_MINUTES });
+out = await planThenExecute("gmail_get_download_url", { items: [{ messageId: "MSG1", attachmentId: "ATT1" }], ttlMinutes: MAX_TTL_MINUTES });
 const minutes = (new Date(out.results[0].expiresAt).getTime() - Date.now()) / 60000;
 check("max TTL honoured", Math.round(minutes) <= MAX_TTL_MINUTES, String(minutes));
 
@@ -214,7 +300,7 @@ console.log("\n[6] upload session — staging folder created on first use");
 driveCalls.length = 0;
 calls.length = 0;
 folderListResult = { data: { files: [] } };
-responder = () => res({ status: 200, headers: { location: "https://upload.googleapis.com/?upload_id=S1" } });
+responder = () => res({ status: 200, headers: { location: SESSION_URI("S1") } });
 out = await planThenExecute("gmail_create_upload_session", {
   files: [{ name: "holiday.mp4", mimeType: "video/mp4", sizeBytes: 20_000_000 }],
 });
@@ -224,11 +310,15 @@ check("created the staging folder", driveCalls[1].op === "create" && driveCalls[
 check("placeholder created inside it", driveCalls[2].args.requestBody.parents?.[0] === "FOLDER1", JSON.stringify(driveCalls[2]?.args?.requestBody));
 check("placeholder marked as ours", driveCalls[2].args.requestBody.appProperties?.gmailMcpUpload === "1", JSON.stringify(driveCalls[2]?.args?.requestBody?.appProperties));
 check("file id returned before any bytes arrive", r.driveFileId === "STAGED1", String(r.driveFileId));
-check("uploadUrl returned", r.uploadUrl.includes("upload_id=S1"), r.uploadUrl);
+check("uploadUrl returned to the caller (client PUTs the bytes there)", r.uploadUrl.includes("upload_id=S1"), r.uploadUrl);
+check("opaque sessionId returned alongside it", typeof r.sessionId === "string" && r.sessionId.length >= 20, String(r.sessionId));
+check("sessionId is NOT the address", !String(r.sessionId).includes("://"), String(r.sessionId));
+check("howTo points at sessionId, not the URL", /sessionId/.test(r.howTo ?? ""), String(r.howTo));
 check("session opened with PATCH on the placeholder", calls[0].method === "PATCH" && calls[0].url.includes("/files/STAGED1"), `${calls[0].method} ${calls[0].url}`);
 check("X-Upload-Content-Type", calls[0].headers["X-Upload-Content-Type"] === "video/mp4", calls[0].headers["X-Upload-Content-Type"]);
 check("X-Upload-Content-Length", calls[0].headers["X-Upload-Content-Length"] === "20000000", calls[0].headers["X-Upload-Content-Length"]);
 check("bearer token attached", calls[0].headers.Authorization === "Bearer ya29.FAKE", calls[0].headers.Authorization);
+check("redirects are never followed blindly (redirect: manual)", calls[0].redirect === "manual", String(calls[0].redirect));
 check("tells the model how to attach it", r.thenSend.includes('"driveFileId": "STAGED1"'), r.thenSend);
 
 console.log("\n[7] upload session — existing folder reused, defaults applied");
@@ -249,35 +339,96 @@ responder = () => res({ status: 200 });
 out = await planThenExecute("gmail_create_upload_session", { files: [{ name: "x.bin" }] });
 check("missing Location reported", /no Location header/.test(out.results[0].error ?? ""), JSON.stringify(out.results[0]));
 
+console.log("\n[8b] upload session — Location points somewhere it must not");
+for (const bad of ["http://169.254.169.254/latest/meta-data/", "http://127.0.0.1:1/x", "https://evil.example/x"]) {
+  responder = () => res({ status: 200, headers: { location: bad } });
+  out = await planThenExecute("gmail_create_upload_session", { files: [{ name: "x.bin" }] });
+  check(`Location ${bad} refused`, /недопустимый адрес/.test(out.results[0].error ?? ""), JSON.stringify(out.results[0]));
+  check(`Location ${bad}: no sessionId handed out`, out.results[0].sessionId === undefined, String(out.results[0].sessionId));
+}
+
+/** Opens one session through the gate and returns its opaque sessionId. */
+async function newSession(name = "file.bin", id = "S-DEFAULT") {
+  responder = () => res({ status: 200, headers: { location: SESSION_URI(id) } });
+  const o = await planThenExecute("gmail_create_upload_session", { files: [{ name }] });
+  const sid = o.results[0].sessionId;
+  if (!sid) throw new Error(`no sessionId in ${JSON.stringify(o.results[0])}`);
+  return sid;
+}
+
 // --- 9. confirm -------------------------------------------------------------
 
-console.log("\n[9] confirm upload");
+console.log("\n[9] confirm upload — addressed by the opaque sessionId");
+const s1 = await newSession("holiday.mp4", "S1");
 calls.length = 0;
 responder = () => res({ status: 308, headers: { range: "bytes=0-999999" } });
-out = await call("gmail_confirm_upload", { uploads: [{ uploadUrl: "https://upload/S1", sizeBytes: 20_000_000 }] });
+out = await call("gmail_confirm_upload", { uploads: [{ sessionId: s1, sizeBytes: 20_000_000 }] });
 check("status query is a PUT", calls[0].method === "PUT", calls[0].method);
+check("goes to the address the SERVER stored, not one from the model", calls[0].url.includes("upload_id=S1"), calls[0].url);
 check("Content-Range asks for status", calls[0].headers["Content-Range"] === "bytes */20000000", calls[0].headers["Content-Range"]);
 check("status = in_progress", out.results[0].status === "in_progress", out.results[0].status);
 check("bytesReceived = last + 1", out.results[0].bytesReceived === 1_000_000, String(out.results[0].bytesReceived));
+check("result is addressed by sessionId, the URL is not echoed back", out.results[0].sessionId === s1 && out.results[0].uploadUrl === undefined, JSON.stringify(out.results[0]));
 
+// ── [9a] THE SSRF FIX: an address from the model is not accepted at all ─────
+console.log("\n[9a] gmail_confirm_upload refuses to take an ADDRESS from the model");
+const confirm = tools.find((t) => t.name === "gmail_confirm_upload");
+const uploadProps = confirm?.inputSchema?.properties?.uploads?.items?.properties ?? {};
+check("schema has NO uploadUrl field at all", !("uploadUrl" in uploadProps), JSON.stringify(Object.keys(uploadProps)));
+check("schema takes sessionId instead", "sessionId" in uploadProps, JSON.stringify(Object.keys(uploadProps)));
+calls.length = 0;
+const badCall = await raw("gmail_confirm_upload", { uploads: [{ uploadUrl: "http://169.254.169.254/latest/meta-data/" }] });
+check("call carrying only uploadUrl is rejected outright", badCall.isError === true, JSON.stringify(badCall).slice(0, 200));
+check("…and nothing was fetched", calls.length === 0, String(calls.length));
+calls.length = 0;
+out = await call("gmail_confirm_upload", { uploads: [{ sessionId: "http://169.254.169.254/latest/meta-data/" }] });
+check("an ADDRESS passed as a sessionId is just an unknown session", /не найдена/.test(out.results[0].error ?? ""), JSON.stringify(out.results[0]));
+check("…and still nothing was fetched", calls.length === 0, String(calls.length));
+
+console.log("\n[10] confirm upload — finished / expired / network failure");
+const s2 = await newSession("holiday.mp4", "S2");
 responder = () => res({ status: 200, body: JSON.stringify({ id: "STAGED1", name: "holiday.mp4", size: "20000000" }) });
-out = await call("gmail_confirm_upload", { uploads: [{ uploadUrl: "https://upload/S1" }] });
+out = await call("gmail_confirm_upload", { uploads: [{ sessionId: s2 }] });
 check("status = complete", out.results[0].status === "complete", out.results[0].status);
 check("drive file id returned", out.results[0].driveFileId === "STAGED1", String(out.results[0].driveFileId));
 
+const s3 = await newSession("holiday.mp4", "S3");
 responder = () => res({ status: 410, body: "gone" });
-out = await call("gmail_confirm_upload", { uploads: [{ uploadUrl: "https://upload/S1" }] });
+out = await call("gmail_confirm_upload", { uploads: [{ sessionId: s3 }] });
 check("410 → expired", out.results[0].status === "expired", out.results[0].status);
 
+const s4 = await newSession("a.bin", "S4");
+const s5 = await newSession("b.bin", "S5");
 responder = () => {
   throw new Error("socket hang up");
 };
-out = await call("gmail_confirm_upload", { uploads: [{ uploadUrl: "https://upload/A" }, { uploadUrl: "https://upload/B" }] });
+out = await call("gmail_confirm_upload", { uploads: [{ sessionId: s4 }, { sessionId: s5 }] });
 check(
   "network failure contained per session",
   out.results.length === 2 && out.results.every((x) => /socket hang up/.test(x.error ?? "")),
   JSON.stringify(out.results),
 );
+
+console.log("\n[10a] тело неожиданного ответа наружу не уходит");
+{
+  const s6 = await newSession("c.bin", "S6");
+  let bodyRead = false;
+  responder = () => ({
+    ok: false,
+    status: 500,
+    headers: { get: () => null },
+    text: async () => {
+      bodyRead = true;
+      return "SUPER-SECRET-INTERNAL-BODY";
+    },
+  });
+  const resp = await raw("gmail_confirm_upload", { uploads: [{ sessionId: s6 }] });
+  const whole = resp.content[0].text;
+  out = JSON.parse(whole);
+  check("тела ответа нет во всём результате инструмента", !whole.includes("SUPER-SECRET-INTERNAL-BODY"), whole.slice(0, 200));
+  check("номер статуса всё же сообщён", /500/.test(out.results[0].error ?? ""), JSON.stringify(out.results[0]));
+  check("тело даже не читалось", bodyRead === false, String(bodyRead));
+}
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);

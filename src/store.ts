@@ -120,6 +120,24 @@ export async function ensureSchema(): Promise<void> {
       created_at    TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  // Resumable-upload session URIs Google handed THIS server (see
+  // uploadSessions.ts). Kept server-side precisely so the address never has to
+  // come back IN from a tool argument — gmail_confirm_upload takes an opaque
+  // `sessionId` and looks the real address up here. Rows are disposable: a
+  // Drive session dies after ~a week anyway.
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS upload_sessions (
+      id            TEXT PRIMARY KEY,
+      account       TEXT NOT NULL,
+      upload_url    TEXT NOT NULL,
+      drive_file_id TEXT,
+      name          TEXT,
+      mime_type     TEXT NOT NULL,
+      size_bytes    BIGINT,
+      expires_at    BIGINT NOT NULL,
+      created_at    TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
   // gmail_snooze: archived now, waiting to be un-archived at wake_at. user_token
   // is nullable — onboarded (native-OAuth) deployments have no static per-user
   // token, only an account_label, which is always present and is what the
@@ -284,6 +302,53 @@ export async function getDownloadToken(token: string): Promise<DownloadTarget | 
     name: row.name,
     mimeType: row.mime_type,
     size: row.size === null ? undefined : Number(row.size),
+    expiresAt: Number(row.expires_at),
+  };
+}
+
+// ---- Resumable upload sessions ----
+
+/** One resumable-upload session as THIS server remembers it. `uploadUrl` is
+ * the address Google itself handed back; it is deliberately never accepted
+ * from a tool argument (see uploadSessions.ts). */
+export interface UploadSessionRecord {
+  account: string;
+  uploadUrl: string;
+  /** The staged Drive placeholder the bytes are being PATCHed into. */
+  driveFileId: string | null;
+  name: string | null;
+  mimeType: string;
+  sizeBytes: number | null;
+  expiresAt: number;
+}
+
+export async function saveUploadSession(id: string, s: UploadSessionRecord): Promise<void> {
+  const p = getPool();
+  // Opportunistic cleanup — an expired session URI is worthless to anyone.
+  await p.query(`DELETE FROM upload_sessions WHERE expires_at < $1`, [Date.now()]);
+  await p.query(
+    `INSERT INTO upload_sessions (id, account, upload_url, drive_file_id, name, mime_type, size_bytes, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [id, s.account, s.uploadUrl, s.driveFileId, s.name, s.mimeType, s.sizeBytes, s.expiresAt],
+  );
+}
+
+/** Returns a still-valid session, or null when unknown/expired. */
+export async function getUploadSession(id: string): Promise<UploadSessionRecord | null> {
+  const p = getPool();
+  const res = await p.query(`SELECT * FROM upload_sessions WHERE id = $1 AND expires_at > $2`, [
+    id,
+    Date.now(),
+  ]);
+  if (!res.rows.length) return null;
+  const row = res.rows[0];
+  return {
+    account: row.account,
+    uploadUrl: row.upload_url,
+    driveFileId: row.drive_file_id ?? null,
+    name: row.name ?? null,
+    mimeType: row.mime_type,
+    sizeBytes: row.size_bytes === null ? null : Number(row.size_bytes),
     expiresAt: Number(row.expires_at),
   };
 }

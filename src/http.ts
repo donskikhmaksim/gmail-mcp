@@ -278,6 +278,23 @@ export async function startHttpServer(config: Config): Promise<void> {
       res.status(404).type("text/plain").send("This download link is invalid or has expired.");
       return;
     }
+    // Safety headers are set HERE — as soon as the token resolves, before any
+    // outbound call — so they hold on every exit path below, not just the
+    // happy one. All four depend only on `target`, never on the bytes.
+    //
+    // `Content-Disposition: attachment` already stops the browser from
+    // rendering an HTML attachment when the link is opened directly. `nosniff`
+    // closes what it does NOT cover: nothing stops a third-party page from
+    // pulling this URL in as a SUBRESOURCE (<script src>, <object>, <embed>),
+    // where the browser is free to sniff the bytes and execute them as the
+    // type it guessed — on this server's own origin. Second line of defence
+    // (an attacker needs the secret link first), but it is one header.
+    res.setHeader("Content-Type", target.mimeType);
+    res.setHeader("Content-Disposition", contentDisposition(target.name));
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    // The link is a secret; keep proxies and shared caches out of it.
+    res.setHeader("Cache-Control", "private, no-store");
+
     const user = (await userFromGoogleAccounts(config)) ?? config.users[0] ?? null;
     if (!user) {
       res.status(503).type("text/plain").send("No Google account is linked to this server any more.");
@@ -293,11 +310,7 @@ export async function startHttpServer(config: Config): Promise<void> {
         id: target.attachmentId,
       });
       const buf = Buffer.from(att.data.data ?? "", "base64url");
-      res.setHeader("Content-Type", target.mimeType);
-      res.setHeader("Content-Disposition", contentDisposition(target.name));
       res.setHeader("Content-Length", String(buf.length));
-      // The link is a secret; keep proxies and shared caches out of it.
-      res.setHeader("Cache-Control", "private, no-store");
       res.end(buf);
     } catch (err) {
       console.error("Attachment download error:", err);

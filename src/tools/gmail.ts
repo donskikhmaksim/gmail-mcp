@@ -25,10 +25,19 @@ import {
 } from "../consent.js";
 import {
   issueDownloadLink,
+  resolveDownloadLink,
   downloadsAvailable,
   DEFAULT_TTL_MINUTES,
   MAX_TTL_MINUTES,
 } from "../downloads.js";
+import { rememberUploadSession, resolveUploadSession } from "../uploadSessions.js";
+import {
+  safeGoogleFetch,
+  assertAllowedGoogleUrl,
+  isBlockedIp,
+  pinnedLookup,
+  type SafeFetchDeps,
+} from "../safeFetch.js";
 import { registerAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 interface PgStore {
@@ -1311,45 +1320,15 @@ const defaultLookup: LookupFn = (host) => dns.lookup(host, { all: true });
 
 /**
  * True when an IP literal is loopback / private / link-local / reserved /
- * multicast — i.e. NOT a public destination. Covers both IPv4 and IPv6
- * (including IPv4-mapped IPv6 like ::ffff:169.254.169.254). Exported for tests.
+ * multicast — i.e. NOT a public destination.
+ *
+ * ЕДИНСТВЕННАЯ таблица диапазонов на весь сервер живёт в `../safeFetch.ts`
+ * (её же использует гугл-only `safeGoogleFetch` для сессий загрузки).
+ * Здесь — только реэкспорт, чтобы две копии не разъезжались и чтобы
+ * существующие тесты, импортирующие `isBlockedIp`/`pinnedLookup` из этого
+ * модуля, продолжали работать.
  */
-export function isBlockedIp(ip: string): boolean {
-  const kind = net.isIP(ip);
-  if (kind === 4) return isBlockedIpv4(ip);
-  if (kind === 6) return isBlockedIpv6(ip);
-  return true; // not a parseable IP → treat as unsafe
-}
-
-function isBlockedIpv4(ip: string): boolean {
-  const o = ip.split(".").map(Number);
-  if (o.length !== 4 || o.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
-  const [a, b] = o;
-  if (a === 0) return true; // 0.0.0.0/8 "this host"
-  if (a === 10) return true; // 10.0.0.0/8 private
-  if (a === 127) return true; // 127.0.0.0/8 loopback
-  if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local (cloud metadata)
-  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 private
-  if (a === 192 && b === 168) return true; // 192.168.0.0/16 private
-  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
-  if (a >= 224) return true; // 224.0.0.0/4 multicast + 240.0.0.0/4 reserved + 255.*
-  return false;
-}
-
-function isBlockedIpv6(ip: string): boolean {
-  const lower = ip.toLowerCase();
-  // IPv4-mapped / IPv4-compatible — validate the embedded v4 address.
-  const mapped = lower.match(/(?:^|:)((?:\d{1,3}\.){3}\d{1,3})$/);
-  if (mapped) return isBlockedIpv4(mapped[1]);
-  if (lower === "::1" || lower === "::") return true; // loopback / unspecified
-  const head = lower.split(":")[0] ?? "";
-  const n = parseInt(head || "0", 16);
-  if (lower.startsWith("fe8") || lower.startsWith("fe9") || lower.startsWith("fea") || lower.startsWith("feb"))
-    return true; // fe80::/10 link-local
-  if (n >= 0xfc00 && n <= 0xfdff) return true; // fc00::/7 unique-local
-  if (lower.startsWith("ff")) return true; // ff00::/8 multicast
-  return false;
-}
+export { isBlockedIp, pinnedLookup };
 
 /** A resolved-and-vetted host: every address in `addrs` already passed isBlockedIp. */
 interface ResolvedHost {
@@ -1414,29 +1393,8 @@ export async function assertPublicUrl(rawUrl: string, lookup: LookupFn = default
   return url;
 }
 
-/**
- * A `net.connect`/`tls.connect`-compatible `lookup` function that ignores
- * whatever hostname it is asked to resolve and always answers with the
- * pre-vetted address list — i.e. it performs no DNS resolution of its own.
- * Handles both call shapes Node's connectors use: `{all:true}` (array of
- * `{address,family}`, used by Happy-Eyeballs/autoSelectFamily) and the
- * single-address legacy shape (`callback(err, address, family)`).
- *
- * Exported for tests: the strongest proof that rebinding is closed is
- * calling this with a hostname argument that does NOT match what it was
- * built for, and asserting it still answers with only the vetted addresses
- * — i.e. structurally incapable of falling back to a fresh resolve.
- */
-export function pinnedLookup(addrs: { address: string; family: 4 | 6 }[]): net.LookupFunction {
-  return (_hostname, options, callback) => {
-    const wantsAll = typeof options === "object" && options !== null && "all" in options && options.all === true;
-    if (wantsAll) {
-      callback(null, addrs.map((a) => ({ address: a.address, family: a.family })));
-    } else {
-      callback(null, addrs[0].address, addrs[0].family);
-    }
-  };
-}
+// `pinnedLookup` (прибивает соединение к уже проверенным адресам, никакого
+// повторного резолва) живёт в `../safeFetch.ts` и реэкспортируется выше.
 
 /**
  * Fetches a URL into a Buffer with SSRF validation, manual redirects (each
@@ -1648,6 +1606,15 @@ export interface GmailSnoozeContext {
    * false unless TG_APPROVAL_ENABLED=true.
    */
   tg?: TgApprovalGate;
+  /**
+   * Подменяемый транспорт для исходящих запросов к Google (`safeGoogleFetch`).
+   * ПРОД НИКОГДА ЭТО НЕ ПЕРЕДАЁТ — поле существует только чтобы офлайн-тесты
+   * могли подставить фейковый fetch/резолвер вместо настоящей сети (как
+   * `fetchAttachmentSafely` принимает `lookup`/`fetchImpl` параметрами).
+   * Это НЕ MCP-параметр: модель не может ничего сюда положить, поле живёт в
+   * контексте регистрации инструментов, а не в схеме вызова.
+   */
+  safeFetch?: SafeFetchDeps;
 }
 
 /** Fallback gate config for callers that don't wire a real one (offline unit
@@ -2597,6 +2564,7 @@ async function executeUploadSessionCore(
   payload: UploadSessionPayload,
   auditId: string,
   consentStore: ConsentStore,
+  fetchDeps?: SafeFetchDeps,
 ): Promise<CallToolResult> {
   const token = await g.accessToken();
   const folderId = await ensureUploadFolder(g);
@@ -2614,7 +2582,11 @@ async function executeUploadSessionCore(
       const fileId = placeholder.data.id;
       if (!fileId) throw new Error("Drive did not return a file id for the staged upload.");
 
-      const res = await fetch(
+      // safeGoogleFetch, а не голый fetch: здесь уходит Bearer-токен аккаунта,
+      // и молча последовать за перенаправлением на чужой хост означало бы
+      // отдать этот токен туда. Сам адрес собран из константы
+      // DRIVE_UPLOAD_ENDPOINT, но проверка единая для всех исходящих.
+      const res = await safeGoogleFetch(
         `${DRIVE_UPLOAD_ENDPOINT}/${encodeURIComponent(fileId)}?uploadType=resumable&fields=id,name,size`,
         {
           method: "PATCH",
@@ -2626,6 +2598,7 @@ async function executeUploadSessionCore(
           },
           body: "{}",
         },
+        fetchDeps,
       );
       if (!res.ok) {
         return { name, error: `Google refused the session (HTTP ${res.status}): ${(await res.text()).slice(0, 500)}` };
@@ -2634,16 +2607,40 @@ async function executeUploadSessionCore(
       if (!uploadUrl) {
         return { name, error: "Google accepted the request but returned no Location header (no session URI)." };
       }
+      // Даже адрес, пришедший от самого Google, проверяем: дальше по нему
+      // будет ходить сервер (gmail_confirm_upload), и хранить непроверенный
+      // адрес — значит отложить проблему, а не решить её.
+      try {
+        assertAllowedGoogleUrl(uploadUrl);
+      } catch (e) {
+        return {
+          name,
+          error: `Google вернул недопустимый адрес сессии загрузки (${e instanceof Error ? e.message : String(e)}).`,
+        };
+      }
+      const remembered = await rememberUploadSession({
+        account: payload.account,
+        uploadUrl,
+        driveFileId: fileId,
+        name: name ?? null,
+        mimeType: contentType,
+        sizeBytes: sizeBytes ?? null,
+      });
       return {
         name,
         driveFileId: fileId,
+        // Непрозрачный идентификатор — ИМЕННО ЕГО ждёт обратно
+        // `gmail_confirm_upload`. Сам адрес обратно не принимается (SSRF).
+        sessionId: remembered.sessionId,
         uploadUrl,
         mimeType: contentType,
         sizeBytes: sizeBytes ?? null,
         howTo:
           `PUT ${uploadUrl} with header "Content-Type: ${contentType}"` +
           (sizeBytes ? ` and "Content-Length: ${sizeBytes}"` : "") +
-          ", body = the raw file bytes.",
+          ", body = the raw file bytes. Then check it with gmail_confirm_upload using the " +
+          "`sessionId` above (NOT the uploadUrl — the server keeps the address itself and does " +
+          "not accept one from a tool argument).",
         thenSend: `Attach it with attachments: [{"driveFileId": "${fileId}"}].`,
       };
     } catch (e) {
@@ -2676,7 +2673,236 @@ registerAutoExecutor("gmail_create_upload_session", {
   execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
     const p = payload as UploadSessionPayload;
     const g = ctx.clients.resolve(p.account);
-    const result = await executeUploadSessionCore(g, p, auditId, ctx.consentStore);
+    const result = await executeUploadSessionCore(g, p, auditId, ctx.consentStore, ctx.safeFetch);
+    return extractText(result);
+  },
+});
+
+// ---- gmail_get_download_url -------------------------------------------------
+//
+// ГЕЙТОВАН. Раньше был помечен `readOnlyHint` и вызывался моделью без единой
+// кнопки. «Только чтение» здесь — иллюзия: инструмент не читает вложение, он
+// РАЗДАЁТ К НЕМУ ДОСТУП. Выданная ссылка сама является доступом: кто её
+// получил — скачает вложение без всякой авторизации, живёт она до 12 часов и
+// НЕ ОТЗЫВАЕТСЯ. Для почты это хуже, чем для Диска: вложение — это кусок
+// переписки, и утечка такой ссылки в лог, в чат или в чужой контекст равна
+// утечке самого письма. По последствиям это выдача прав, а не чтение.
+//
+// Binding РЕАЛЬНЫЙ: перечитывает живое письмо и ищет в нём это вложение
+// (имя, тип, размер) — если между планом и подтверждением письмо удалили или
+// вложение стало другим, дрейф ловится и ссылка не выдаётся.
+
+export interface DownloadUrlItem {
+  messageId: string;
+  attachmentId: string;
+  filename?: string;
+  mimeType?: string;
+}
+export interface DownloadUrlPayload {
+  account: string;
+  ttlMinutes: number;
+  items: DownloadUrlItem[];
+}
+
+/** Живой снимок каждого запрошенного вложения — основа биндинга и превью. */
+async function downloadUrlBindingSnapshot(g: GoogleClients, items: DownloadUrlItem[]) {
+  return mapWithLimit(items, async (item) => {
+    try {
+      const msg = await g.gmail.users.messages.get({ userId: "me", id: item.messageId, format: "full" });
+      const found = collectAttachments(msg.data.payload).find((a) => a.attachmentId === item.attachmentId);
+      const subject = header(msg.data.payload?.headers, "Subject");
+      const from = header(msg.data.payload?.headers, "From");
+      return {
+        messageId: item.messageId,
+        attachmentId: item.attachmentId,
+        found: !!found,
+        // ЖИВЫЕ имя/тип из письма — это и есть личность вложения, за которую
+        // отвечает биндинг: подменить файл за тем же attachmentId, не сломав
+        // хэш, нельзя. Имя, которое передал вызывающий, хранится ОТДЕЛЬНО
+        // (`saveAs`) и в превью показывается отдельной пометкой — иначе
+        // согласие можно было бы получить под чужим именем файла.
+        filename: found?.filename ?? null,
+        mimeType: found?.mimeType ?? null,
+        saveAs: item.filename ?? null,
+        mimeTypeOverride: item.mimeType ?? null,
+        size: found?.size ?? null,
+        subject: subject || null,
+        from: from || null,
+      };
+    } catch {
+      // Письмо не прочиталось (удалено/нет прав/чужой id). Это НЕ ошибка
+      // плана: вызывающий мог задать имя и тип сам. Но в снимке это видно, и
+      // в превью человек прочитает «письмо перечитать не удалось».
+      return {
+        messageId: item.messageId,
+        attachmentId: item.attachmentId,
+        found: false,
+        filename: null,
+        mimeType: null,
+        saveAs: item.filename ?? null,
+        mimeTypeOverride: item.mimeType ?? null,
+        size: null,
+        subject: null,
+        from: null,
+      };
+    }
+  });
+}
+
+async function downloadUrlRehash(g: GoogleClients, addressing: unknown): Promise<string> {
+  const a = addressing as DownloadUrlPayload;
+  const snapshot = await downloadUrlBindingSnapshot(g, a.items);
+  return sha256({ account: a.account, ttlMinutes: a.ttlMinutes, items: snapshot });
+}
+
+/** Человеческая формулировка того, ЧТО именно подтверждает владелец. Вынесена
+ * отдельной функцией, потому что это и есть текст, который человек читает
+ * над кнопкой «✅ Подтвердить» в Telegram: невнятный текст обесценивает всю
+ * кнопку — подтверждают то, что поняли. */
+export function downloadUrlConsentWarning(ttlMinutes: number, expiresAtMs: number): string {
+  return (
+    "⚠️ **Ссылка — это и есть доступ к вложению.** Любой, у кого она окажется (переслали, попала в " +
+    "лог, в чужой контекст), скачает файл БЕЗ входа в почту и без каких-либо прав. " +
+    `**Отозвать выданную ссылку нельзя** — она работает, пока не истечёт срок: ${ttlMinutes} мин ` +
+    `(примерно до ${formatLaTime(expiresAtMs)} PT).`
+  );
+}
+
+/** Хвост превью: буквально расшифровывает, что делает кнопка подтверждения. */
+export function downloadUrlConsentButtonLine(count: number, ttlMinutes: number): string {
+  return (
+    `_Кнопка «✅ Подтвердить» означает: ВЫДАТЬ ${count === 1 ? "ссылку" : `${count} ссылки`}, по ` +
+    `${count === 1 ? "которой" : "которым"} вложение скачает любой, у кого она есть; отозвать нельзя; ` +
+    `живёт ~${ttlMinutes} мин._`
+  );
+}
+
+/** Post-verify для выданной ссылки: токен реально сохранён и указывает на то
+ * же самое вложение (а не «сервер сказал, что выдал»). */
+export async function postVerifyDownloadLink(
+  downloadUrl: string | null | undefined,
+  messageId: string,
+  attachmentId: string,
+  label: string,
+): Promise<VerifyLine & { detail: string }> {
+  const lbl = safeText(label) || "(вложение)";
+  if (!downloadUrl) {
+    return { outcome: "warn", line: `- ⚠️ **«${lbl}»** — ссылка не выдана`, detail: "no link" };
+  }
+  const token = downloadUrl.split("/dl/")[1] ?? "";
+  const target = await resolveDownloadLink(token);
+  if (!target) {
+    return {
+      outcome: "mismatch",
+      line: `- ❌ **«${lbl}»** — выданной ссылки нет в хранилище сервера`,
+      detail: "token missing",
+    };
+  }
+  if (target.messageId !== messageId || target.attachmentId !== attachmentId) {
+    return {
+      outcome: "mismatch",
+      line: `- ❌ **«${lbl}»** — ссылка ведёт к другому вложению (${safeText(target.messageId, 40)}/${safeText(target.attachmentId, 40)})`,
+      detail: "wrong target",
+    };
+  }
+  return {
+    outcome: "ok",
+    line: `- ✅ **«${lbl}»** — ссылка действует до ${formatLaTime(target.expiresAt)} PT и ведёт к этому вложению; отозвать её нельзя`,
+    detail: "issued",
+  };
+}
+
+async function executeGetDownloadUrlCore(
+  g: GoogleClients,
+  payload: DownloadUrlPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  interface LinkResult {
+    messageId: string;
+    attachmentId: string;
+    filename?: string;
+    mimeType?: string;
+    bytes?: number | null;
+    downloadUrl?: string;
+    expiresAt?: string;
+    error?: string;
+  }
+  const results = await mapWithLimit<DownloadUrlItem, LinkResult>(payload.items, async (item) => {
+    try {
+      let { filename, mimeType } = item;
+      let size: number | undefined;
+      // Fill in whatever the caller did not pass by looking at the message itself.
+      if (!filename || !mimeType) {
+        const msg = await g.gmail.users.messages.get({
+          userId: "me",
+          id: item.messageId,
+          format: "full",
+        });
+        const found = collectAttachments(msg.data.payload).find(
+          (a) => a.attachmentId === item.attachmentId,
+        );
+        filename = filename ?? found?.filename;
+        mimeType = mimeType ?? found?.mimeType;
+        size = found?.size;
+      }
+      const { url, expiresAt } = await issueDownloadLink(
+        {
+          account: payload.account,
+          messageId: item.messageId,
+          attachmentId: item.attachmentId,
+          name: filename || "attachment",
+          mimeType: mimeType ?? "application/octet-stream",
+          size,
+        },
+        payload.ttlMinutes,
+      );
+      return {
+        messageId: item.messageId,
+        attachmentId: item.attachmentId,
+        filename: filename || "attachment",
+        mimeType: mimeType ?? "application/octet-stream",
+        bytes: size ?? null,
+        downloadUrl: url,
+        expiresAt,
+      };
+    } catch (e) {
+      return {
+        messageId: item.messageId,
+        attachmentId: item.attachmentId,
+        error: String(e instanceof Error ? e.message : e),
+      };
+    }
+  });
+  const result = await buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Выдано ссылок:",
+    summaryIcon: "🔗",
+    verify: (r) => postVerifyDownloadLink(r.downloadUrl, r.messageId, r.attachmentId, r.filename ?? r.messageId),
+    reportTitle: "Независимая проверка выданных ссылок",
+    reportSubtitle: "выданная ссылка ⇄ запись в хранилище ссылок сервера",
+    consentStore,
+    auditId,
+  });
+  const parsed = JSON.parse((result.content[0] as { text: string }).text);
+  return ok({
+    ...parsed,
+    note:
+      "Каждая ссылка работает без какого-либо входа, пока не истечёт срок — обращайтесь с ней как с паролем " +
+      "к этому одному файлу. Отозвать её нельзя.",
+  });
+}
+
+registerAutoExecutor("gmail_get_download_url", {
+  rehash: (addressing, ctx: AutoExecutorCtx) => {
+    const p = addressing as DownloadUrlPayload;
+    return downloadUrlRehash(ctx.clients.resolve(p.account), addressing);
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as DownloadUrlPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeGetDownloadUrlCore(g, p, auditId, ctx.consentStore);
     return extractText(result);
   },
 });
@@ -4528,15 +4754,21 @@ export function registerGmailTools(
   server.registerTool(
     "gmail_get_download_url",
     {
-      title: "Get a temporary link to an attachment",
+      title: "Выдать ссылку-доступ на вложение (скачает любой, у кого она есть)",
       description:
-        "Return a temporary download link per attachment so the client (phone, browser, script) can fetch the " +
+        "Hand out a temporary download link per attachment so the client (phone, browser, script) can fetch the " +
         "bytes directly, instead of gmail_get_attachment inlining them into this conversation. Use it for anything " +
         "large or binary, or whenever the user wants to keep the file rather than read its content here. " +
         "Get `attachmentId` from gmail_get_message; filename and type are looked up automatically when omitted. " +
-        "The link IS the credential: anyone holding it can fetch that one attachment until it expires " +
-        `(default ${DEFAULT_TTL_MINUTES} minutes, max ${MAX_TTL_MINUTES / 60} hours), so pass it only to the person who ` +
-        "asked. It grants access to that single attachment — not to the message, and not to the mailbox.",
+        "THIS IS NOT A READ: the link IS the credential. Anyone holding it downloads that attachment with NO " +
+        "sign-in and no permissions, and the link CANNOT be revoked — it works until it expires " +
+        `(default ${DEFAULT_TTL_MINUTES} minutes, max ${MAX_TTL_MINUTES / 60} hours). Leaking it into a log, a chat ` +
+        "or another context is equivalent to leaking that piece of the correspondence. It grants access to that " +
+        "single attachment — not to the message, and not to the mailbox. That is why it is a " +
+        "two-mode consent-gated tool (mcp-development-standard/references/gate.md): call WITHOUT " +
+        "`manifest_id`/`user_reply` (with `items`) to build a plan and return a preview — NO link is issued yet. " +
+        "Show the preview to the user verbatim and wait for their reply. Call again with the returned " +
+        "`manifest_id` and the user's VERBATIM `user_reply` to actually issue the link(s).",
       inputSchema: {
         account,
         items: z
@@ -4548,18 +4780,35 @@ export function registerGmailTools(
               mimeType: z.string().optional(),
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Attachments to mint links for. Required to build a plan (first call, no manifest_id/user_reply). " +
+              "Ignored on the execute call — the approved batch is read back from the manifest.",
+          ),
         ttlMinutes: z
           .number()
           .int()
           .min(1)
           .max(MAX_TTL_MINUTES)
           .optional()
-          .describe(`How long each link stays valid. Default ${DEFAULT_TTL_MINUTES} minutes.`),
+          .describe(
+            `How long each link stays valid. Default ${DEFAULT_TTL_MINUTES} minutes, hard maximum ` +
+              `${MAX_TTL_MINUTES} minutes (${MAX_TTL_MINUTES / 60} hours). Part of what is confirmed.`,
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
-      annotations: { readOnlyHint: true },
+      // НЕ readOnlyHint и НЕ «безобидное» действие: инструмент выдаёт
+      // неаутентифицированный, неотзываемый доступ тому, кому попадёт ссылка —
+      // тот же класс, что drive_share в соседнем репозитории. Поэтому
+      // destructiveHint: true (последствие необратимо) + openWorldHint: true
+      // (ссылка уходит во внешний мир).
+      annotations: { destructiveHint: true, openWorldHint: true },
     },
-    guard(async ({ account, items, ttlMinutes }) => {
+    guard(async ({ account, items, ttlMinutes, manifest_id, user_reply }) => {
       if (!downloadsAvailable()) {
         return fail(
           "Download links are unavailable: this server does not know its own public URL. " +
@@ -4567,59 +4816,76 @@ export function registerGmailTools(
             "gmail_get_attachment still works for small attachments.",
         );
       }
+      const { consentStore, consentCfg, tg } = snoozeCtx;
+      if (!consentStore) {
+        return fail(
+          "Выдача ссылок недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results = await mapWithLimit(items, async (item) => {
-        try {
-          let { filename, mimeType } = item;
-          let size: number | undefined;
-          // Fill in whatever the caller did not pass by looking at the message itself.
-          if (!filename || !mimeType) {
-            const msg = await g.gmail.users.messages.get({
-              userId: "me",
-              id: item.messageId,
-              format: "full",
-            });
-            const found = collectAttachments(msg.data.payload).find(
-              (a) => a.attachmentId === item.attachmentId,
-            );
-            filename = filename ?? found?.filename;
-            mimeType = mimeType ?? found?.mimeType;
-            size = found?.size;
+      const accountName = clients.canonicalName(account);
+      const ttl = Math.min(ttlMinutes ?? DEFAULT_TTL_MINUTES, MAX_TTL_MINUTES);
+
+      const decision = await requireConsent<DownloadUrlPayload>({
+        tool: "gmail_get_download_url",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        tg,
+        // План перечитывает MIME-дерево каждого письма (format=full) и берёт
+        // ЖИВЫЕ имя/тип/размер вложения — байты не качаются, ссылка не
+        // выдаётся, пока человек не подтвердит.
+        plan: async () => {
+          if (!items || !items.length) {
+            throw new Error("Нужен непустой `items`, чтобы построить план выдачи ссылок.");
           }
-          const { url, expiresAt } = await issueDownloadLink(
-            {
-              account: clients.canonicalName(account),
-              messageId: item.messageId,
-              attachmentId: item.attachmentId,
-              name: filename || "attachment",
-              mimeType: mimeType ?? "application/octet-stream",
-              size,
-            },
-            ttlMinutes ?? DEFAULT_TTL_MINUTES,
-          );
+          const snapshot = await downloadUrlBindingSnapshot(g, items);
+          const payload: DownloadUrlPayload = { account: accountName, ttlMinutes: ttl, items };
+          const lines = snapshot.map((s) => {
+            // В превью человек видит ЖИВОЕ имя из письма, а не то, которое
+            // подставил вызывающий: иначе согласие можно было бы получить под
+            // подменённым именем файла («invoice.pdf» вместо «passport.jpg»).
+            // Имя от вызывающего показывается отдельной пометкой.
+            const head = `- **«${safeText(s.filename ?? s.saveAs ?? s.attachmentId, 60)}»**`;
+            const renamed =
+              s.saveAs && s.saveAs !== s.filename ? `; будет отдан под именем «${safeText(s.saveAs, 60)}»` : "";
+            if (!s.found) {
+              return (
+                `${head} — ⚠️ письмо ${safeText(s.messageId, 40)} перечитать не удалось (удалено/нет доступа); ` +
+                `имя и тип не проверены — ссылка будет выдана по данным вызывающего${renamed}`
+              );
+            }
+            return (
+              `${head} (${safeText(s.mimeType ?? "", 40)}, ${s.size ?? "?"} байт)` +
+              ` — из письма «${safeText(s.subject ?? "(без темы)", 60)}» от ${safeText(s.from ?? "(?)", 60)}${renamed}`
+            );
+          });
+          const preview =
+            `### 📤 План: Выдать ссылки на вложения — ${items.length}\n\n` +
+            `${downloadUrlConsentWarning(ttl, Date.now() + ttl * 60_000)}\n\n` +
+            `${lines.join("\n")}\n\n` +
+            `${downloadUrlConsentButtonLine(items.length, ttl)}`;
           return {
-            messageId: item.messageId,
-            attachmentId: item.attachmentId,
-            filename: filename || "attachment",
-            mimeType: mimeType ?? "application/octet-stream",
-            bytes: size ?? null,
-            downloadUrl: url,
-            expiresAt,
+            payload,
+            objectHash: sha256({ account: accountName, ttlMinutes: ttl, items: snapshot }),
+            preview,
+            batchSize: items.length,
           };
-        } catch (e) {
-          return {
-            messageId: item.messageId,
-            attachmentId: item.attachmentId,
-            error: String(e instanceof Error ? e.message : e),
-          };
-        }
+        },
+        // Real binding: re-reads each message + its attachment right now — a
+        // message deleted or an attachment swapped between plan and execute
+        // forces a mismatch instead of handing out a link to whatever is there.
+        rehash: (addressing) => downloadUrlRehash(g, addressing),
       });
-      const good = results.filter((r) => !("error" in r));
-      return ok({
-        summary: `🔗 Built ${good.length}/${items.length} download link(s)`,
-        results,
-        note: "Each link works without any further sign-in until it expires — treat it as a password for that one file.",
-      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      return executeGetDownloadUrlCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -4712,23 +4978,41 @@ export function registerGmailTools(
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      return executeUploadSessionCore(g, payload, auditId, consentStore);
+      return executeUploadSessionCore(g, payload, auditId, consentStore, snoozeCtx.safeFetch);
     }),
   );
 
+  // ЧТО ЗДЕСЬ ИСПРАВЛЕНО. Раньше этот инструмент принимал `uploadUrl` —
+  // АДРЕС, ПРИШЕДШИЙ В АРГУМЕНТЕ, — шёл по нему без единой проверки и
+  // возвращал тело ответа в диалог. Это давало подделку запроса со стороны
+  // сервера (SSRF): модель, которой скормили нужный текст, заставляла сервер
+  // постучаться во внутреннюю сеть (метаданные облака 169.254.169.254,
+  // приватные диапазоны, localhost) и вернуть ответ наружу. Теперь адрес не
+  // принимается ВООБЩЕ: сервер сам выдал его при создании сессии, сам и
+  // хранит (uploadSessions.ts), а наружу отдаёт только непрозрачный
+  // `sessionId`. Плюс второй рубеж — safeGoogleFetch (allowlist хостов
+  // Google + запрет приватных адресов на уровне реального соединения +
+  // проверка каждого перенаправления).
   server.registerTool(
     "gmail_confirm_upload",
     {
       title: "Check a direct upload",
       description:
-        "Ask Google how an upload started by gmail_create_upload_session is doing. Reports `complete` (the file is " +
-        "ready to attach), `in_progress` (how many bytes arrived, so the client knows where to resume), or " +
-        "`expired` (session gone — open a new one). Uploads nothing itself.",
+        "Ask Google how an upload started by gmail_create_upload_session is doing. Pass the `sessionId` that " +
+        "session returned — the upload address itself is kept server-side and is NOT accepted as an argument. " +
+        "Reports `complete` (the file is ready to attach), `in_progress` (how many bytes arrived, so the client " +
+        "knows where to resume), or `expired` (session gone — open a new one). Uploads nothing itself. " +
+        "The body of an unexpected answer is never echoed back into the conversation.",
       inputSchema: {
         uploads: z
           .array(
             z.object({
-              uploadUrl: z.string().describe("Session URI returned by gmail_create_upload_session."),
+              sessionId: z
+                .string()
+                .describe(
+                  "The opaque `sessionId` returned by gmail_create_upload_session. NOT a URL: the server looks " +
+                    "the real upload address up in its own store.",
+                ),
               sizeBytes: z
                 .number()
                 .int()
@@ -4739,17 +5023,38 @@ export function registerGmailTools(
           )
           .min(1),
       },
-      annotations: { readOnlyHint: true },
+      // НЕ readOnlyHint: инструмент делает исходящий запрос наружу (пусть и по
+      // адресу, который сервер хранит у себя, а не принимает от модели) и
+      // читает собственное хранилище сессий. Пометка «только чтение» прятала
+      // его и от теста покрытия гейтов, и от группировки разрешений клиента —
+      // ровно так обе дыры и прожили незамеченными.
+      annotations: { destructiveHint: false, openWorldHint: true },
     },
     guard(async ({ uploads }) => {
-      const results = await mapWithLimit(uploads, async ({ uploadUrl, sizeBytes }) => {
+      const results = await mapWithLimit(uploads, async ({ sessionId, sizeBytes }) => {
+        const session = await resolveUploadSession(sessionId);
+        if (!session) {
+          return {
+            sessionId,
+            error:
+              "Сессия загрузки с таким `sessionId` не найдена (истекла или её создавал не этот сервер). " +
+              "Создайте новую через gmail_create_upload_session.",
+          };
+        }
         try {
           // An empty PUT with "bytes */total" asks for status instead of sending
           // content; the session URI carries its own authorisation.
-          const res = await fetch(uploadUrl, {
-            method: "PUT",
-            headers: { "Content-Range": `bytes */${sizeBytes ?? "*"}` },
-          });
+          // Перенаправления `safeGoogleFetch` вслепую не выполняет: каждый
+          // `Location` проходит те же проверки, а обычный ответ «шли дальше» —
+          // это 308 БЕЗ `Location`, его это не задевает.
+          const res = await safeGoogleFetch(
+            session.uploadUrl,
+            {
+              method: "PUT",
+              headers: { "Content-Range": `bytes */${sizeBytes ?? session.sizeBytes ?? "*"}` },
+            },
+            snoozeCtx.safeFetch,
+          );
           if (res.status === 200 || res.status === 201) {
             let file: { id?: string; name?: string; size?: string } = {};
             try {
@@ -4758,10 +5063,10 @@ export function registerGmailTools(
               /* Google answered without a usable body — the id simply isn't there. */
             }
             return {
-              uploadUrl,
+              sessionId,
               status: "complete" as const,
-              driveFileId: file.id ?? null,
-              name: file.name ?? null,
+              driveFileId: file.id ?? session.driveFileId ?? null,
+              name: file.name ?? session.name ?? null,
               size: file.size ?? null,
             };
           }
@@ -4770,18 +5075,27 @@ export function registerGmailTools(
             const range = res.headers.get("range");
             const last = range ? Number(range.split("-")[1]) : NaN;
             const bytesReceived = Number.isFinite(last) ? last + 1 : 0;
-            return { uploadUrl, status: "in_progress" as const, bytesReceived, resumeFrom: bytesReceived };
+            return { sessionId, status: "in_progress" as const, bytesReceived, resumeFrom: bytesReceived };
           }
           if (res.status === 404 || res.status === 410) {
             return {
-              uploadUrl,
+              sessionId,
               status: "expired" as const,
               error: "Google no longer knows this session (expired, cancelled, or finished long ago). Open a new one.",
             };
           }
-          return { uploadUrl, error: `Unexpected status ${res.status}: ${(await res.text()).slice(0, 500)}` };
+          // Тело неожиданного ответа НАРУЖУ НЕ УХОДИТ. Адрес сюда больше не
+          // приходит от модели, но эхо чужого тела в диалог — это канал утечки
+          // сам по себе (security-checklist.md §6): наружу идёт только номер
+          // статуса. Тело даже не читается.
+          return {
+            sessionId,
+            error:
+              `🛑 Неожиданный ответ на проверку загрузки: HTTP ${res.status}. ` +
+              "Тело ответа наружу не передаётся; при повторении — открыть новую загрузочную сессию.",
+          };
         } catch (e) {
-          return { uploadUrl, error: String(e instanceof Error ? e.message : e) };
+          return { sessionId, error: String(e instanceof Error ? e.message : e) };
         }
       });
       return ok({
