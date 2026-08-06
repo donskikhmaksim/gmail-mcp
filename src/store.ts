@@ -192,6 +192,13 @@ export async function ensureSchema(): Promise<void> {
   await p.query(
     `CREATE INDEX IF NOT EXISTS consent_manifests_cleanup_idx ON consent_manifests (server, status, expires_at)`,
   );
+  // «План ушёл кнопкой» (2026-08-06, режим "только кнопкой" — consent.ts's
+  // `isTgButtonOnly`). ADD COLUMN IF NOT EXISTS, а не пересоздание таблицы:
+  // живые манифесты в проде не должны потеряться при деплое. DEFAULT FALSE ⇒
+  // все ранее созданные планы остаются на обычном текстовом пути, как и были.
+  await p.query(
+    `ALTER TABLE consent_manifests ADD COLUMN IF NOT EXISTS tg_notified BOOLEAN NOT NULL DEFAULT FALSE`,
+  );
   // Append-only audit trail. Written in two phases (plan §0.4/[R:полнота-3]):
   // appendConsentAudit() at the gate DECISION (confirmed/refused/invalidated),
   // then updateConsentAuditOutcome() fills in what the MUTATION actually did
@@ -850,6 +857,10 @@ export interface ConsentManifestRow {
   expiresAt: number;
   consumedAt: number | null;
   userReply: string | null;
+  /** «План ушёл кнопкой в Telegram» — см. consent.ts's `ConsentManifestRow.
+   * tgNotified` / `isTgButtonOnly`. Колонка добавлена ADD COLUMN IF NOT EXISTS
+   * в `ensureSchema()`, DEFAULT FALSE. */
+  tgNotified: boolean;
 }
 
 export interface ConsentAuditEntry {
@@ -879,6 +890,7 @@ function rowToManifest(row: {
   expires_at: string | number;
   consumed_at: string | number | null;
   user_reply: string | null;
+  tg_notified?: boolean | null;
 }): ConsentManifestRow {
   return {
     id: row.id,
@@ -892,6 +904,7 @@ function rowToManifest(row: {
     expiresAt: Number(row.expires_at),
     consumedAt: row.consumed_at === null ? null : Number(row.consumed_at),
     userReply: row.user_reply,
+    tgNotified: row.tg_notified === true,
   };
 }
 
@@ -975,6 +988,21 @@ export async function invalidateManifest(id: string, server: string, userReply: 
     `UPDATE consent_manifests SET status = 'INVALIDATED', user_reply = $3
       WHERE id = $1 AND server = $2 AND status = 'AWAITING_CONSENT'`,
     [id, server, userReply],
+  );
+}
+
+/**
+ * Ставит «план ушёл кнопкой» (consent.ts's `ConsentStore.markTgNotified`).
+ * Зовётся ровно один раз — сразу после успешной отправки сообщения с кнопками
+ * в Telegram. Условие `status = 'AWAITING_CONSENT'` — чтобы отметка никогда не
+ * появилась у уже закрытого плана (гонка со «сжиганием» по отказу).
+ */
+export async function markTgNotified(id: string, server: string): Promise<void> {
+  const p = getPool();
+  await p.query(
+    `UPDATE consent_manifests SET tg_notified = TRUE
+      WHERE id = $1 AND server = $2 AND status = 'AWAITING_CONSENT'`,
+    [id, server],
   );
 }
 

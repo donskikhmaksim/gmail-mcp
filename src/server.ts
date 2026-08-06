@@ -17,6 +17,7 @@ import {
   getManifest,
   consumeManifest,
   invalidateManifest,
+  markTgNotified,
   appendConsentAudit,
   updateConsentAuditOutcome,
   listConsentAudit,
@@ -75,6 +76,7 @@ export const consentStoreAdapter: ConsentStore = {
   getManifest,
   consumeManifest,
   invalidateManifest,
+  markTgNotified,
   appendConsentAudit,
   updateConsentAuditOutcome,
 };
