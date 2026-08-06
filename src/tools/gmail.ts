@@ -9,7 +9,7 @@ import net from "node:net";
 import { Agent as UndiciAgent, fetch as pinnedFetch } from "undici";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { gmail_v1 } from "googleapis";
-import { ok, fail, guard, isTextual, mapWithLimit, safeText } from "../util.js";
+import { ok, okVerbatim, fail, guard, isTextual, mapWithLimit, safeText, safeBlock } from "../util.js";
 import { accountField, type UserClients } from "../accounts.js";
 import type { GoogleClients } from "../google.js";
 import { documentToPlainText } from "./docs.js";
@@ -495,9 +495,18 @@ export async function postVerifySend(
   };
 }
 
-/** Now, formatted for America/Los_Angeles. */
+/**
+ * Now, formatted for America/Los_Angeles.
+ *
+ * Суффикс — «PT», а НЕ «America/Los_Angeles»: подпись отчёта обрамляется
+ * `_…_` (курсив), а конвертер markdown→Telegram-HTML намеренно не курсивит
+ * подчёркивания внутри слова (иначе ломались бы имена файлов вида
+ * `n8n_email_report.md`). Из-за `Los_Angeles` вся строка подписи уезжала в
+ * Telegram как есть, с голыми подчёркиваниями. «PT» — тот же формат, что уже
+ * используется в превью планов (`formatLaTime(...) PT`).
+ */
 function nowInLA(): string {
-  return new Date().toLocaleString("sv-SE", { timeZone: "America/Los_Angeles" }) + " America/Los_Angeles";
+  return new Date().toLocaleString("sv-SE", { timeZone: "America/Los_Angeles" }) + " PT";
 }
 
 /**
@@ -505,9 +514,14 @@ function nowInLA(): string {
  * instrument hand-rolling its own status string is a defect"). `renderPostVerifyReport`
  * below (the 4 send tools) and every T1 mutation (trash/archive/labels/Drive
  * writes, package T1) go through this SAME function with their own
- * title/subtitle — the ✅/⚠️/❌ shape + verbatim-reprint tail is defined once.
+ * title/subtitle — the ✅/⚠️/❌ shape is defined once.
  * `results` only needs `{outcome, line}` — `PostVerifyResult` (extra
  * `messageId`/`detail` fields) satisfies this structurally, no cast needed.
+ *
+ * ЗДЕСЬ БОЛЬШЕ НЕТ хвоста «[агенту: перепечатай … ДОСЛОВНО]». Это была
+ * инструкция модели, вшитая в данные; «не пересказывать» теперь выражено
+ * `_meta`-флагом ответа (`okVerbatim(..., "execution-report")`), см.
+ * `PRESENTATION_META_KEY` в util.ts. Внутри отчёта — только факты.
  */
 interface VerifyLine {
   outcome: PostVerifyOutcome;
@@ -523,9 +537,60 @@ function renderVerifyReport(title: string, subtitle: string, results: VerifyLine
     `### 🧾 ${title}\n` +
     `_${nowInLA()} · ${subtitle}_\n\n` +
     `${body}\n\n` +
-    `**Итог: ✅ ${okN} подтверждено, ⚠️ ${warnN} не проверено, ❌ ${mmN} расхождение.**\n` +
-    `_[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО — это серверная проверка, не заменяй пересказом]_`
+    `**Итог: ✅ ${okN} подтверждено, ⚠️ ${warnN} не проверено, ❌ ${mmN} расхождение.**`
   );
+}
+
+/**
+ * Собирает ГОТОВЫЙ ЧЕЛОВЕКОЧИТАЕМЫЙ отчёт об исполнении мутации.
+ *
+ * Инцидент 2026-08-06: оба билдера ниже возвращали `ok({summary, results,
+ * verification})`, а `ok()` не-строку сериализует в `JSON.stringify(…, null, 2)`.
+ * В обычном чате модель это ещё пересказывала, но АВТО-путь (кнопка «✅
+ * Подтвердить» в Telegram → `autoExecute` → `extractText` → `editMessageText`)
+ * отдаёт `content[0].text` человеку КАК ЕСТЬ — и Максим получил в чат сырой
+ * JSON с фигурными скобками, ключами и экранированными `\n` внутри
+ * `verification`. Планы приходили нормально ровно потому, что там в `ok()`
+ * шла СТРОКА (`ok(decision.preview)`), а не объект.
+ *
+ * Поэтому текстом теперь становится сам отчёт, а машинные поля (messageId/
+ * threadId/labelId…) не выбрасываются, а печатаются компактной строкой
+ * «Детали» — без JSON-скобок, но без потери данных.
+ */
+function renderResultDetails(results: unknown[]): string[] {
+  const MAX_ITEMS = 10;
+  const lines: string[] = [];
+  for (const r of results.slice(0, MAX_ITEMS)) {
+    if (!r || typeof r !== "object") continue;
+    const pairs = Object.entries(r as Record<string, unknown>)
+      .filter(([k, v]) => k !== "error" && v !== null && v !== undefined && typeof v !== "object")
+      .map(([k, v]) => `${safeText(k, 40)}: ${safeText(String(v), 120)}`);
+    if (pairs.length) lines.push(`- ${pairs.join(" · ")}`);
+  }
+  if (results.length > MAX_ITEMS) lines.push(`- …ещё ${results.length - MAX_ITEMS}`);
+  return lines;
+}
+
+function renderExecutionReport(opts: {
+  summary: string;
+  errors: string[];
+  verification?: string;
+  results: unknown[];
+  note?: string;
+  extra?: Record<string, unknown>;
+}): string {
+  const parts: string[] = [opts.summary];
+  if (opts.errors.length) {
+    parts.push(["**Ошибки:**", ...opts.errors.map((e) => `- ❌ ${safeText(e, 300)}`)].join("\n"));
+  }
+  if (opts.verification) parts.push(opts.verification);
+  const details = renderResultDetails(opts.results);
+  const extraLines = opts.extra ? renderResultDetails([opts.extra]) : [];
+  if (details.length || extraLines.length) {
+    parts.push(["_Детали:_", ...details, ...extraLines].join("\n"));
+  }
+  if (opts.note) parts.push(`⚠️ ${safeText(opts.note, 500)}`);
+  return parts.join("\n\n");
 }
 
 /** Builds the §5.3 proof block from per-message post-verify results (server-glued). */
@@ -861,6 +926,13 @@ async function buildMutationResult<T extends { error?: string }>(opts: {
   consentStore?: ConsentStore;
   auditId?: string;
   preSnapshot?: unknown;
+  /** Предупреждение вызывающему/человеку отдельным абзацем отчёта (например
+   * «ссылка работает без входа — обращайтесь как с паролем»). Раньше три
+   * инструмента дописывали его, РАСПАРСИВ обратно JSON из уже собранного
+   * результата — теперь параметр, а не разбор собственного вывода. */
+  note?: string;
+  /** Доп. поля результата, не выводимые из `results` (например `folderId`). */
+  extra?: Record<string, unknown>;
 }): Promise<ReturnType<typeof ok>> {
   const { results, total, verb, summaryIcon, verify, reportTitle, reportSubtitle, consentStore, auditId, preSnapshot } = opts;
   const succeeded = results.filter((r) => !r.error);
@@ -897,11 +969,21 @@ async function buildMutationResult<T extends { error?: string }>(opts: {
         );
       });
   }
-  return ok({
-    summary: `${icon} ${verb} ${okN}/${total}${tail}`,
-    results,
-    ...(pv.length ? { verification: renderVerifyReport(reportTitle, reportSubtitle, pv) } : {}),
-  });
+  const summary = `${icon} ${verb} ${okN}/${total}${tail}`;
+  const verification = pv.length ? renderVerifyReport(reportTitle, reportSubtitle, pv) : undefined;
+  const note = opts.note;
+  return okVerbatim(
+    renderExecutionReport({
+      summary,
+      errors: results.map((r) => r.error).filter((e): e is string => !!e),
+      verification,
+      results,
+      note,
+      extra: opts.extra,
+    }),
+    "execution-report",
+    { summary, results, ...(verification ? { verification } : {}), ...(note ? { note } : {}), ...(opts.extra ?? {}) },
+  );
 }
 
 /**
@@ -973,11 +1055,18 @@ async function buildSendResult(
   }
   // Strip the internal expectedTo marker from the results echoed back.
   const cleaned = results.map(({ expectedTo, ...rest }) => rest);
-  return ok({
-    summary: `${icon} ${verb} ${okN}/${total}${tail}`,
-    results: cleaned,
-    ...(pv.length ? { verification: renderPostVerifyReport(pv) } : {}),
-  });
+  const summary = `${icon} ${verb} ${okN}/${total}${tail}`;
+  const verification = pv.length ? renderPostVerifyReport(pv) : undefined;
+  return okVerbatim(
+    renderExecutionReport({
+      summary,
+      errors: results.map((r) => r.error).filter((e): e is string => !!e),
+      verification,
+      results: cleaned,
+    }),
+    "execution-report",
+    { summary, results: cleaned, ...(verification ? { verification } : {}) },
+  );
 }
 
 /**
@@ -1055,6 +1144,19 @@ interface SendPreviewItem {
   warning?: string;
 }
 
+/**
+ * Строка(и) «- Текст:» в превью плана. Однострочное тело остаётся на той же
+ * строке (как было), многострочное уходит под заголовок с отступом — так
+ * список в письме читается списком, а не одной слипшейся строкой.
+ */
+function renderPreviewBody(body: string): string {
+  const block = safeBlock(body, { maxLines: 24, maxChars: 700 });
+  if (!block) return "- Текст: (пусто)";
+  const lines = block.split("\n");
+  if (lines.length === 1) return `- Текст: ${lines[0].trim()}`;
+  return `- Текст:\n${block}`;
+}
+
 function renderSendPreview(opts: { verb: string; fromLabel: string; items: SendPreviewItem[] }): string {
   const header = `### 📤 План: ${opts.verb} — ${opts.items.length}`;
   const blocks = opts.items.map((it, i) => {
@@ -1072,7 +1174,12 @@ function renderSendPreview(opts: { verb: string; fromLabel: string; items: SendP
         : undefined,
       it.sendAt ? `- Когда: ${formatLaTime(it.sendAt.getTime())} PT` : undefined,
       it.warning ? `- ⚠️ ${safeText(it.warning, 200)}` : undefined,
-      `- Текст: ${safeText(it.body, 400) || "(пусто)"}`,
+      // Тело — МНОГОСТРОЧНО (safeBlock, не safeText): человек утверждает
+      // отправку по этому превью, а `safeText` схлопывал `\n` в пробелы и
+      // превращал перечисление в кашу «1. Первое 2. Второе». Построчная
+      // санитизация внутри safeBlock оставляет ту же защиту от подделки
+      // строк плана, что и раньше.
+      renderPreviewBody(it.body),
     ].filter((l): l is string => l != null);
     return lines.join("\n");
   });
@@ -2251,10 +2358,20 @@ async function executeScheduleSendCore(
         e instanceof Error ? e.message : String(e),
       );
     });
-  return ok({
-    summary: `🕗 Scheduled ${ok_.length}/${results.length} message(s)`,
-    results,
-  });
+  // Тот же человекочитаемый формат, что и у остальных гейтованных мутаций:
+  // этот путь тоже авто-исполняется кнопкой в Telegram, где `content[0].text`
+  // показывается человеку КАК ЕСТЬ (post-verify здесь нет по природе тула —
+  // письмо ещё не ушло, проверять в «Отправленных» нечего).
+  const summary = `🕗 Scheduled ${ok_.length}/${results.length} message(s)`;
+  return okVerbatim(
+    renderExecutionReport({
+      summary,
+      errors: results.filter((r) => "error" in r && !!r.error).map((r) => (r as { error: string }).error),
+      results,
+    }),
+    "execution-report",
+    { summary, results },
+  );
 }
 
 registerAutoExecutor("gmail_schedule_send", {
@@ -2772,9 +2889,9 @@ async function executeExportThreadCore(
     consentStore,
     auditId,
     preSnapshot: { threadId: payload.threadId, subject: payload.subject, messageCount: payload.messageCount },
+    extra: { folderId: parentId ?? null },
   });
-  const parsed = JSON.parse((result.content[0] as { text: string }).text);
-  return ok({ ...parsed, folderId: parentId ?? null });
+  return result;
 }
 
 registerAutoExecutor("gmail_export_thread_eml", {
@@ -2887,15 +3004,12 @@ async function executeUploadSessionCore(
     reportSubtitle: "запрошено ⇄ живой Drive (плейсхолдер; сама загрузка байт клиентом здесь НЕ проверяется)",
     consentStore,
     auditId,
-  });
-  const parsed = JSON.parse((result.content[0] as { text: string }).text);
-  return ok({
-    ...parsed,
     note:
       "Gmail will only carry the attachment once the client has PUT the bytes — a message sent before that " +
       "would go out with an empty file. Check with gmail_confirm_upload when in doubt. " +
       "Gmail caps a whole message at 25 MB.",
   });
+  return result;
 }
 
 registerAutoExecutor("gmail_create_upload_session", {
@@ -3114,14 +3228,11 @@ async function executeGetDownloadUrlCore(
     reportSubtitle: "выданная ссылка ⇄ запись в хранилище ссылок сервера",
     consentStore,
     auditId,
-  });
-  const parsed = JSON.parse((result.content[0] as { text: string }).text);
-  return ok({
-    ...parsed,
     note:
       "Каждая ссылка работает без какого-либо входа, пока не истечёт срок — обращайтесь с ней как с паролем " +
       "к этому одному файлу. Отозвать её нельзя.",
   });
+  return result;
 }
 
 registerAutoExecutor("gmail_get_download_url", {
@@ -3440,8 +3551,8 @@ export function registerGmailTools(
         rehash: (addressing) => sha256(addressing),
       });
 
-      if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
       return executeSendBatchCore(g, accountName, selfEmail, payload, auditId, consentStore);
@@ -3574,8 +3685,8 @@ export function registerGmailTools(
         rehash: (addressing) => rehashReplyBatch(g, addressing as ReplyBatchPayload),
       });
 
-      if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
       return executeReplyBatchCore(g, accountName, selfEmail, payload, auditId, consentStore);
@@ -3682,8 +3793,8 @@ export function registerGmailTools(
         rehash: (addressing) => rehashForwardBatch(g, addressing as ForwardBatchPayload),
       });
 
-      if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
       return executeForwardBatchCore(g, accountName, selfEmail, payload, auditId, consentStore);
@@ -3774,8 +3885,8 @@ export function registerGmailTools(
         rehash: (addressing) => sha256(addressing),
       });
 
-      if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
       return executeDraftBatchCore(g, payload, auditId, consentStore);
@@ -3834,8 +3945,8 @@ export function registerGmailTools(
         rehash: (addressing) => rehashIdBatch(g, addressing as IdBatchPayload),
       });
 
-      if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
       return executeArchiveCore(g, payload, auditId, consentStore);
@@ -3894,8 +4005,8 @@ export function registerGmailTools(
         rehash: (addressing) => rehashIdBatch(g, addressing as IdBatchPayload),
       });
 
-      if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
       return executeTrashCore(g, payload, auditId, consentStore);
@@ -3996,8 +4107,8 @@ export function registerGmailTools(
         rehash: (addressing) => rehashModifyLabels(g, addressing as ModifyLabelsPayload),
       });
 
-      if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
       return executeModifyLabelsCore(g, payload, auditId, consentStore);
@@ -4088,8 +4199,8 @@ export function registerGmailTools(
         rehash: (addressing) => rehashIdBatch(g, addressing as IdBatchPayload),
       });
 
-      if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
       const { store, userToken } = snoozeCtx;
@@ -4215,8 +4326,8 @@ export function registerGmailTools(
         rehash: (addressing) => sha256(addressing),
       });
 
-      if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
       // Resolving attachments/building the raw MIME (inside the core fn) NOW,
@@ -4348,8 +4459,8 @@ export function registerGmailTools(
         rehash: (addressing) => rehashCancelScheduledSend(store, addressing as CancelScheduledSendPayload),
       });
 
-      if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
       return executeCancelScheduledSendCore(store, payload, auditId, consentStore);
@@ -4610,8 +4721,8 @@ export function registerGmailTools(
         rehash: (addressing) => rehashSaveAttachment(g, addressing as SaveAttachmentPayload),
       });
 
-      if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
       return executeSaveAttachmentCore(g, payload, auditId, consentStore);
@@ -4716,8 +4827,8 @@ export function registerGmailTools(
         rehash: (addressing) => sha256(addressing),
       });
 
-      if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
       return executeCreateLabelCore(g, payload, auditId, consentStore);
@@ -4826,8 +4937,8 @@ export function registerGmailTools(
         rehash: (addressing) => rehashUpdateLabel(g, addressing as UpdateLabelPayload),
       });
 
-      if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
       return executeUpdateLabelCore(g, payload, auditId, consentStore);
@@ -4921,8 +5032,8 @@ export function registerGmailTools(
         rehash: (addressing) => rehashDeleteLabel(g, addressing as DeleteLabelPayload),
       });
 
-      if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
       return executeDeleteLabelCore(g, payload, auditId, consentStore);
@@ -5037,8 +5148,8 @@ export function registerGmailTools(
         rehash: (addressing) => rehashExportThread(g, addressing as ExportThreadPayload),
       });
 
-      if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
       return executeExportThreadCore(g, payload, auditId, consentStore);
@@ -5177,8 +5288,8 @@ export function registerGmailTools(
         rehash: (addressing) => downloadUrlRehash(g, addressing),
       });
 
-      if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
       return executeGetDownloadUrlCore(g, payload, auditId, consentStore);
@@ -5270,8 +5381,8 @@ export function registerGmailTools(
         rehash: (addressing) => sha256(addressing),
       });
 
-      if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
       return executeUploadSessionCore(g, payload, auditId, consentStore, snoozeCtx.safeFetch);

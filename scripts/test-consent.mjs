@@ -129,7 +129,11 @@ console.log("\n[1] фаза плана: planned, манифест создан, 
   check("манифест создан", store.manifests.size === 1);
   check("статус AWAITING_CONSENT", [...store.manifests.values()][0].status === "AWAITING_CONSENT");
   check("превью несёт id плана", dec.kind === "planned" && dec.preview.includes(dec.manifestId));
-  check("превью просит показать дословно и ждать", dec.preview.includes("дождись его ответа"));
+  // До 2026-08-06 здесь проверялось наличие хвоста «[агенту: покажи это
+  // пользователю дословно и дождись его ответа]» ВНУТРИ превью. Это была
+  // инструкция модели, вшитая в данные; требование переехало в `description`
+  // инструмента + `_meta` ответа. Теперь проверяем обратное.
+  check("в превью НЕТ обращений к агенту", !/\[агенту:|дождись его ответа/i.test(dec.preview), dec.preview);
   check("превью помечает истечение в PT", dec.preview.includes("PT"));
   check("в фазе плана аудит-мутация не пишется", store.audits.length === 0);
 }
