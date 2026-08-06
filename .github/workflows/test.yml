@@ -25,3 +25,26 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+
+      - name: Workflow files are parseable
+        # Not a formality: .github/workflows/sync-upstream.yml sat
+        # unparseable (a backslash line-continuation broke the `run: |`
+        # block) from 2026-07-23 until 2026-08-06 — GitHub silently failed
+        # EVERY run with "workflow file issue", so fork auto-update never
+        # ran once for any self-hoster. One YAML parse catches this
+        # immediately.
+        run: |
+          python3 -m pip install --quiet 'PyYAML>=6,<7'
+          python3 - <<'PY'
+          import pathlib, sys, yaml
+          bad = []
+          for p in sorted(pathlib.Path(".github/workflows").glob("*.y*ml")):
+              try:
+                  yaml.safe_load(p.read_text())
+              except yaml.YAMLError as e:
+                  bad.append(f"{p}: {e}")
+          if bad:
+              print("\n".join(bad))
+              sys.exit(1)
+          print("all workflow files parse")
+          PY

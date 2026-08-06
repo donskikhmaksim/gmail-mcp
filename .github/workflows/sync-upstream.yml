@@ -44,6 +44,11 @@ jobs:
             git push origin "$BRANCH"
             echo "Synced $BRANCH from upstream — Railway will redeploy."
           else
-            echo "::warning::This fork has diverged from upstream (local commits); \
-skipping auto-sync. Resolve manually to resume automatic updates."
+            # NB: keep this on ONE line. A backslash line-continuation whose
+            # next line starts at column 0 terminates the `run: |` block
+            # scalar and makes the whole workflow unparseable — which is
+            # exactly what happened between 2026-07-23 and 2026-08-06: every
+            # scheduled run failed with "workflow file issue" and no fork
+            # ever auto-synced.
+            echo "::warning::This fork has diverged from upstream (local commits); skipping auto-sync. Resolve manually to resume automatic updates."
           fi
