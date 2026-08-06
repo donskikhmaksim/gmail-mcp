@@ -141,9 +141,10 @@ await Promise.all([server.connect(serverSide), client.connect(clientSide)]);
 const raw = async (name, args) => client.callTool({ name, arguments: args });
 const call = async (name, args) => JSON.parse((await raw(name, args)).content[0].text);
 
-/** Drives gmail_create_upload_session's plan→execute flow in one call, for
- * tests that only care about the mutation's outcome (the gate mechanics
- * themselves are covered by scripts/test-t1-gate.mjs). */
+/** Drives a gated tool's plan→execute flow in one call, for tests that only
+ * care about the outcome (the gate mechanics themselves are covered by
+ * scripts/test-t1-gate.mjs). Used by gmail_create_upload_session AND, since
+ * the download-link gate landed, by gmail_get_download_url. */
 async function planThenExecute(name, args) {
   const planResp = await raw(name, args);
   const planText = planResp.content[0].text;
@@ -175,36 +176,59 @@ check("downloadsAvailable() is false", downloadsAvailable() === false);
 let out = await raw("gmail_get_download_url", { items: [{ messageId: "MSG1", attachmentId: "ATT1" }] });
 check("tool refuses with a clear error", out.isError === true && /PUBLIC_BASE_URL/.test(out.content[0].text), out.content[0].text);
 
-console.log("\n[3] link for an attachment, metadata looked up automatically");
+console.log("\n[3] link for an attachment, metadata looked up automatically (now behind the consent gate)");
 initDownloads("https://mail.example.com/");
-out = await call("gmail_get_download_url", { items: [{ messageId: "MSG1", attachmentId: "ATT1" }] });
+{
+  const planText = (await raw("gmail_get_download_url", { items: [{ messageId: "MSG1", attachmentId: "ATT1" }] })).content[0].text;
+  check("plan phase returns a plan, not a link", planText.includes("### 📤 План") && !planText.includes("/dl/"), planText.slice(0, 80));
+  check(
+    "plan says out loud the link works without signing in",
+    /БЕЗ входа в аккаунт/.test(planText) && /Отозвать/.test(planText),
+    planText.slice(0, 200),
+  );
+  check("plan states both the requested TTL and the hard maximum", /30 мин/.test(planText) && /720 мин/.test(planText), planText.slice(-160));
+}
+out = await planThenExecute("gmail_get_download_url", { items: [{ messageId: "MSG1", attachmentId: "ATT1" }] });
 let r = out.results[0];
 check("link points at /dl/<token>", /^https:\/\/mail\.example\.com\/dl\/[A-Za-z0-9_-]{20,}$/.test(r.downloadUrl), r.downloadUrl);
 check("filename pulled from the message", r.filename === "Договор №7.pdf", r.filename);
 check("mime pulled from the message", r.mimeType === "application/pdf", r.mimeType);
 check("size pulled from the message", r.bytes === 3_500_000, String(r.bytes));
 check("expiry is in the future", new Date(r.expiresAt).getTime() > Date.now(), String(r.expiresAt));
+check("post-verify report attached (token re-read from the store)", /Независимая проверка выданных ссылок/.test(out.verification ?? ""), String(out.verification).slice(0, 80));
+check("note warns the link needs no sign-in", /БЕЗ входа в аккаунт/.test(out.note ?? ""), String(out.note));
 
 const target = await resolveDownloadLink(r.downloadUrl.split("/dl/")[1]);
 check("token resolves to that message + attachment", target?.messageId === "MSG1" && target?.attachmentId === "ATT1", JSON.stringify(target));
 check("account recorded for later resolution", target?.account === "personal", String(target?.account));
 check("unknown token resolves to null", (await resolveDownloadLink("nope")) === null);
 
-console.log("\n[4] caller-supplied name wins, no message lookup needed");
-out = await call("gmail_get_download_url", {
-  items: [{ messageId: "MSG404", attachmentId: "ATT1", filename: "custom.bin", mimeType: "application/octet-stream" }],
+console.log("\n[4] caller-supplied name wins; an unreadable message can no longer be linked blind");
+out = await planThenExecute("gmail_get_download_url", {
+  items: [{ messageId: "MSG1", attachmentId: "ATT1", filename: "custom.bin", mimeType: "application/octet-stream" }],
 });
-check("no error despite an unknown message id", out.results[0].error === undefined, JSON.stringify(out.results[0]));
+check("no error", out.results[0].error === undefined, JSON.stringify(out.results[0]));
 check("supplied filename used", out.results[0].filename === "custom.bin", out.results[0].filename);
+{
+  // Before the gate, a caller could pass filename+mimeType for a message this
+  // account cannot even read and still get a working link. The plan now reads
+  // the message to bind identity, so that path is refused outright.
+  const resp = await raw("gmail_get_download_url", {
+    items: [{ messageId: "MSG404", attachmentId: "ATT1", filename: "custom.bin", mimeType: "application/octet-stream" }],
+  });
+  const body = resp.content[0].text;
+  check("unknown message id is refused at plan time", resp.isError === true || !body.includes("/dl/"), body.slice(0, 120));
+}
 
-console.log("\n[5] failures are per item, and TTL is clamped");
-out = await call("gmail_get_download_url", {
-  items: [{ messageId: "MSG1", attachmentId: "ATT1" }, { messageId: "GHOST", attachmentId: "ATT9" }],
-});
-check("good item still got a link", typeof out.results[0].downloadUrl === "string", JSON.stringify(out.results[0]));
-check("bad item reports its own error", /Message not found/.test(out.results[1].error ?? ""), JSON.stringify(out.results[1]));
-check("no link leaked for the bad item", out.results[1].downloadUrl === undefined);
-out = await call("gmail_get_download_url", { items: [{ messageId: "MSG1", attachmentId: "ATT1" }], ttlMinutes: MAX_TTL_MINUTES });
+console.log("\n[5] a bad item fails the whole plan (fail-closed), and TTL is clamped");
+{
+  const resp = await raw("gmail_get_download_url", {
+    items: [{ messageId: "MSG1", attachmentId: "ATT1" }, { messageId: "GHOST", attachmentId: "ATT9" }],
+  });
+  const body = resp.content[0].text;
+  check("no link minted when one item cannot be read", !body.includes("/dl/"), body.slice(0, 120));
+}
+out = await planThenExecute("gmail_get_download_url", { items: [{ messageId: "MSG1", attachmentId: "ATT1" }], ttlMinutes: MAX_TTL_MINUTES });
 const minutes = (new Date(out.results[0].expiresAt).getTime() - Date.now()) / 60000;
 check("max TTL honoured", Math.round(minutes) <= MAX_TTL_MINUTES, String(minutes));
 

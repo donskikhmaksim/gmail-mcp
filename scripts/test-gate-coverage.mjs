@@ -32,6 +32,11 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { registerGmailTools } from "../dist/tools/gmail.js";
 import { registerAccountTools } from "../dist/accounts.js";
+import { initDownloads } from "../dist/downloads.js";
+
+// gmail_get_download_url refuses before the gate when the server does not know
+// its own public URL — give it one so the PLAN phase is actually reached here.
+initDownloads("https://mail.example.test");
 
 let failures = 0;
 const check = (label, cond, extra = "") => {
@@ -87,6 +92,16 @@ const GATED_TOOLS = {
   },
   gmail_export_thread_eml: { args: { threadId: "T1" }, counterKey: "driveCreate", destructive: false },
   gmail_create_upload_session: { args: { files: [{ name: "big.pdf" }] }, counterKey: "driveCreate", destructive: false },
+  // Not a mailbox mutation but a CAPABILITY handed out: an unauthenticated,
+  // non-revocable link to one attachment (same class as drive_share).
+  // `forbidInPlan` is the extra proof that the plan phase mints nothing —
+  // no counter can express "a link was issued", but a /dl/ URL in the body can.
+  gmail_get_download_url: {
+    args: { items: [{ messageId: "M1", attachmentId: "ATT1" }] },
+    counterKey: "driveCreate",
+    destructive: true,
+    forbidInPlan: /\/dl\//,
+  },
 };
 
 // ── fakes (same shape as scripts/test-a3-gate.mjs, kept self-contained here
@@ -293,10 +308,13 @@ for (const [name, spec] of Object.entries(GATED_TOOLS)) {
   check(`${name} plan call: mutation counter (${spec.counterKey}) unchanged`, counters[spec.counterKey] === before, String(counters[spec.counterKey]));
   check(`${name} plan call: response is a plan, not a success/failure header`, body.includes("### 📤 План"), body.slice(0, 60));
   check(`${name} plan call: no ✅/✉️/❌ success-style header`, !/^[✅✉️❌]/.test(body), body.slice(0, 10));
+  if (spec.forbidInPlan) {
+    check(`${name} plan call: nothing was handed out (${spec.forbidInPlan})`, !spec.forbidInPlan.test(body), body.slice(0, 120));
+  }
 }
 
 console.log("\n[5] read tools genuinely carry readOnlyHint (spot-check, not exhaustive)");
-for (const name of ["gmail_list_scheduled_sends", "gmail_get_download_url", "gmail_list_labels", "list_accounts"]) {
+for (const name of ["gmail_list_scheduled_sends", "gmail_get_message", "gmail_list_labels", "list_accounts"]) {
   const t = tools.find((x) => x.name === name);
   check(`${name} readOnlyHint: true`, t?.annotations?.readOnlyHint === true, JSON.stringify(t?.annotations));
 }

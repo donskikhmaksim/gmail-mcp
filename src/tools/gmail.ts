@@ -25,6 +25,7 @@ import {
 } from "../consent.js";
 import {
   issueDownloadLink,
+  resolveDownloadLink,
   downloadsAvailable,
   DEFAULT_TTL_MINUTES,
   MAX_TTL_MINUTES,
@@ -1165,6 +1166,26 @@ interface SaveAttachmentItem {
 interface SaveAttachmentPayload {
   account: string;
   items: SaveAttachmentItem[];
+}
+
+/** One attachment a download link was planned for. `filename`/`size` are the
+ * LIVE values read from the message at plan time — they are the binding this
+ * gate defends (a different file behind the same attachmentId must not inherit
+ * the consent). */
+interface DownloadUrlItem {
+  messageId: string;
+  attachmentId: string;
+  filename: string;
+  size: number;
+  /** Caller's override for the name the file is saved under (not identity). */
+  saveAs?: string;
+  mimeType?: string;
+}
+interface DownloadUrlPayload {
+  account: string;
+  items: DownloadUrlItem[];
+  /** Part of the binding: the link's lifetime is half of what is being granted. */
+  ttlMinutes: number;
 }
 
 interface ExportThreadPayload {
@@ -2365,6 +2386,169 @@ registerAutoExecutor("gmail_save_attachment_to_drive", {
     const p = payload as SaveAttachmentPayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeSaveAttachmentCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ---- gmail_get_download_url --------------------------------------------------
+//
+// This tool does not mutate the mailbox — it MINTS A CAPABILITY: an
+// unauthenticated URL that hands the bytes of one attachment to whoever holds
+// it, for up to MAX_TTL_MINUTES, with no way to revoke it. That is exactly the
+// class of action drive_share is gated on in the sibling repo, so it goes
+// through the same plan→execute gate here.
+
+/** Real binding: re-reads each message's MIME tree right now and re-locates
+ * the attachment. A vanished message, a replaced attachment (same id, new
+ * name/size) or a different requested TTL all force a mismatch instead of
+ * inheriting an older consent. Mirrors `rehashSaveAttachment`. */
+async function rehashDownloadUrl(g: GoogleClients, addressing: DownloadUrlPayload): Promise<string> {
+  const fresh = await mapWithLimit(addressing.items, async (it) => {
+    try {
+      const msg = await g.gmail.users.messages.get({ userId: "me", id: it.messageId, format: "full" });
+      const found = collectAttachments(msg.data.payload).find((x) => x.attachmentId === it.attachmentId);
+      return found
+        ? { messageId: it.messageId, attachmentId: it.attachmentId, filename: found.filename, size: found.size }
+        : { messageId: it.messageId, attachmentId: it.attachmentId, filename: "__UNREADABLE__", size: -1 };
+    } catch {
+      return { messageId: it.messageId, attachmentId: it.attachmentId, filename: "__UNREADABLE__", size: -1 };
+    }
+  });
+  return sha256({ account: addressing.account, ttlMinutes: addressing.ttlMinutes, items: fresh });
+}
+
+/** Projection used for the plan's objectHash — must stay 1:1 with what
+ * `rehashDownloadUrl` recomputes. */
+function downloadUrlHashPayload(p: DownloadUrlPayload) {
+  return {
+    account: p.account,
+    ttlMinutes: p.ttlMinutes,
+    items: p.items.map(({ messageId, attachmentId, filename, size }) => ({ messageId, attachmentId, filename, size })),
+  };
+}
+
+/**
+ * Post-verify for a minted link: re-reads the token back out of the live
+ * token store (Postgres, or the in-memory fallback) and checks it addresses
+ * the attachment that was actually planned. A link that did not persist — or
+ * that points somewhere else — must not be reported as ✅.
+ */
+async function postVerifyDownloadLink(
+  downloadUrl: string | undefined,
+  messageId: string,
+  attachmentId: string,
+  nameHint: string,
+): Promise<VerifyLine & { detail: string }> {
+  const label = safeText(nameHint) || "(без имени)";
+  if (!downloadUrl) {
+    return { outcome: "warn", line: `- ⚠️ **«${label}»** — ссылка не выдана, перепроверять нечего`, detail: "no link" };
+  }
+  let token: string;
+  try {
+    token = new URL(downloadUrl).pathname.split("/").filter(Boolean).pop() ?? "";
+  } catch {
+    return { outcome: "mismatch", line: `- ❌ **«${label}»** — выданная ссылка неразборчива`, detail: "bad link" };
+  }
+  try {
+    const rec = await resolveDownloadLink(token);
+    if (!rec) {
+      return {
+        outcome: "mismatch",
+        line: `- ❌ **«${label}»** — ссылка не найдена в хранилище токенов (не сохранилась)`,
+        detail: "token missing",
+      };
+    }
+    if (rec.messageId !== messageId || rec.attachmentId !== attachmentId) {
+      return {
+        outcome: "mismatch",
+        line: `- ❌ **«${label}»** — ссылка ведёт на другое вложение, чем запрошено`,
+        detail: "token points elsewhere",
+      };
+    }
+    return {
+      outcome: "ok",
+      line:
+        `- ✅ **«${label}»** — ссылка живёт до ${formatLaTime(rec.expiresAt)} и ведёт ровно на это вложение ` +
+        `(письмо ${messageId})`,
+      detail: "link verified",
+    };
+  } catch (e) {
+    return {
+      outcome: "warn",
+      line: `- ⚠️ **«${label}»** — не удалось перепроверить ссылку (${safeText(e instanceof Error ? e.message : String(e), 60)})`,
+      detail: "read failed",
+    };
+  }
+}
+
+async function executeDownloadUrlCore(
+  payload: DownloadUrlPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  if (!downloadsAvailable()) {
+    throw new Error(
+      "Ссылки на скачивание недоступны: сервер не знает своего публичного адреса (PUBLIC_BASE_URL). " +
+        "Ничего не выдано.",
+    );
+  }
+  const results = await mapWithLimit(payload.items, async (item) => {
+    const name = item.saveAs || item.filename || "attachment";
+    try {
+      const { url, expiresAt } = await issueDownloadLink(
+        {
+          account: payload.account,
+          messageId: item.messageId,
+          attachmentId: item.attachmentId,
+          name,
+          mimeType: item.mimeType ?? "application/octet-stream",
+          size: item.size >= 0 ? item.size : undefined,
+        },
+        payload.ttlMinutes,
+      );
+      return {
+        messageId: item.messageId,
+        attachmentId: item.attachmentId,
+        filename: name,
+        mimeType: item.mimeType ?? "application/octet-stream",
+        bytes: item.size >= 0 ? item.size : null,
+        downloadUrl: url,
+        expiresAt,
+      };
+    } catch (e) {
+      return {
+        messageId: item.messageId,
+        attachmentId: item.attachmentId,
+        filename: name,
+        error: String(e instanceof Error ? e.message : e),
+      };
+    }
+  });
+  const result = await buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Выдано ссылок",
+    summaryIcon: "🔗",
+    verify: (r) => postVerifyDownloadLink(r.downloadUrl, r.messageId, r.attachmentId, r.filename),
+    reportTitle: "Независимая проверка выданных ссылок",
+    reportSubtitle: "выдано ⇄ живое хранилище токенов",
+    consentStore,
+    auditId,
+  });
+  const parsed = JSON.parse((result.content[0] as { text: string }).text);
+  return ok({
+    ...parsed,
+    note:
+      `Каждая ссылка работает БЕЗ входа в аккаунт: пока она жива (${payload.ttlMinutes} мин), файл скачает любой, ` +
+      "кто её получил. Отозвать выданную ссылку нельзя — передавайте только тому, кто просил.",
+  });
+}
+
+registerAutoExecutor("gmail_get_download_url", {
+  rehash: autoRehash(rehashDownloadUrl),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as DownloadUrlPayload;
+    const result = await executeDownloadUrlCore(p, auditId, ctx.consentStore);
     return extractText(result);
   },
 });
@@ -4601,9 +4785,12 @@ export function registerGmailTools(
         "bytes directly, instead of gmail_get_attachment inlining them into this conversation. Use it for anything " +
         "large or binary, or whenever the user wants to keep the file rather than read its content here. " +
         "Get `attachmentId` from gmail_get_message; filename and type are looked up automatically when omitted. " +
-        "The link IS the credential: anyone holding it can fetch that one attachment until it expires " +
-        `(default ${DEFAULT_TTL_MINUTES} minutes, max ${MAX_TTL_MINUTES / 60} hours), so pass it only to the person who ` +
-        "asked. It grants access to that single attachment — not to the message, and not to the mailbox.",
+        "The link IS the credential: anyone holding it can fetch that one attachment WITHOUT signing in to the " +
+        `account, until it expires (default ${DEFAULT_TTL_MINUTES} minutes, max ${MAX_TTL_MINUTES / 60} hours), and ` +
+        "it cannot be revoked once handed out — so pass it only to the person who asked. It grants access to that " +
+        "single attachment — not to the message, and not to the mailbox. " +
+        "Because it hands out an unauthenticated capability, this tool is CONFIRMED like the write tools: call it " +
+        "once without manifest_id/user_reply to get a plan, show it, and call again with the user's verbatim reply.",
       inputSchema: {
         account,
         items: z
@@ -4615,18 +4802,40 @@ export function registerGmailTools(
               mimeType: z.string().optional(),
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Attachments to mint links for. Required to build a plan (first call, no manifest_id/user_reply). " +
+              "Ignored on the execute call — read back from the manifest.",
+          ),
         ttlMinutes: z
           .number()
           .int()
           .min(1)
           .max(MAX_TTL_MINUTES)
           .optional()
-          .describe(`How long each link stays valid. Default ${DEFAULT_TTL_MINUTES} minutes.`),
+          .describe(
+            `How long each link stays valid. Default ${DEFAULT_TTL_MINUTES} minutes, hard maximum ` +
+              `${MAX_TTL_MINUTES} minutes (${MAX_TTL_MINUTES / 60} hours). Part of what is confirmed.`,
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous call without it. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
-      annotations: { readOnlyHint: true },
+      // NOT readOnlyHint: this hands an unauthenticated, non-revocable
+      // capability to whoever gets the link — the same class of action as
+      // drive_share in the sibling repo.
+      annotations: { destructiveHint: true, openWorldHint: true },
     },
-    guard(async ({ account, items, ttlMinutes }) => {
+    guard(async ({ account, items, ttlMinutes, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg, tg } = snoozeCtx;
+      if (!consentStore) {
+        return fail(
+          "Выдача ссылок недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       if (!downloadsAvailable()) {
         return fail(
           "Download links are unavailable: this server does not know its own public URL. " +
@@ -4635,58 +4844,63 @@ export function registerGmailTools(
         );
       }
       const g = clients.resolve(account);
-      const results = await mapWithLimit(items, async (item) => {
-        try {
-          let { filename, mimeType } = item;
-          let size: number | undefined;
-          // Fill in whatever the caller did not pass by looking at the message itself.
-          if (!filename || !mimeType) {
-            const msg = await g.gmail.users.messages.get({
-              userId: "me",
-              id: item.messageId,
-              format: "full",
-            });
-            const found = collectAttachments(msg.data.payload).find(
-              (a) => a.attachmentId === item.attachmentId,
-            );
-            filename = filename ?? found?.filename;
-            mimeType = mimeType ?? found?.mimeType;
-            size = found?.size;
+      const accountName = clients.canonicalName(account);
+      const ttl = ttlMinutes ?? DEFAULT_TTL_MINUTES;
+
+      const decision = await requireConsent<DownloadUrlPayload>({
+        tool: "gmail_get_download_url",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        tg,
+        // Plan reads the MIME tree (format=full) for each attachment's real
+        // name/size — identity only, no bytes are downloaded and no link is
+        // minted until the human confirms.
+        plan: async () => {
+          if (!items || !items.length) {
+            throw new Error("Нужен непустой `items`, чтобы построить план выдачи ссылок на скачивание.");
           }
-          const { url, expiresAt } = await issueDownloadLink(
-            {
-              account: clients.canonicalName(account),
+          const built: DownloadUrlItem[] = await mapWithLimit(items, async (item) => {
+            const msg = await g.gmail.users.messages.get({ userId: "me", id: item.messageId, format: "full" });
+            const found = collectAttachments(msg.data.payload).find((a) => a.attachmentId === item.attachmentId);
+            if (!found) {
+              throw new Error(
+                `Вложение ${item.attachmentId} не найдено в письме ${item.messageId} — ссылки не выданы.`,
+              );
+            }
+            return {
               messageId: item.messageId,
               attachmentId: item.attachmentId,
-              name: filename || "attachment",
-              mimeType: mimeType ?? "application/octet-stream",
-              size,
-            },
-            ttlMinutes ?? DEFAULT_TTL_MINUTES,
+              filename: found.filename,
+              size: found.size,
+              saveAs: item.filename,
+              mimeType: item.mimeType ?? found.mimeType,
+            };
+          });
+          const payload: DownloadUrlPayload = { account: accountName, items: built, ttlMinutes: ttl };
+          const lines = built.map(
+            (it) =>
+              `- «${safeText(it.filename)}» (${it.size} байт) из письма ${it.messageId}` +
+              (it.saveAs ? `, сохранить как «${safeText(it.saveAs)}»` : ""),
           );
-          return {
-            messageId: item.messageId,
-            attachmentId: item.attachmentId,
-            filename: filename || "attachment",
-            mimeType: mimeType ?? "application/octet-stream",
-            bytes: size ?? null,
-            downloadUrl: url,
-            expiresAt,
-          };
-        } catch (e) {
-          return {
-            messageId: item.messageId,
-            attachmentId: item.attachmentId,
-            error: String(e instanceof Error ? e.message : e),
-          };
-        }
+          const preview =
+            `### 📤 План: Ссылки на скачивание вложений — ${built.length}\n\n${lines.join("\n")}\n\n` +
+            `⚠️ Каждая ссылка открывает файл БЕЗ входа в аккаунт: кто угодно, кому она попадёт, скачает это ` +
+            `вложение. Срок жизни — ${ttl} мин (максимум ${MAX_TTL_MINUTES} мин). Отозвать выданную ссылку нельзя.`;
+          return { payload, objectHash: sha256(downloadUrlHashPayload(payload)), preview, batchSize: built.length };
+        },
+        // Real binding: message/attachment ids + live filename/size + the
+        // requested TTL. Drift in any of them forces a fresh plan.
+        rehash: (addressing) => rehashDownloadUrl(g, addressing as DownloadUrlPayload),
       });
-      const good = results.filter((r) => !("error" in r));
-      return ok({
-        summary: `🔗 Built ${good.length}/${items.length} download link(s)`,
-        results,
-        note: "Each link works without any further sign-in until it expires — treat it as a password for that one file.",
-      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      return executeDownloadUrlCore(payload, auditId, consentStore);
     }),
   );
 
