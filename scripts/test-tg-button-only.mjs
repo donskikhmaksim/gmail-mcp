@@ -115,6 +115,41 @@ async function buildPlan({ tg, hasAutoExecutor } = {}) {
   return { store, dec, id: dec.manifestId };
 }
 
+
+/** Поднимает НАСТОЯЩИЙ MCP-сервер этого репозитория на in-memory транспорте.
+ * Ни сети, ни живых Google API — только фейковые клиенты. */
+async function mcpHarness({ tg, store, counters } = {}) {
+  const c = counters ?? { send: 0 };
+  const clients = {
+    names: ["work"], defaultName: "work", multi: false,
+    resolve: () => ({
+      gmail: {
+        users: {
+          getProfile: async () => ({ data: { emailAddress: "me@x.com" } }),
+          messages: {
+            send: async () => { c.send++; return { data: { id: "SID", threadId: "T1" } }; },
+            get: async () => ({ data: { labelIds: ["SENT"], payload: { headers: [] } } }),
+            list: async () => ({ data: { resultSizeEstimate: 0 } }),
+          },
+        },
+      },
+      accessToken: async () => "fake-token",
+    }),
+    canonicalName: (n) => (n && n.trim() ? n.trim() : "work"),
+    emailFor: () => "me@x.com",
+    baseGmailQuery: () => "",
+  };
+  const consentStore = store ?? makeStore();
+  const server = new McpServer({ name: "button-only", version: "0" });
+  registerGmailTools(server, clients, {
+    store: null, userToken: null, consentStore, consentCfg: cfg, auditStore: null, tg,
+  });
+  const cli = new Client({ name: "c", version: "0" });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(b), cli.connect(a)]);
+  return { cli, counters: c, store: consentStore };
+}
+
 // ═══ [1] юнит формулы ══════════════════════════════════════════════════════
 console.log("[1] формула isTgButtonOnly — две строки, никаких списков имён тулов");
 {
@@ -300,14 +335,28 @@ console.log("\n[8] TG-слой выключен → обычный тексто�
 // ═══ [9] инвентаризация: у каждого «кнопочного» тула есть чем исполниться ══
 console.log("\n[9] инвентаризация: гейтованные тулы vs реестр авто-исполнителей");
 {
-  // Список гейтованных тулов строится СКАНОМ ИСХОДНИКА, а не хардкодом: иначе
-  // новый тул, добавленный в gmail.ts, молча не попал бы под проверку.
-  const src = readFileSync(new URL("../src/tools/gmail.ts", import.meta.url), "utf8");
-  const gated = [...src.matchAll(/await requireGmailConsent<[^>]*>\(\{\s*tool:\s*"([^"]+)"/g)].map((m) => m[1]);
-  // Нижняя граница — иначе сломанный скан (regex перестал матчиться) молча
-  // прошёл бы по ПУСТОМУ множеству и тест был бы «зелёным» ни на чём.
-  check(`скан нашёл гейтованные тулы (${gated.length} ≥ 15)`, gated.length >= 15, String(gated.length));
-  check("скан не нашёл дублей", new Set(gated).size === gated.length, gated.join(","));
+  // ПРИЗНАК ЗАЩИЩЁННОСТИ БЕРЁТСЯ ИЗ ТОГО, ЧТО СЕРВЕР РЕАЛЬНО ПУБЛИКУЕТ, а не
+  // из регулярки по файлу. Regex-скан рабочей копии врёт молча: имена тулов
+  // совпадают, а защищённость меняется — сверка по КОЛИЧЕСТВУ этого не ловит.
+  // Рабочий признак: в опубликованной inputSchema есть ОБА параметра
+  // подтверждения (`manifest_id` и `user_reply`).
+  const { cli } = await mcpHarness({ tg: makeTg() });
+  const tools = (await cli.listTools()).tools;
+  check("реестр сервера непуст (санити)", tools.length > 10, String(tools.length));
+
+  const gated = tools
+    .filter((t) => {
+      const props = t.inputSchema?.properties ?? {};
+      return "manifest_id" in props && "user_reply" in props;
+    })
+    .map((t) => t.name);
+  // Нижняя граница — иначе сломанный отбор (пустой реестр, переименованные
+  // параметры) молча прошёл бы по ПУСТОМУ множеству и был бы «зелёным» ни на чём.
+  check(`из живого реестра отобраны гейтованные тулы (${gated.length} ≥ 15)`, gated.length >= 15, String(gated.length));
+  check("оба параметра подтверждения, а не один", gated.every((n) => {
+    const props = tools.find((t) => t.name === n).inputSchema.properties;
+    return props.manifest_id && props.user_reply;
+  }));
 
   const registered = new Set(registeredAutoExecuteTools());
   check(`реестр авто-исполнителей непуст (${registered.size} ≥ 15)`, registered.size >= 15, String(registered.size));
@@ -321,12 +370,25 @@ console.log("\n[9] инвентаризация: гейтованные тулы
 
   // Мутационный тест САМОЙ инвентаризации: выкидываем один тул из реестра —
   // проверка обязана покраснеть. Без этого «зелёная инвентаризация» ничего не
-  // доказывает (сломанный скан/пустой реестр выглядели бы точно так же).
+  // доказывает (сломанный отбор/пустой реестр выглядели бы точно так же).
   const dropped = gated[0];
   registered.delete(dropped);
   check(`мутация: без «${dropped}» в реестре инвентаризация краснеет`, missing(gated).length === 1, missing(gated).join(", "));
   registered.add(dropped);
   check("после отката мутации инвентаризация снова зелёная", missing(gated).length === 0);
+
+  // Regex-скан исходника остаётся — но ТОЛЬКО как «кто зовёт гейт» (то есть
+  // чей план уходит кнопкой), и лишь для перекрёстной сверки с живым реестром:
+  // расхождение двух независимых источников = дрейф, который иначе не видно.
+  const src = readFileSync(new URL("../src/tools/gmail.ts", import.meta.url), "utf8");
+  const callsGate = [...src.matchAll(/await requireGmailConsent<[^>]*>\(\{\s*tool:\s*"([^"]+)"/g)].map((m) => m[1]);
+  check(`скан исходника нашёл вызовы гейта (${callsGate.length} ≥ 15)`, callsGate.length >= 15, String(callsGate.length));
+  check("скан не нашёл дублей", new Set(callsGate).size === callsGate.length, callsGate.join(","));
+  const onlyInSchema = gated.filter((t) => !callsGate.includes(t));
+  const onlyInSource = callsGate.filter((t) => !gated.includes(t));
+  check("живой реестр и исходник согласованы (нет дрейфа)",
+    onlyInSchema.length === 0 && onlyInSource.length === 0,
+    `только в схеме: [${onlyInSchema}], только в исходнике: [${onlyInSource}]`);
 }
 
 // ═══ [10] СКВОЗЬ РЕАЛЬНЫЙ MCP-ПУТЬ ═══════════════════════════════════════
@@ -338,37 +400,9 @@ console.log("\n[9] инвентаризация: гейтованные тулы
 // Поэтому здесь — настоящий тул через настоящий MCP-реестр.
 console.log("\n[10] сквозной путь через реальный gmail_send (боевая проводка hasAutoExecutor)");
 {
-  const counters = { send: 0 };
-  const clients = {
-    names: ["work"], defaultName: "work", multi: false,
-    resolve: () => ({
-      gmail: {
-        users: {
-          getProfile: async () => ({ data: { emailAddress: "me@x.com" } }),
-          messages: {
-            send: async () => { counters.send++; return { data: { id: "SID", threadId: "T1" } }; },
-            get: async () => ({ data: { labelIds: ["SENT"], payload: { headers: [] } } }),
-            list: async () => ({ data: { resultSizeEstimate: 0 } }),
-          },
-        },
-      },
-      accessToken: async () => "fake-token",
-    }),
-    canonicalName: (n) => (n && n.trim() ? n.trim() : "work"),
-    emailFor: () => "me@x.com",
-    baseGmailQuery: () => "",
-  };
-
   clock.t = 1_700_000_000_000;
   const tg = makeTg({ approval: "pending" });
-  const store = makeStore();
-  const server = new McpServer({ name: "button-only", version: "0" });
-  registerGmailTools(server, clients, {
-    store: null, userToken: null, consentStore: store, consentCfg: cfg, auditStore: null, tg,
-  });
-  const cli = new Client({ name: "c", version: "0" });
-  const [a, b] = InMemoryTransport.createLinkedPair();
-  await Promise.all([server.connect(b), cli.connect(a)]);
+  const { cli, counters, store } = await mcpHarness({ tg });
 
   const planRes = await cli.callTool({ name: "gmail_send", arguments: { messages: [{ to: "a@x.com", subject: "S", body: "B" }] } });
   const planText = planRes.content[0].text;
@@ -383,6 +417,14 @@ console.log("\n[10] сквозной путь через реальный gmail_
   check("боевой gmail_send: текстовое «да» НЕ отправило письмо", counters.send === 0, String(counters.send));
   check("боевой gmail_send: отказ говорит про кнопку", /кнопк/i.test(execText), execText.slice(0, 160));
   check("боевой gmail_send: план жив", store.manifests.get(manifestId).status === "AWAITING_CONSENT", store.manifests.get(manifestId).status);
+  // КОДИРОВКА: тексты отказов русские и идут через MCP-транспорт. Если где-то
+  // по пути поток читается не как UTF-8, русский превращается в мусор — и
+  // тогда проверки «ответ говорит про кнопку» молча перестают срабатывать, а
+  // не краснеют. Сверяем ЦЕЛУЮ русскую подстроку и отсутствие мусора.
+  check("UTF-8 доходит целым: точная русская подстрока на месте",
+    execText.includes("подтверждается ТОЛЬКО кнопкой"), JSON.stringify(execText.slice(0, 80)));
+  check("UTF-8: нет замен на ? / \\uFFFD (mojibake)",
+    !/[?]{3,}|\uFFFD/.test(execText) && /[а-яё]/i.test(execText), JSON.stringify(execText.slice(0, 80)));
 
   // Самый прямой снимок дыры: кнопка УЖЕ нажата. Без режима «только кнопкой»
   // текстовое «да» здесь ОТПРАВИЛО БЫ письмо (модель могла бы сочинить это

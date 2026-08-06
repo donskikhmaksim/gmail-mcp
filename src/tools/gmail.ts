@@ -1625,8 +1625,8 @@ export interface GmailSnoozeContext {
   userToken: string | null;
   /**
    * Consent-gate storage (package A1, `src/consent.ts`'s `ConsentStore`). null
-   * exactly when Postgres isn't configured. The 4 gated send tools below
-   * refuse outright when this is null — gate.md §3.5: no durable manifest
+   * exactly when Postgres isn't configured. Every gated write tool below (15
+   * after T1, not just the original 4 send tools) refuses outright when this is null — gate.md §3.5: no durable manifest
    * storage means no gate, and that must never become a silent bypass.
    */
   consentStore: ConsentStore | null;
