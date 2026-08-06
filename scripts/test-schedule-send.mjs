@@ -34,10 +34,20 @@ function makeStore() {
       scheduledRows.set(id, { id, ...args, canceled: false });
       return id;
     },
+    // Status-aware: gmail_cancel_scheduled_send's post-verify re-reads the
+    // 'canceled' bucket, so a fake that only ever answers 'pending' would make
+    // a real cancellation look unverifiable.
     listScheduledSends: async (accountName, status = "pending") =>
       [...scheduledRows.values()]
-        .filter((r) => r.accountName === accountName && !r.canceled && (status === "all" || status === "pending"))
-        .map((r) => ({ id: r.id, toPreview: r.toPreview, subjectPreview: r.subjectPreview, sendAt: r.sendAt, status: "pending" })),
+        .filter((r) => r.accountName === accountName)
+        .filter((r) => (status === "all" ? true : status === "canceled" ? r.canceled : status === "pending" ? !r.canceled : false))
+        .map((r) => ({
+          id: r.id,
+          toPreview: r.toPreview,
+          subjectPreview: r.subjectPreview,
+          sendAt: r.sendAt,
+          status: r.canceled ? "canceled" : "pending",
+        })),
     countScheduledSends: async () => 0,
     cancelScheduledSend: async (id, accountName) => {
       const row = scheduledRows.get(id);
@@ -256,15 +266,82 @@ out = parse(await client.callTool({ name: "gmail_list_scheduled_sends", argument
 check("lists the scheduled items", out.results.some((x) => x.subject === "Отчёт"), JSON.stringify(out.results));
 check("soonest-relevant fields present", out.results.every((x) => "id" in x && "sendAt" in x));
 
-console.log("\n[9] cancel_scheduled_send — cancels once, refuses a repeat, isolates unknown ids");
+console.log("\n[9] cancel_scheduled_send — GATED (2026-08-06): plan first, then execute");
 const idToCancel = [...scheduledRows.values()].find((r) => r.subjectPreview === "Отчёт").id;
-out = parse(await client.callTool({ name: "gmail_cancel_scheduled_send", arguments: { ids: [idToCancel] } }));
-check("canceled", out.results[0].canceled === true, JSON.stringify(out.results[0]));
-out = parse(await client.callTool({ name: "gmail_cancel_scheduled_send", arguments: { ids: [idToCancel, 999999] } }));
-check("re-canceling the same id fails cleanly", out.results[0].canceled === false, JSON.stringify(out.results[0]));
-check("unknown id fails cleanly, not an exception", out.results[1].canceled === false, JSON.stringify(out.results[1]));
+
+// 9a. A bare call must NOT cancel anything — it plans, and the preview has to
+//     name what would be lost (recipient/subject), not just an id.
+const planResp = await client.callTool({ name: "gmail_cancel_scheduled_send", arguments: { ids: [idToCancel] } });
+const planText = planResp.content[0].text;
+check("bare call returns a plan, not a result", planText.includes("### 📤 План"), planText.slice(0, 80));
+check("preview names the recipient", planText.includes("boss@x.com"), planText.slice(0, 300));
+check("preview names the subject", planText.includes("Отчёт"), planText.slice(0, 300));
+check("preview warns the cancellation is one-way", /Обратной операции нет/.test(planText), planText.slice(0, 300));
+check(
+  "NOTHING was cancelled by the plan call",
+  scheduledRows.get(idToCancel).canceled === false,
+  JSON.stringify(scheduledRows.get(idToCancel)),
+);
+out = parse(await client.callTool({ name: "gmail_list_scheduled_sends", arguments: {} }));
+check("still listed as pending after the plan call", out.results.some((x) => x.id === idToCancel), JSON.stringify(out.results));
+
+// 9b. Execute with the manifest + a verbatim human reply.
+out = await planThenExecute(client, "gmail_cancel_scheduled_send", { ids: [idToCancel] }, "да, отменяй");
+check("canceled after confirmation", scheduledRows.get(idToCancel).canceled === true, JSON.stringify(out));
+check("summary reports 1/1 canceled", /Canceled 1\/1/.test(out.summary), JSON.stringify(out.summary));
+check("post-verify re-read the live queue", /отменена, подтверждено по живой очереди/.test(out.verification ?? ""), JSON.stringify(out.verification));
 out = parse(await client.callTool({ name: "gmail_list_scheduled_sends", arguments: {} }));
 check("canceled item no longer listed", !out.results.some((x) => x.id === idToCancel), JSON.stringify(out.results));
+
+// 9c. An id that is not pending must break the PLAN — the person confirming
+//     should never see a preview containing a message that cannot be cancelled.
+const badPlan = await client.callTool({ name: "gmail_cancel_scheduled_send", arguments: { ids: [idToCancel, 999999] } });
+const badText = badPlan.content[0].text;
+check("plan refuses when an id is not pending", /не найдена среди ожидающих/.test(badText), badText.slice(0, 200));
+check("refusal is an error result, not a plan", !badText.includes("### 📤 План"), badText.slice(0, 80));
+
+// 9d. REAL binding (gate.md §3.3 п.2): the queue is re-read at execute time.
+//     A message that left (or was cancelled elsewhere) between plan and
+//     confirmation must not be silently swapped for whatever is there now — a
+//     degenerate `rehash: sha256(addressing)` would happily accept it.
+console.log("\n[9d] cancel_scheduled_send — binding catches a queue that moved after the plan");
+out = await scheduleThroughGate(client, {
+  messages: [{ to: "drift@x.com", subject: "Уедет", body: "b", sendAt: "2099-07-01T08:00:00Z" }],
+});
+const driftId = out.results[0].id;
+const driftPlan = await client.callTool({ name: "gmail_cancel_scheduled_send", arguments: { ids: [driftId] } });
+const driftManifest = extractManifestId(driftPlan.content[0].text);
+// …the world moves: that message goes out (leaves the pending queue) before
+// the human's "yes" is relayed.
+scheduledRows.get(driftId).canceled = true;
+const driftOut = (await client.callTool({
+  name: "gmail_cancel_scheduled_send",
+  arguments: { manifest_id: driftManifest, user_reply: "да, отменяй" },
+})).content[0].text;
+check("stale plan is refused after the queue changed", /Состояние изменилось после планирования/.test(driftOut), driftOut.slice(0, 200));
+check("no success header on a refused stale plan", !/Canceled 1\/1/.test(driftOut), driftOut.slice(0, 120));
+
+// 9e. Post-verify must RE-READ the queue, never trust the UPDATE's own answer.
+//     A store that reports success while the row stays pending is exactly the
+//     silent-failure shape incident 1 had; the response must show ❌, not ✅.
+console.log("\n[9e] cancel_scheduled_send — post-verify believes the live queue, not the write call");
+const lyingStore = {
+  ...makeStore(),
+  listScheduledSends: async (_a, status = "pending") =>
+    status === "pending"
+      ? [{ id: 42, toPreview: "x@y.com", subjectPreview: "Не отменится", sendAt: new Date("2099-01-01T00:00:00Z"), status: "pending" }]
+      : [], // 'canceled' stays empty — the cancellation never actually landed
+  cancelScheduledSend: async () => true, // …but the write call claims success
+};
+const lyingClient = await buildHarness({
+  store: lyingStore,
+  userToken: null,
+  consentStore: makeConsentStore(),
+  consentCfg: CONSENT_CFG,
+});
+const lyingOut = await planThenExecute(lyingClient, "gmail_cancel_scheduled_send", { ids: [42] }, "да, отменяй");
+check("mismatch is caught by post-verify", /НЕ значится отменённой/.test(lyingOut.verification ?? ""), JSON.stringify(lyingOut.verification));
+check("the header is NOT a clean success", /❌/.test(lyingOut.summary ?? ""), JSON.stringify(lyingOut.summary));
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);
