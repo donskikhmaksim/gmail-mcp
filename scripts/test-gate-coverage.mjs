@@ -17,10 +17,7 @@
  *    below, with a one-line reason. A write tool that is neither gated nor
  *    allowlisted fails this test — that's the point: a new write landing in
  *    gmail.ts without going through requireConsent (or being consciously
- *    exempted) breaks CI instead of shipping silently ungated. Это утверждение
- *    стало ПРАВДОЙ только 2026-08-06: до появления `.github/workflows/ci.yml`
- *    `npm test` в CI не запускался вообще (были лишь guide/sync-upstream), и
- *    эта проверка ничего не блокировала, хотя комментарий уже обещал обратное.
+ *    exempted) breaks CI instead of shipping silently ungated.
  *
  * After T1, only TWO tools remain in the allowlist, both with the
  * orchestrator's explicit per-tool verdict (2026-08-04) as reason, not a
