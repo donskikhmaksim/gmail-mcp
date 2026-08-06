@@ -32,6 +32,12 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { registerGmailTools } from "../dist/tools/gmail.js";
 import { registerAccountTools } from "../dist/accounts.js";
+import { initDownloads } from "../dist/downloads.js";
+import { registeredAutoExecuteTools } from "../dist/autoExecute.js";
+
+// gmail_get_download_url refuses before the gate when the server doesn't know
+// its own public URL — give it one so the gate itself is what gets exercised.
+initDownloads("https://mail.example.test");
 
 let failures = 0;
 const check = (label, cond, extra = "") => {
@@ -84,6 +90,18 @@ const GATED_TOOLS = {
   },
   gmail_export_thread_eml: { args: { threadId: "T1" }, counterKey: "driveCreate", destructive: false },
   gmail_create_upload_session: { args: { files: [{ name: "big.pdf" }] }, counterKey: "driveCreate", destructive: false },
+  // Выдача ссылки-доступа на вложение. Раньше стояла с `readOnlyHint: true` и
+  // вызывалась без единой кнопки — «только чтение» здесь ложь: ссылка САМА
+  // является доступом (скачает любой, у кого она есть; отозвать нельзя).
+  // Мутация тут не проходит через фейковый Google-клиент (ссылка пишется в
+  // хранилище ссылок сервера), поэтому вместо счётчика вызовов проверяется
+  // прямое доказательство: в ответе фазы плана нет ни одной выданной ссылки.
+  gmail_get_download_url: {
+    args: { items: [{ messageId: "M1", attachmentId: "ATT1" }] },
+    counterKey: null,
+    planMustNotContain: "/dl/",
+    destructive: false,
+  },
 };
 
 // ── fakes (same shape as scripts/test-a3-gate.mjs, kept self-contained here
@@ -284,18 +302,37 @@ for (const [name, spec] of Object.entries(GATED_TOOLS)) {
 
 console.log("\n[4] behavioural proof: calling each gated tool WITHOUT manifest_id/user_reply never mutates");
 for (const [name, spec] of Object.entries(GATED_TOOLS)) {
-  const before = counters[spec.counterKey];
+  const before = spec.counterKey ? counters[spec.counterKey] : null;
   const resp = await cli.callTool({ name, arguments: spec.args });
   const body = text(resp);
-  check(`${name} plan call: mutation counter (${spec.counterKey}) unchanged`, counters[spec.counterKey] === before, String(counters[spec.counterKey]));
+  if (spec.counterKey) {
+    check(`${name} plan call: mutation counter (${spec.counterKey}) unchanged`, counters[spec.counterKey] === before, String(counters[spec.counterKey]));
+  }
+  if (spec.planMustNotContain) {
+    check(
+      `${name} plan call: nothing was handed out (no «${spec.planMustNotContain}» in the plan)`,
+      !body.includes(spec.planMustNotContain),
+      body.slice(0, 200),
+    );
+  }
   check(`${name} plan call: response is a plan, not a success/failure header`, body.includes("### 📤 План"), body.slice(0, 60));
   check(`${name} plan call: no ✅/✉️/❌ success-style header`, !/^[✅✉️❌]/.test(body), body.slice(0, 10));
 }
 
 console.log("\n[5] read tools genuinely carry readOnlyHint (spot-check, not exhaustive)");
-for (const name of ["gmail_list_scheduled_sends", "gmail_get_download_url", "gmail_confirm_upload", "list_accounts"]) {
+for (const name of ["gmail_list_scheduled_sends", "gmail_confirm_upload", "list_accounts"]) {
   const t = tools.find((x) => x.name === name);
   check(`${name} readOnlyHint: true`, t?.annotations?.readOnlyHint === true, JSON.stringify(t?.annotations));
+}
+
+// ── [6] у КАЖДОГО гейтованного тула есть исполнитель для кнопки в Telegram ──
+// Иначе получается тихий тупик: человек нажимает «✅ Подтвердить», манифест
+// помечается подтверждённым, а исполнять действие некому — поллер в http.ts
+// ищет исполнителя в реестре autoExecute.ts по ИМЕНИ тула.
+console.log("\n[6] every gated tool has an auto-executor (the Telegram button must lead somewhere)");
+const executors = new Set(registeredAutoExecuteTools());
+for (const name of Object.keys(GATED_TOOLS)) {
+  check(`${name} has an auto-executor`, executors.has(name), [...executors].join(", "));
 }
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);

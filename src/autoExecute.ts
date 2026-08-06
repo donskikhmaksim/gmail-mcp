@@ -20,6 +20,7 @@
 
 import type { UserClients } from "./accounts.js";
 import type { ConsentStore, ConsentAddressing } from "./consent.js";
+import type { SafeFetchDeps } from "./safeFetch.js";
 
 /** Минимальная структурная поверхность, нужная snooze/schedule_send для
  * персистентности — то же самое, что `tools/gmail.ts`'s локальный `PgStore`
@@ -55,6 +56,15 @@ export interface AutoExecutorCtx {
    * per-request, и авто-путь используют ОДИН настоящий адаптер в проде, а
    * офлайн-тесты могут подставить фейковый через тот же `ctx`. */
   store: AutoExecutorPgStore | null;
+  /**
+   * Подменяемый транспорт для исходящих запросов к Google (`safeGoogleFetch`),
+   * тот же смысл, что у `GmailSnoozeContext.safeFetch`: ПРОД ЭТО НЕ ПЕРЕДАЁТ
+   * (поллер в http.ts строит ctx без него ⇒ реальная сеть), поле существует,
+   * чтобы офлайн-тесты могли проверить и АВТО-путь (исполнение по кнопке в
+   * Telegram) тем же способом, что и обычный вызов инструмента. Это не
+   * MCP-параметр — модель сюда ничего положить не может.
+   */
+  safeFetch?: SafeFetchDeps;
 }
 
 /** `ctx` — второй параметр, нужен ТОЛЬКО rehash-функциям с настоящим
