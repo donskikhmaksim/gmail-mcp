@@ -21,6 +21,8 @@ import {
   type ConsentStore,
   type ConsentConfig,
   type ConsentPlan,
+  type ConsentDecision,
+  type RequireConsentParams,
   type TgApprovalGate,
 } from "../consent.js";
 import {
@@ -29,7 +31,7 @@ import {
   DEFAULT_TTL_MINUTES,
   MAX_TTL_MINUTES,
 } from "../downloads.js";
-import { registerAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
+import { registerAutoExecutor, getAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 interface PgStore {
   addSnooze(args: {
@@ -1623,8 +1625,8 @@ export interface GmailSnoozeContext {
   userToken: string | null;
   /**
    * Consent-gate storage (package A1, `src/consent.ts`'s `ConsentStore`). null
-   * exactly when Postgres isn't configured. The 4 gated send tools below
-   * refuse outright when this is null — gate.md §3.5: no durable manifest
+   * exactly when Postgres isn't configured. Every gated write tool below (15
+   * after T1, not just the original 4 send tools) refuses outright when this is null — gate.md §3.5: no durable manifest
    * storage means no gate, and that must never become a silent bypass.
    */
   consentStore: ConsentStore | null;
@@ -1648,6 +1650,26 @@ export interface GmailSnoozeContext {
    * false unless TG_APPROVAL_ENABLED=true.
    */
   tg?: TgApprovalGate;
+}
+
+/**
+ * Единственная точка вызова consent-гейта в этом файле. Отличается от голого
+ * `requireConsent` РОВНО одним: всегда прокидывает `hasAutoExecutor` — ответ на
+ * вопрос «есть ли у этого инструмента способ исполниться ПО НАЖАТИЮ кнопки»
+ * (реестр `autoExecute.ts`). Это второе условие режима «только кнопкой»
+ * (`consent.ts`'s `isTgButtonOnly`): правило по СВОЙСТВУ, а не список имён —
+ * как только у тула появляется авто-исполнитель, его план автоматически
+ * перестаёт подтверждаться текстом.
+ *
+ * Обёртка, а не аргумент в каждом из 15 вызовов, ИМЕННО чтобы новый гейтованный
+ * тул не мог случайно оказаться без этого условия: забыть про обёртку сложнее,
+ * чем забыть одно поле в объекте.
+ */
+function requireGmailConsent<T>(p: RequireConsentParams<T>): Promise<ConsentDecision<T>> {
+  return requireConsent<T>({
+    hasAutoExecutor: (tool) => getAutoExecutor(tool) !== undefined,
+    ...p,
+  });
 }
 
 /** Fallback gate config for callers that don't wire a real one (offline unit
@@ -2944,7 +2966,7 @@ export function registerGmailTools(
       const selfEmail = await accountEmail(g, accountName);
       const fromLabel = selfEmail ? `${accountName} (${selfEmail})` : accountName;
 
-      const decision = await requireConsent<SendBatchPayload>({
+      const decision = await requireGmailConsent<SendBatchPayload>({
         tool: "gmail_send",
         accountLabel: accountName,
         manifestId: manifest_id,
@@ -3042,7 +3064,7 @@ export function registerGmailTools(
       const selfEmail = await accountEmail(g, accountName);
       const fromLabel = selfEmail ? `${accountName} (${selfEmail})` : accountName;
 
-      const decision = await requireConsent<ReplyBatchPayload>({
+      const decision = await requireGmailConsent<ReplyBatchPayload>({
         tool: "gmail_reply",
         accountLabel: accountName,
         manifestId: manifest_id,
@@ -3174,7 +3196,7 @@ export function registerGmailTools(
       const selfEmail = await accountEmail(g, accountName);
       const fromLabel = selfEmail ? `${accountName} (${selfEmail})` : accountName;
 
-      const decision = await requireConsent<ForwardBatchPayload>({
+      const decision = await requireGmailConsent<ForwardBatchPayload>({
         tool: "gmail_forward",
         accountLabel: accountName,
         manifestId: manifest_id,
@@ -3285,7 +3307,7 @@ export function registerGmailTools(
       const selfEmail = await accountEmail(g, accountName);
       const fromLabel = selfEmail ? `${accountName} (${selfEmail})` : accountName;
 
-      const decision = await requireConsent<DraftBatchPayload>({
+      const decision = await requireGmailConsent<DraftBatchPayload>({
         tool: "gmail_create_draft",
         accountLabel: accountName,
         manifestId: manifest_id,
@@ -3366,7 +3388,7 @@ export function registerGmailTools(
       const g = clients.resolve(account);
       const accountName = clients.canonicalName(account);
 
-      const decision = await requireConsent<IdBatchPayload>({
+      const decision = await requireGmailConsent<IdBatchPayload>({
         tool: "gmail_archive",
         accountLabel: accountName,
         manifestId: manifest_id,
@@ -3426,7 +3448,7 @@ export function registerGmailTools(
       const g = clients.resolve(account);
       const accountName = clients.canonicalName(account);
 
-      const decision = await requireConsent<IdBatchPayload>({
+      const decision = await requireGmailConsent<IdBatchPayload>({
         tool: "gmail_trash",
         accountLabel: accountName,
         manifestId: manifest_id,
@@ -3493,7 +3515,7 @@ export function registerGmailTools(
       const g = clients.resolve(account);
       const accountName = clients.canonicalName(account);
 
-      const decision = await requireConsent<ModifyLabelsPayload>({
+      const decision = await requireGmailConsent<ModifyLabelsPayload>({
         tool: "gmail_modify_labels",
         accountLabel: accountName,
         manifestId: manifest_id,
@@ -3599,7 +3621,7 @@ export function registerGmailTools(
       const g = clients.resolve(account);
       const accountName = clients.canonicalName(account);
 
-      const decision = await requireConsent<SnoozeBatchPayload>({
+      const decision = await requireGmailConsent<SnoozeBatchPayload>({
         tool: "gmail_snooze",
         accountLabel: accountName,
         manifestId: manifest_id,
@@ -3721,7 +3743,7 @@ export function registerGmailTools(
       const selfEmail = await accountEmail(g, accountName);
       const fromLabel = selfEmail ? `${accountName} (${selfEmail})` : accountName;
 
-      const decision = await requireConsent<ScheduleBatchPayload>({
+      const decision = await requireGmailConsent<ScheduleBatchPayload>({
         tool: "gmail_schedule_send",
         accountLabel: accountName,
         manifestId: manifest_id,
@@ -4032,7 +4054,7 @@ export function registerGmailTools(
       const g = clients.resolve(account);
       const accountName = clients.canonicalName(account);
 
-      const decision = await requireConsent<SaveAttachmentPayload>({
+      const decision = await requireGmailConsent<SaveAttachmentPayload>({
         tool: "gmail_save_attachment_to_drive",
         accountLabel: accountName,
         manifestId: manifest_id,
@@ -4171,7 +4193,7 @@ export function registerGmailTools(
       const g = clients.resolve(account);
       const accountName = clients.canonicalName(account);
 
-      const decision = await requireConsent<CreateLabelPayload>({
+      const decision = await requireGmailConsent<CreateLabelPayload>({
         tool: "gmail_create_label",
         accountLabel: accountName,
         manifestId: manifest_id,
@@ -4251,7 +4273,7 @@ export function registerGmailTools(
       const g = clients.resolve(account);
       const accountName = clients.canonicalName(account);
 
-      const decision = await requireConsent<UpdateLabelPayload>({
+      const decision = await requireGmailConsent<UpdateLabelPayload>({
         tool: "gmail_update_label",
         accountLabel: accountName,
         manifestId: manifest_id,
@@ -4354,7 +4376,7 @@ export function registerGmailTools(
       const g = clients.resolve(account);
       const accountName = clients.canonicalName(account);
 
-      const decision = await requireConsent<DeleteLabelPayload>({
+      const decision = await requireGmailConsent<DeleteLabelPayload>({
         tool: "gmail_delete_label",
         accountLabel: accountName,
         manifestId: manifest_id,
@@ -4480,7 +4502,7 @@ export function registerGmailTools(
       // `readThreadIdentity(g, id)` now (moved so `rehash` — module-level for
       // the auto-executor — can call the exact same function `plan` uses).
 
-      const decision = await requireConsent<ExportThreadPayload>({
+      const decision = await requireGmailConsent<ExportThreadPayload>({
         tool: "gmail_export_thread_eml",
         accountLabel: accountName,
         manifestId: manifest_id,
@@ -4684,7 +4706,7 @@ export function registerGmailTools(
       const g = clients.resolve(account);
       const accountName = clients.canonicalName(account);
 
-      const decision = await requireConsent<UploadSessionPayload>({
+      const decision = await requireGmailConsent<UploadSessionPayload>({
         tool: "gmail_create_upload_session",
         accountLabel: accountName,
         manifestId: manifest_id,

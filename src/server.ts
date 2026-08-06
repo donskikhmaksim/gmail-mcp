@@ -17,6 +17,7 @@ import {
   getManifest,
   consumeManifest,
   invalidateManifest,
+  markTgNotified,
   appendConsentAudit,
   updateConsentAuditOutcome,
   listConsentAudit,
@@ -75,6 +76,7 @@ export const consentStoreAdapter: ConsentStore = {
   getManifest,
   consumeManifest,
   invalidateManifest,
+  markTgNotified,
   appendConsentAudit,
   updateConsentAuditOutcome,
 };
@@ -144,7 +146,7 @@ export function buildMcpServer(user: User): McpServer {
     { instructions: "Tools to manage Gmail: read, search, send, reply, archive, delete, labels. " + accountsHint },
   );
   // Package A3 landed: `GmailSnoozeContext` (gmail.ts) now declares
-  // `consentStore`/`consentCfg` and the 4 send tools wire `requireConsent`
+  // `consentStore`/`consentCfg` and all 15 gated write tools wire `requireConsent`
   // through them. Honest degradation (gate.md §3.5): `consentStore` is null
   // exactly when `store` is — without Postgres there's nowhere to persist a
   // manifest, so the gated tools refuse outright rather than send unconfirmed.

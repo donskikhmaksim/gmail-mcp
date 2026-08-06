@@ -114,7 +114,7 @@ function secretMatches(provided: string, expected: string): boolean {
  * auth mechanism is configured. `config.requireAuth` is false exactly when a
  * deployment sets neither `MCP_AUTH_TOKEN` nor onboarding OAuth — before this
  * fix, `handleMcp` served every caller as `config.users[0]` with ZERO
- * authentication, including the 4 consent-gated send tools: an external
+ * authentication, including all 15 consent-gated write tools: an external
  * caller could invoke `gmail_send` and simply supply its own `user_reply`,
  * walking straight through the gate (STANDARD §1.2 obход, §1.5 fail-closed by
  * default). Refuse with 503 instead. The only escape hatch is an explicit env
@@ -132,7 +132,7 @@ function allowUnauthenticated(): boolean {
 const NO_AUTH_CONFIGURED_MESSAGE =
   "No authentication is configured for this server (no MCP_AUTH_TOKEN, no onboarding OAuth). " +
   "Refusing unauthenticated access to /mcp, since that would let ANY caller invoke every tool " +
-  "unauthenticated -- including the 4 consent-gated send tools, where the caller could simply " +
+  "unauthenticated -- including all 15 consent-gated write tools, where the caller could simply " +
   "supply its own user_reply and walk through the gate. Set MCP_AUTH_TOKEN, enable onboarding " +
   "OAuth, or (LOCAL DEVELOPMENT ONLY) set MCP_ALLOW_UNAUTHENTICATED=true.";
 
@@ -508,7 +508,7 @@ export async function startHttpServer(config: Config): Promise<void> {
         if (allowUnauthenticated()) {
           console.warn(
             "WARNING: MCP_ALLOW_UNAUTHENTICATED=true — /mcp is serving EVERY request with ZERO " +
-              "authentication, including the 4 consent-gated send tools. Local development ONLY " +
+              "authentication, including all 15 consent-gated write tools. Local development ONLY " +
               "— never deploy this way.",
           );
         } else {

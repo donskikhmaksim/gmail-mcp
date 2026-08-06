@@ -243,7 +243,7 @@ console.log("\n[2] fail-closed: sendMessage упал → манифест НЕ �
 }
 
 // ═══ [3] happy path плана: sendMessage ок → PENDING-строка, ТГ-подсказка в превью ═══
-console.log("\n[3] план: sendMessage ок → planned, tg_approvals PENDING, превью просит и кнопку, и «да»");
+console.log("\n[3] план: sendMessage ок → planned, tg_approvals PENDING, превью просит кнопку + повтор вызова");
 let planCtx; // переиспользуем в [4]/[5]/[6]/[7]
 {
   const { mock } = resetTelegramMocks();
@@ -256,7 +256,13 @@ let planCtx; // переиспользуем в [4]/[5]/[6]/[7]
   const dec = await requireConsent({ tool: "gmail_send", accountLabel: "work", plan, rehash, store: consentStore, cfg: consentCfg, tg: gate });
 
   check("kind=planned", dec.kind === "planned");
-  check("превью упоминает Telegram И «да» здесь", /Telegram/.test(dec.preview) && /да/.test(dec.preview));
+  // Приписка к плану БЕЗ авто-исполнителя (в этом тесте `hasAutoExecutor` не
+  // передан) честно просит ПОВТОРИТЬ ВЫЗОВ после нажатия — текстовое «да» для
+  // такого плана всё ещё единственный способ довести дело до конца. Зеркальный
+  // случай (план с авто-исполнителем ⇒ «только кнопкой») закреплён в
+  // scripts/test-tg-button-only.mjs.
+  check("превью упоминает Telegram", /Telegram/.test(dec.preview), dec.preview);
+  check("превью просит повторить вызов инструмента (нет авто-исполнителя)", /повтори вызов инструмента/.test(dec.preview), dec.preview);
   const row = tgStore.approvals.get(dec.manifestId);
   check("tg_approvals содержит PENDING-строку с этим manifestId", !!row && row.status === "PENDING");
   check("message_id из ответа Telegram сохранён", row.messageId === 4242);
