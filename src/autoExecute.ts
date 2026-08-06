@@ -37,6 +37,24 @@ export interface AutoExecutorPgStore {
     subjectPreview: string;
     sendAt: Date;
   }): Promise<number>;
+  /** gmail_cancel_scheduled_send (гейтован с 2026-08-06) читает живую очередь
+   * и в rehash (binding), и в post-verify — поэтому авто-путь тоже обязан их
+   * иметь, иначе кнопка «✅ Подтвердить» в Telegram упирается в тупик. */
+  listScheduledSends(
+    accountName: string,
+    status?: string,
+  ): Promise<
+    {
+      id: number;
+      toPreview: string;
+      subjectPreview: string;
+      sendAt: Date;
+      status?: string;
+      error?: string | null;
+      sentMessageId?: string | null;
+    }[]
+  >;
+  cancelScheduledSend(id: number, accountName: string): Promise<boolean>;
 }
 
 export interface AutoExecutorCtx {

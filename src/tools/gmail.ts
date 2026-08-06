@@ -114,6 +114,78 @@ interface AuditStore {
 
 const GOOGLE_DOC_MIME = "application/vnd.google-apps.document";
 
+// ── OCR scratch file: identity guard + honest cleanup ──────────────────────
+//
+// Google's OCR has no "read the text" endpoint: the only way in is to create a
+// Google Doc, i.e. a REAL file materialised in the owner's Drive (quota,
+// activity feed, "Recent"). That makes gmail_get_attachment_text a write,
+// however read-shaped it looks from outside — see its registration below for
+// why it nonetheless stays ungated and what has to hold for that to be safe.
+
+/** Name every OCR scratch doc carries — also the identity guard's marker. */
+const OCR_TEMP_NAME = "gmcp-ocr-tmp";
+
+/** A temp OCR file that is STILL IN THE USER'S DRIVE after the call. */
+interface OcrCleanupFailure {
+  tempFileId: string;
+  /** Why it could not be cleaned up — verbatim, never swallowed. */
+  error: string;
+}
+
+/**
+ * Moves the temporary OCR document to the trash, having first checked that the
+ * id really points at OUR scratch doc.
+ *
+ * Two deliberate choices, both reactions to how the previous version failed:
+ *
+ *  - TRASH, not `files.delete`. Permanent deletion must never be a side effect
+ *    of extracting text: if `docId` were ever wrong (a Drive quirk, a future
+ *    refactor threading in a caller-supplied id), a delete would destroy a real
+ *    user file with no recovery, while trashing is undoable for 30 days.
+ *  - IDENTITY GUARD. Re-read the file first and require name+mimeType to match
+ *    the scratch doc this call just created; a mismatch means we do NOT touch
+ *    it and report instead.
+ *
+ * @returns `null` on success, or a description of the leftover file. The caller
+ *   MUST surface a non-null result to the USER: the previous version logged the
+ *   failure and still reported a clean "extracted N/N", so the person whose
+ *   Drive was accumulating "gmcp-ocr-tmp" garbage never heard about it.
+ */
+async function cleanupOcrTempDoc(
+  g: GoogleClients,
+  docId: string,
+  toolName: string,
+): Promise<OcrCleanupFailure | null> {
+  try {
+    const meta = await g.drive.files.get({ fileId: docId, fields: "id,name,mimeType,trashed" });
+    const name = meta.data.name ?? "";
+    const mime = meta.data.mimeType ?? "";
+    if (name !== OCR_TEMP_NAME || mime !== GOOGLE_DOC_MIME) {
+      throw new Error(
+        `identity guard: ${docId} is «${safeText(name, 80)}» (${safeText(mime, 60)}), not this call's ` +
+          `temporary «${OCR_TEMP_NAME}» Google Doc — left untouched on purpose.`,
+      );
+    }
+    if (meta.data.trashed) return null;
+    await g.drive.files.update({ fileId: docId, requestBody: { trashed: true } });
+    return null;
+  } catch (e) {
+    const error = e instanceof Error ? e.message : String(e);
+    // Logged AND returned: the log is for the operator, the return value is for
+    // the person who asked — they are the one who has to remove the leftover.
+    console.error(`[${toolName}] temp OCR doc ${docId} was NOT cleaned up — it stays in Drive:`, error);
+    return { tempFileId: docId, error };
+  }
+}
+
+/** Human-readable warning naming every leftover, so it cannot pass unnoticed. */
+function ocrLeftoverWarning(leftovers: OcrCleanupFailure[]): string {
+  return (
+    `⚠️ ${leftovers.length} temporary OCR file(s) could NOT be cleaned up and are STILL in the Drive ` +
+    `(delete them by id: ${leftovers.map((l) => l.tempFileId).join(", ")}). Tell the user — do not hide this.`
+  );
+}
+
 /** Drive's upload host — a big attachment is staged there before it is mailed. */
 const DRIVE_UPLOAD_ENDPOINT = "https://www.googleapis.com/upload/drive/v3/files";
 
@@ -2204,6 +2276,164 @@ registerAutoExecutor("gmail_schedule_send", {
   },
 });
 
+// ---- gmail_cancel_scheduled_send -------------------------------------------
+//
+// GATED as of 2026-08-06. It used to be exempt, with "защитное действие
+// (отмена отправки), сознательно вне гейта" as the reason — i.e. cancelling was
+// treated as safe because it points in the "undo" direction. That does not
+// survive contact with what the gate is actually for: the gate protects the
+// OWNER'S INTENT, not one particular direction of change.
+//
+//  - the intent being destroyed here is one the owner already confirmed —
+//    gmail_schedule_send is itself gated, so "queue this" needed a yes while
+//    "un-queue it" needed nothing. A model could silently undo a confirmed
+//    decision, which is precisely the asymmetry a gate exists to prevent;
+//  - there is NO un-cancel. The row goes to 'canceled' and the send never
+//    happens; nothing restores it;
+//  - it fails silently. Nobody notices a mail that did not go out until the
+//    recipient asks about it;
+//  - the ids are bare integers copied out of a list, so an off-by-one cancels a
+//    different message than the one meant.
+
+interface CancelScheduledSendItem {
+  id: number;
+  toPreview: string;
+  subjectPreview: string;
+  /** ISO string of what the queue says RIGHT NOW — part of the binding hash. */
+  sendAt: string;
+}
+
+interface CancelScheduledSendPayload {
+  account: string;
+  items: CancelScheduledSendItem[];
+}
+
+/** The slice of the queue store this tool needs (plan, rehash and execute). */
+type ScheduledSendStore = Pick<PgStore, "listScheduledSends" | "cancelScheduledSend">;
+
+/** Reads the live queue rows behind the requested ids. Throws (→ the plan
+ * fails, nothing is cancelled) when an id is not actually pending: better to
+ * refuse than to build a plan whose preview shows blanks. */
+async function readPendingScheduledSends(
+  store: ScheduledSendStore,
+  accountName: string,
+  ids: number[],
+): Promise<CancelScheduledSendItem[]> {
+  const pending = await store.listScheduledSends(accountName, "pending");
+  const byId = new Map(pending.map((r) => [r.id, r]));
+  return ids.map((id) => {
+    const row = byId.get(id);
+    if (!row) {
+      throw new Error(
+        `Отправка ${id} не найдена среди ожидающих на аккаунте «${accountName}» — уже ушла, уже отменена ` +
+          "или это чужой id. Ничего не отменено; посмотрите gmail_list_scheduled_sends.",
+      );
+    }
+    return { id, toPreview: row.toPreview, subjectPreview: row.subjectPreview, sendAt: row.sendAt.toISOString() };
+  });
+}
+
+/** REAL binding (gate.md §3.3 п.2): goes back to the QUEUE at execute time and
+ * hashes what is there NOW. A message that left (or was cancelled by someone
+ * else, or had its time changed) between plan and confirmation no longer
+ * hashes the same, so the stale approval is refused instead of hitting a row
+ * the человек never saw. `__GONE__` is a deliberate sentinel — a vanished row
+ * must change the hash, not silently drop out of it. */
+async function rehashCancelScheduledSend(
+  store: ScheduledSendStore,
+  addressing: CancelScheduledSendPayload,
+): Promise<string> {
+  const pending = await store.listScheduledSends(addressing.account, "pending");
+  const byId = new Map(pending.map((r) => [r.id, r]));
+  const fresh = addressing.items.map((it) => {
+    const row = byId.get(it.id);
+    return row
+      ? { id: it.id, toPreview: row.toPreview, subjectPreview: row.subjectPreview, sendAt: row.sendAt.toISOString() }
+      : { id: it.id, toPreview: "__GONE__", subjectPreview: "__GONE__", sendAt: "__GONE__" };
+  });
+  return sha256({ account: addressing.account, items: fresh });
+}
+
+/** Independent post-verify: the row must actually be in 'canceled' afterwards —
+ * never trust the UPDATE's own rowCount as proof. */
+async function postVerifyScheduledSendCanceled(
+  store: ScheduledSendStore,
+  accountName: string,
+  id: number,
+  subjectHint: string,
+): Promise<VerifyLine & { detail: string }> {
+  const label = safeText(subjectHint) || "(без темы)";
+  let canceled: Awaited<ReturnType<ScheduledSendStore["listScheduledSends"]>>;
+  try {
+    canceled = await store.listScheduledSends(accountName, "canceled");
+  } catch (e) {
+    return {
+      outcome: "warn",
+      line: `- ⚠️ **«${label}»** (#${id}) — не удалось перепроверить (${safeText(e instanceof Error ? e.message : String(e), 60)})`,
+      detail: "read failed",
+    };
+  }
+  if (!canceled.some((r) => r.id === id)) {
+    return { outcome: "mismatch", line: `- ❌ **«${label}»** (#${id}) — в живой очереди НЕ значится отменённой`, detail: "not canceled" };
+  }
+  return { outcome: "ok", line: `- ✅ **«${label}»** (#${id}) — отменена, подтверждено по живой очереди`, detail: "canceled" };
+}
+
+async function executeCancelScheduledSendCore(
+  store: ScheduledSendStore,
+  payload: CancelScheduledSendPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const results: { id: number; to: string; subject: string; sendAt: string; error?: string }[] = await mapWithLimit(
+    payload.items,
+    async (it) => {
+      const base = { id: it.id, to: it.toPreview, subject: it.subjectPreview, sendAt: it.sendAt };
+      try {
+        const canceled = await store.cancelScheduledSend(it.id, payload.account);
+        return canceled ? base : { ...base, error: "Already sent, already canceled, or unknown id." };
+      } catch (e) {
+        return { ...base, error: String(e instanceof Error ? e.message : e) };
+      }
+    },
+  );
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Canceled",
+    summaryIcon: "🚫",
+    verify: (r) => postVerifyScheduledSendCanceled(store, payload.account, r.id, r.subject),
+    reportTitle: "Независимая проверка отмены отложенных отправок",
+    reportSubtitle: "запрошено ⇄ живая очередь этого сервера",
+    consentStore,
+    auditId,
+    preSnapshot: payload.items,
+  });
+}
+
+registerAutoExecutor("gmail_cancel_scheduled_send", {
+  rehash: (addressing, ctx: AutoExecutorCtx) => {
+    if (!ctx.store) {
+      throw new Error("Отмена отложенной отправки недоступна: хранилище (DATABASE_URL) сейчас недоступно.");
+    }
+    return rehashCancelScheduledSend(ctx.store, addressing as CancelScheduledSendPayload);
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    if (!ctx.store) {
+      // Same refusal the manual path gives synchronously: the manifest may have
+      // been built while Postgres was up, but the poller ticks later.
+      throw new Error("Отмена отложенной отправки недоступна: хранилище (DATABASE_URL) сейчас недоступно — попробуйте позже.");
+    }
+    const result = await executeCancelScheduledSendCore(
+      ctx.store,
+      payload as CancelScheduledSendPayload,
+      auditId,
+      ctx.consentStore,
+    );
+    return extractText(result);
+  },
+});
+
 // ---- gmail_save_attachment_to_drive ----------------------------------------
 
 async function rehashSaveAttachment(g: GoogleClients, addressing: SaveAttachmentPayload): Promise<string> {
@@ -4051,30 +4281,78 @@ export function registerGmailTools(
     "gmail_cancel_scheduled_send",
     {
       title: "Cancel a scheduled email",
-      description: "Cancel one or more messages queued by gmail_schedule_send, as long as they have not already gone out.",
+      description:
+        "Cancel one or more messages queued by gmail_schedule_send, as long as they have not already gone out. " +
+        "There is no un-cancel: a cancelled message is never sent. Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with `ids`) to " +
+        "build a plan and return a preview — nothing is cancelled yet. Show the preview to the user verbatim and " +
+        "wait for their reply. Call again with the returned `manifest_id` and the user's VERBATIM `user_reply` to " +
+        "actually cancel.",
       inputSchema: {
         account,
-        ids: z.array(z.number().int()).min(1).describe("Ids from gmail_list_scheduled_sends."),
+        ids: z
+          .array(z.number().int())
+          .optional()
+          .describe(
+            "Ids from gmail_list_scheduled_sends. Required to build a plan (first call, no manifest_id/" +
+              "user_reply). Ignored on the execute call — the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, ids }) => {
-      const { store } = snoozeCtx;
+    guard(async ({ account, ids, manifest_id, user_reply }) => {
+      const { store, consentStore, consentCfg, tg } = snoozeCtx;
       if (!store) {
         return fail("DATABASE_URL is not configured, so there is nothing scheduled to cancel.");
       }
+      if (!consentStore) {
+        return fail(
+          "Отмена отложенной отправки недоступна: не настроено хранилище согласия (DATABASE_URL). Без него " +
+            "сервер не может провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const accountName = clients.canonicalName(account);
-      const results = await mapWithLimit(ids, async (id) => {
-        const canceled = await store.cancelScheduledSend(id, accountName);
-        return canceled
-          ? { id, canceled: true as const }
-          : { id, canceled: false as const, error: "Already sent, already canceled, or unknown id." };
+
+      const decision = await requireConsent<CancelScheduledSendPayload>({
+        tool: "gmail_cancel_scheduled_send",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        tg,
+        // Plan reads the LIVE queue: the preview names who each message was
+        // going to, its subject and when it would have gone out — so the
+        // person confirming sees what they are about to lose, not bare ids.
+        plan: async () => {
+          if (!ids || !ids.length) {
+            throw new Error("Нужен непустой `ids`, чтобы построить план отмены отложенных отправок.");
+          }
+          const built = await readPendingScheduledSends(store, accountName, ids);
+          const payload: CancelScheduledSendPayload = { account: accountName, items: built };
+          const lines = built.map(
+            (it) =>
+              `- #${it.id} → **${safeText(it.toPreview, 80)}** — «${safeText(it.subjectPreview, 80)}», ушло бы ` +
+              `${formatLaTime(new Date(it.sendAt).getTime())}`,
+          );
+          const preview =
+            `### 📤 План: Отмена отложенной отправки — ${built.length}\n\n${lines.join("\n")}\n\n` +
+            "Эти письма НЕ будут отправлены. Обратной операции нет.";
+          return { payload, objectHash: sha256(payload), preview, batchSize: built.length };
+        },
+        rehash: (addressing) => rehashCancelScheduledSend(store, addressing as CancelScheduledSendPayload),
       });
-      const ok_ = results.filter((r) => r.canceled);
-      return ok({
-        summary: `🚫 Canceled ${ok_.length}/${ids.length} scheduled send(s)`,
-        results,
-      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      return executeCancelScheduledSendCore(store, payload, auditId, consentStore);
     }),
   );
 
@@ -4136,13 +4414,37 @@ export function registerGmailTools(
 
   // ---- gmail_get_attachment_text (array) -----------------------------------
 
+  // NOT gated — a deliberate, and NARROW, exemption. Rationale: reading an
+  // invoice PDF is a routine read-shaped question; a plan/confirm round-trip on
+  // every one of them trains the owner to rubber-stamp confirmations, which is
+  // how a gate quietly stops being a gate.
+  //
+  // What this tool is NOT is read-only, and it no longer implies otherwise (it
+  // used to ship with NO annotations at all, which reads as "nothing to see
+  // here"). Google's OCR forces a real Google Doc into the owner's Drive, so
+  // this is a write, it is classified as one by the source scan in
+  // scripts/test-gate-coverage.mjs, and it must stay accounted for there.
+  //
+  // Three properties are what make the exemption defensible rather than a
+  // hidden hole (see cleanupOcrTempDoc above):
+  //  1. the scratch copy goes to the TRASH, never files.delete — irreversible
+  //     deletion must not be a side effect of reading text;
+  //  2. an identity guard refuses to touch anything that is not our own
+  //     "gmcp-ocr-tmp" Google Doc;
+  //  3. a cleanup that fails is REPORTED in this tool's own result, not just
+  //     logged — the previous version logged it and still answered a clean
+  //     "extracted N/N", so the user never learned about the leftover.
+
   server.registerTool(
     "gmail_get_attachment_text",
     {
       title: "Read attachments as text (OCR)",
       description:
         "Extract the TEXT of one or more email attachments (PDF, scan, image) using Google Drive's built-in OCR. " +
-        "Use this to actually READ invoices/receipt PDFs.",
+        "Use this to actually READ invoices/receipt PDFs. NOT a pure read: Google's OCR only works on a Google " +
+        `Doc, so this creates a temporary Google Doc ("${OCR_TEMP_NAME}") in YOUR Drive per attachment, reads the ` +
+        "text, then moves that copy to the trash. If a copy cannot be cleaned up, the result says so explicitly " +
+        "and names the leftover file id — pass that on to the user instead of reporting a clean run.",
       inputSchema: {
         account,
         items: z
@@ -4156,10 +4458,15 @@ export function registerGmailTools(
           )
           .min(1),
       },
+      // No readOnlyHint: this creates and trashes a real Drive file. Reversible
+      // (trash, not permanent delete) → destructiveHint: false.
+      annotations: { destructiveHint: false },
     },
     guard(async ({ account, items }) => {
       const g = clients.resolve(account);
+      const leftovers: OcrCleanupFailure[] = [];
       const results = await mapWithLimit(items, async (item) => {
+          let docId: string | null = null;
           try {
             const att = await g.gmail.users.messages.attachments.get({
               userId: "me",
@@ -4168,42 +4475,31 @@ export function registerGmailTools(
             });
             const buffer = Buffer.from(att.data.data ?? "", "base64url");
             const created = await g.drive.files.create({
-              requestBody: { name: "gmcp-ocr-tmp", mimeType: GOOGLE_DOC_MIME },
+              requestBody: { name: OCR_TEMP_NAME, mimeType: GOOGLE_DOC_MIME },
               media: { mimeType: item.mimeType ?? "application/pdf", body: Readable.from(buffer) },
               ocrLanguage: item.ocrLanguage,
               fields: "id",
             });
-            // No gate here (this tool is read/OCR, not a mutation of anything
-            // the user owns going forward) — but the temp Google Doc it creates
-            // for OCR IS a real Drive write that must never linger. Guard the id
-            // itself (never call delete with an undefined fileId) and make the
-            // cleanup's own failure VISIBLE (logged), not a silently-swallowed
-            // `.catch(() => {})` — a delete that keeps failing (permissions,
-            // quota, transient 5xx) must show up in the logs instead of quietly
-            // accumulating "gmcp-ocr-tmp" garbage in the account's Drive forever.
-            const docId = created.data.id;
+            docId = created.data.id ?? null;
             if (!docId) {
               throw new Error("Google Drive did not return a file id for the temporary OCR document.");
             }
-            try {
-              const doc = await g.docs.documents.get({ documentId: docId });
-              const text = documentToPlainText(doc.data);
-              return { messageId: item.messageId, attachmentId: item.attachmentId, text };
-            } finally {
-              await g.drive.files.delete({ fileId: docId }).catch((e) => {
-                console.error(
-                  `[gmail_get_attachment_text] failed to delete temp OCR doc ${docId} — it will linger in Drive:`,
-                  e instanceof Error ? e.message : String(e),
-                );
-              });
-            }
+            const doc = await g.docs.documents.get({ documentId: docId });
+            const text = documentToPlainText(doc.data);
+            return { messageId: item.messageId, attachmentId: item.attachmentId, text };
           } catch (e) {
             return { messageId: item.messageId, attachmentId: item.attachmentId, error: String(e instanceof Error ? e.message : e) };
+          } finally {
+            if (docId) {
+              const failure = await cleanupOcrTempDoc(g, docId, "gmail_get_attachment_text");
+              if (failure) leftovers.push(failure);
+            }
           }
         });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
         summary: `📄 Extracted text from ${ok_.length}/${items.length} attachment(s)`,
+        ...(leftovers.length ? { warning: ocrLeftoverWarning(leftovers), leftoverTempFiles: leftovers } : {}),
         results,
       });
     }),

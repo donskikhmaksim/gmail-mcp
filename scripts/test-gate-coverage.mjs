@@ -45,13 +45,15 @@
  *    gmail.ts without going through requireConsent (or being consciously
  *    exempted) breaks CI instead of shipping silently ungated.
  *
- * Three tools remain in the allowlist, each with an explicit per-tool verdict
- * as its reason, not a placeholder: gmail_cancel_scheduled_send (itself
- * protective — it cancels a send), gmail_get_attachment_text (read/OCR; its
- * transient Google Doc gets a reliable finally-cleanup, not a gate) and
- * gmail_confirm_upload (mutates nothing — a status probe that no longer takes
- * an address at all: the server looks the upload URI up in its own store by an
- * opaque `sessionId` and goes there through `safeGoogleFetch`).
+ * TWO tools remain in the allowlist (2026-08-06 — gmail_cancel_scheduled_send
+ * left it for the gate, see GATED_TOOLS), each with an explicit per-tool
+ * verdict as its reason, not a placeholder: gmail_get_attachment_text (OCR is
+ * a read-shaped question and gating every one of them would only teach
+ * rubber-stamping — so instead its scratch Google Doc is TRASHED under an
+ * identity guard and a failed cleanup is reported to the user, not swallowed)
+ * and gmail_confirm_upload (mutates nothing — a status probe that no longer
+ * takes an address at all: the server looks the upload URI up in its own store
+ * by an opaque `sessionId` and goes there through `safeGoogleFetch`).
  *
  * Usage: node scripts/test-gate-coverage.mjs
  */
@@ -202,8 +204,13 @@ const SIDE_EFFECTS = scanSideEffects();
 // for 3 of these; that has been replaced with the actual decision so this
 // list can't be mistaken for still-pending triage.
 const UNGATED_WRITE_ALLOWLIST = {
-  gmail_cancel_scheduled_send: "защитное действие (отмена отправки), сознательно вне гейта",
-  gmail_get_attachment_text: "по сути read (OCR), Drive-файл временный — надёжный finally-cleanup, не гейт",
+  gmail_get_attachment_text:
+    "OCR — рутинный вопрос-чтение («что в этом счёте?»); гейт на каждый такой вызов приучил бы штамповать " +
+    "подтверждения, и гейт перестал бы быть гейтом. Google-OCR всё равно материализует настоящий Google Doc " +
+    "в Диске владельца, поэтому тул честно классифицирован как write и БОЛЬШЕ НЕ притворяется безобидным: " +
+    "черновая копия уезжает в КОРЗИНУ (не files.delete), identity-guard не даёт тронуть ничего, кроме нашего " +
+    "же «gmcp-ocr-tmp», а провалившаяся уборка попадает в ОТВЕТ инструмента, а не только в лог " +
+    "(scripts/test-ocr-cleanup.mjs).",
   gmail_confirm_upload:
     "ничего не мутирует — статус-запрос; адрес НЕ приходит от модели вообще (сервер хранит его сам, " +
     "наружу отдан непрозрачный sessionId), исходящий запрос идёт через safeGoogleFetch " +
@@ -223,6 +230,15 @@ const GATED_TOOLS = {
   gmail_schedule_send: {
     args: { messages: [{ to: "c@x.com", subject: "S", body: "B", sendAt: "2099-01-01T08:00:00-07:00" }] },
     counterKey: "addScheduledSend",
+    destructive: true,
+  },
+  // Gated 2026-08-06. Was allowlisted as "protective — it only cancels", which
+  // confused the DIRECTION of the change with whose intent it destroys: the
+  // owner already confirmed the send (gmail_schedule_send is gated), there is
+  // no un-cancel, and a wrongly-cancelled mail fails silently.
+  gmail_cancel_scheduled_send: {
+    args: { ids: [7] },
+    counterKey: "cancelScheduledSend",
     destructive: true,
   },
   // ── T1 priority-2 tools ────────────────────────────────────────────────
@@ -289,6 +305,7 @@ function makeCounters() {
     labelPatch: 0,
     labelDelete: 0,
     driveCreate: 0,
+    cancelScheduledSend: 0,
   };
 }
 
@@ -385,9 +402,17 @@ function buildPgStore(counters) {
       counters.addScheduledSend++;
       return counters.addScheduledSend;
     },
-    listScheduledSends: async () => [],
+    // One pending row so gmail_cancel_scheduled_send's PLAN phase (which reads
+    // the live queue to show what would be lost) has something to find.
+    listScheduledSends: async (_account, status = "pending") =>
+      status === "pending"
+        ? [{ id: 7, toPreview: "a@x.com", subjectPreview: "Hi", sendAt: new Date("2099-01-01T08:00:00Z"), status: "pending" }]
+        : [],
     countScheduledSends: async () => 0,
-    cancelScheduledSend: async () => false,
+    cancelScheduledSend: async () => {
+      counters.cancelScheduledSend++;
+      return true;
+    },
   };
 }
 
