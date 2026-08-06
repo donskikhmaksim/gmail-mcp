@@ -395,9 +395,12 @@ await runHappyPath(
           String(fetchCalls[0]?.url),
         );
         check("текст упоминает 'Opened'", text.includes("Opened"), text);
+        // Отчёт теперь человекочитаемый (не JSON-дамп), поэтому поле ищем в
+        // строке «Детали», а не по `"sessionId": "…"`. Смысл проверки прежний:
+        // наружу уходит непрозрачный идентификатор, а не сам адрес загрузки.
         check(
           "наружу отдан непрозрачный sessionId, а не адрес",
-          /"sessionId":\s*"[A-Za-z0-9_-]{20,}"/.test(text) && !/"sessionId":\s*"[^"]*:\/\//.test(text),
+          /sessionId:\s*[A-Za-z0-9_-]{20,}/.test(text) && !/sessionId:\s*\S*:\/\//.test(text),
           text.slice(0, 300),
         );
       },

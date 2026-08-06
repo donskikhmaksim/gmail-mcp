@@ -313,12 +313,23 @@ export function renderConsentBlock(header: string, body: string): string {
   return `### ${header}\n\n${body}`;
 }
 
+/**
+ * Тело плана + строка с id/сроком. БЕЗ обращений к модели внутри текста.
+ *
+ * Раньше здесь был хвост «_[агенту: покажи это пользователю дословно и
+ * дождись его ответа. Не вызывай исполнение, пока он не ответил.]_» — то есть
+ * инструкция модели, вшитая в данные (см. `PRESENTATION_META_KEY` в
+ * util.ts про то, почему это порочный приём, а не безобидная мелочь).
+ * Требование никуда не делось, оно просто переехало в два ЧЕСТНЫХ места:
+ *  - поведенческий контракт («покажи превью дословно и жди ответа, не
+ *    исполняй») — в `description` каждого гейтованного инструмента, где он и
+ *    был всё это время дословно; это часть схемы инструмента, а не данные;
+ *  - машиночитаемый флаг «не пересказывать» — в `_meta` ответа
+ *    (`okVerbatim(..., "plan")`), вне `content`.
+ */
 function renderPlanned(previewBody: string, id: string, expiresAt: number): string {
   const meta = `_план \`${id}\` · истекает в ${formatLaTime(expiresAt)} PT_`;
-  const tail =
-    "_[агенту: покажи это пользователю дословно и дождись его ответа. " +
-    "Не вызывай исполнение, пока он не ответил.]_";
-  return `${previewBody}\n\n${meta}\n\n${tail}`;
+  return `${previewBody}\n\n${meta}`;
 }
 
 function renderRefusal(header: string, body: string): string {

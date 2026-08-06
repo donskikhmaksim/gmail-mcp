@@ -30,7 +30,7 @@ const check = (label, cond, extra = "") => {
   console.log(`${cond ? "  ok  " : "  FAIL"} ${label}${cond ? "" : ` — got: ${extra}`}`);
   if (!cond) failures++;
 };
-const parse = (r) => JSON.parse(r.content[0].text);
+const parse = (r) => r.structuredContent ?? JSON.parse(r.content[0].text);
 
 const TEMP_NAME = "gmcp-ocr-tmp";
 const GOOGLE_DOC_MIME = "application/vnd.google-apps.document";

@@ -26,7 +26,7 @@ const check = (label, cond, extra = "") => {
   console.log(`${cond ? "  ok  " : "  FAIL"} ${label}${cond ? "" : ` — got: ${extra}`}`);
   if (!cond) failures++;
 };
-const parse = (r) => JSON.parse(r.content[0].text);
+const parse = (r) => r.structuredContent ?? JSON.parse(r.content[0].text);
 
 // --- fake store with a mix of statuses -------------------------------------
 

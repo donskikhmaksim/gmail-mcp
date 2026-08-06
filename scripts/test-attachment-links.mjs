@@ -179,7 +179,10 @@ const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
 await Promise.all([server.connect(serverSide), client.connect(clientSide)]);
 
 const raw = async (name, args) => client.callTool({ name, arguments: args });
-const call = async (name, args) => JSON.parse((await raw(name, args)).content[0].text);
+const call = async (name, args) => {
+  const r = await raw(name, args);
+  return r.structuredContent ?? JSON.parse(r.content[0].text);
+};
 
 /** Drives a gated tool's plan→execute flow in one call, for tests that only
  * care about the mutation's outcome (the gate mechanics themselves are covered
@@ -423,8 +426,11 @@ console.log("\n[10a] тело неожиданного ответа наружу
     },
   });
   const resp = await raw("gmail_confirm_upload", { uploads: [{ sessionId: s6 }] });
-  const whole = resp.content[0].text;
-  out = JSON.parse(whole);
+  // Смотрим на ВЕСЬ результат (текст + structuredContent + _meta), а не только
+  // на content[0].text: с 2026-08-06 данные едут вторым полем, и утечка тела
+  // ответа туда была бы так же плоха, как в тексте.
+  const whole = JSON.stringify(resp);
+  out = resp.structuredContent ?? JSON.parse(resp.content[0].text);
   check("тела ответа нет во всём результате инструмента", !whole.includes("SUPER-SECRET-INTERNAL-BODY"), whole.slice(0, 200));
   check("номер статуса всё же сообщён", /500/.test(out.results[0].error ?? ""), JSON.stringify(out.results[0]));
   check("тело даже не читалось", bodyRead === false, String(bodyRead));

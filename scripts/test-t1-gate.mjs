@@ -43,7 +43,7 @@ const check = (label, cond, extra = "") => {
   console.log(`${cond ? "  ok  " : "  FAIL"} ${label}${cond ? "" : ` — got: ${extra}`}`);
   if (!cond) failures++;
 };
-const parse = (r) => JSON.parse(r.content[0].text);
+const parse = (r) => r.structuredContent ?? JSON.parse(r.content[0].text);
 const text = (r) => r.content[0].text;
 
 function extractManifestId(previewText) {

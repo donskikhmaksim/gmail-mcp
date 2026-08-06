@@ -113,7 +113,7 @@ async function buildHarness(snoozeCtx) {
   return client;
 }
 
-const parse = (r) => JSON.parse(r.content[0].text);
+const parse = (r) => r.structuredContent ?? JSON.parse(r.content[0].text);
 
 // gmail_schedule_send is now consent-gated (package A3): a bare call with
 // `messages` only builds a plan, nothing is queued. Sections 5-7 below drive

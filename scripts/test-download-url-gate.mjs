@@ -128,7 +128,7 @@ await Promise.all([server.connect(b), client.connect(a)]);
 
 const call = async (args) => {
   const r = await client.callTool({ name: "gmail_get_download_url", arguments: args });
-  return { isError: r.isError === true, text: r.content[0].text };
+  return { isError: r.isError === true, text: r.content[0].text, data: r.structuredContent };
 };
 const manifestIdOf = (previewText) => {
   const m = previewText.match(/план `([^`]+)`/);
@@ -176,7 +176,7 @@ let issuedToken = null;
   const id = manifestIdOf(plan.text);
   clock.t += 6_000;
   const done = await call({ manifest_id: id, user_reply: "да, давай" });
-  const body = JSON.parse(done.text);
+  const body = done.data;
   check("one link issued", linksIn(done.text) === 1, done.text.slice(0, 200));
   check("summary is the server's own status line", /^🔗 Выдано ссылок: 1\/1/.test(body.summary), body.summary);
   check("post-verify report attached", /Независимая проверка выданных ссылок/.test(body.verification ?? ""), String(body.verification).slice(0, 80));

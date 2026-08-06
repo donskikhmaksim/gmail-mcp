@@ -25,7 +25,7 @@ const check = (label, cond, extra = "") => {
   console.log(`${cond ? "  ok  " : "  FAIL"} ${label}${cond ? "" : ` — got: ${extra}`}`);
   if (!cond) failures++;
 };
-const parse = (r) => JSON.parse(r.content[0].text);
+const parse = (r) => r.structuredContent ?? JSON.parse(r.content[0].text);
 
 function gWith(getImpl) {
   return { gmail: { users: { messages: { get: getImpl } } } };
@@ -136,7 +136,7 @@ console.log("\n[3b] postVerifySend — read hangs past timeout → ⚠️");
 
 // --- 4. report rendering ----------------------------------------------------
 
-console.log("\n[4] renderPostVerifyReport — §5.3 shape + reprint-verbatim tail");
+console.log("\n[4] renderPostVerifyReport — §5.3 shape, БЕЗ инструкций агенту в теле");
 {
   const rep = renderPostVerifyReport([
     { outcome: "ok", messageId: "a", line: "- ✅ **«A»** — в «Отправленных», To: x@y.com", detail: "" },
@@ -144,7 +144,11 @@ console.log("\n[4] renderPostVerifyReport — §5.3 shape + reprint-verbatim tai
   ]);
   check("has proof heading", rep.includes("🧾 Независимая проверка"), rep);
   check("counts summarised", /✅ 1 подтверждено, ⚠️ 0 не проверено, ❌ 1 расхождение/.test(rep), rep);
-  check("reprint-verbatim instruction present", /перепечатай.*ДОСЛОВНО/.test(rep), rep);
+  // Было наоборот («instruction present») до 2026-08-06: сервер вшивал в тело
+  // отчёта «[агенту: перепечатай … ДОСЛОВНО]». Требование не исчезло — оно
+  // переехало в `_meta` ответа; в ДАННЫХ обращений к модели быть не должно.
+  // Полноценная проверка «по существу, а не по строке» — test-no-agent-directives.mjs.
+  check("НЕТ хвоста-инструкции агенту", !/перепечатай|\[агенту:/i.test(rep), rep);
 }
 
 // --- 5. wired gmail_send: self-send keeps header off ✅ ---------------------
