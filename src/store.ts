@@ -1464,4 +1464,44 @@ export async function listApprovedUnexecuted(server: string, nowMs: number, limi
   }));
 }
 
+/**
+ * Точечный сиблинг `listApprovedUnexecuted` — ОДИН кандидат по `manifest_id`
+ * (Максим, 2026-08-06: «исполнять прямо в обработчике нажатия, не дожидаясь
+ * опроса»). Тот же JOIN и те же условия, включая server-scoping по
+ * `consent_manifests.server`: вебхук-владелец получает нажатия по манифестам
+ * ВСЕХ серверов, но исполнять имеет право только свои — чужие остаются их
+ * собственным поллерам (у этого процесса нет ни их инструментов, ни их
+ * Google-клиентов). Возвращает null, когда манифеста нет, он не наш, уже
+ * потреблён/истёк или кнопка ещё не в APPROVED — вызывающий молча пропускает.
+ *
+ * НЕ является «захватом»: захват (одноразовость) по-прежнему делает атомарный
+ * `consumeManifest` внутри `tryAutoExecute`. Этот SELECT — только чтение
+ * адресации (tool/account/chat/message), чтобы собрать вызов.
+ */
+export async function getApprovedUnexecuted(
+  manifestId: string,
+  server: string,
+  nowMs: number,
+): Promise<AutoExecuteCandidateRow | null> {
+  const p = getPool();
+  const res = await p.query(
+    `SELECT m.id AS manifest_id, m.tool, m.account_label, a.chat_id, a.message_id
+       FROM consent_manifests m
+       JOIN tg_approvals a ON a.manifest_id = m.id
+      WHERE m.id = $1 AND m.server = $2 AND m.status = 'AWAITING_CONSENT' AND m.expires_at > $3
+        AND a.status = 'APPROVED'
+      LIMIT 1`,
+    [manifestId, server, nowMs],
+  );
+  if (!res.rows.length) return null;
+  const r = res.rows[0];
+  return {
+    manifestId: r.manifest_id,
+    tool: r.tool,
+    accountLabel: r.account_label,
+    chatId: r.chat_id,
+    messageId: r.message_id === null ? null : Number(r.message_id),
+  };
+}
+
 export { randomUUID };
