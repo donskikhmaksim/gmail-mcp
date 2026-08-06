@@ -2716,10 +2716,15 @@ async function downloadUrlBindingSnapshot(g: GoogleClients, items: DownloadUrlIt
         messageId: item.messageId,
         attachmentId: item.attachmentId,
         found: !!found,
-        // Имя/тип, которые передал вызывающий, ПЕРЕБИВАЮТ живые — ровно так
-        // же ведёт себя исполнение, поэтому и в биндинг идёт то же самое.
-        filename: item.filename ?? found?.filename ?? null,
-        mimeType: item.mimeType ?? found?.mimeType ?? null,
+        // ЖИВЫЕ имя/тип из письма — это и есть личность вложения, за которую
+        // отвечает биндинг: подменить файл за тем же attachmentId, не сломав
+        // хэш, нельзя. Имя, которое передал вызывающий, хранится ОТДЕЛЬНО
+        // (`saveAs`) и в превью показывается отдельной пометкой — иначе
+        // согласие можно было бы получить под чужим именем файла.
+        filename: found?.filename ?? null,
+        mimeType: found?.mimeType ?? null,
+        saveAs: item.filename ?? null,
+        mimeTypeOverride: item.mimeType ?? null,
         size: found?.size ?? null,
         subject: subject || null,
         from: from || null,
@@ -2732,8 +2737,10 @@ async function downloadUrlBindingSnapshot(g: GoogleClients, items: DownloadUrlIt
         messageId: item.messageId,
         attachmentId: item.attachmentId,
         found: false,
-        filename: item.filename ?? null,
-        mimeType: item.mimeType ?? null,
+        filename: null,
+        mimeType: null,
+        saveAs: item.filename ?? null,
+        mimeTypeOverride: item.mimeType ?? null,
         size: null,
         subject: null,
         from: null,
@@ -4756,7 +4763,8 @@ export function registerGmailTools(
         "THIS IS NOT A READ: the link IS the credential. Anyone holding it downloads that attachment with NO " +
         "sign-in and no permissions, and the link CANNOT be revoked — it works until it expires " +
         `(default ${DEFAULT_TTL_MINUTES} minutes, max ${MAX_TTL_MINUTES / 60} hours). Leaking it into a log, a chat ` +
-        "or another context is equivalent to leaking that piece of the correspondence. That is why it is a " +
+        "or another context is equivalent to leaking that piece of the correspondence. It grants access to that " +
+        "single attachment — not to the message, and not to the mailbox. That is why it is a " +
         "two-mode consent-gated tool (mcp-development-standard/references/gate.md): call WITHOUT " +
         "`manifest_id`/`user_reply` (with `items`) to build a plan and return a preview — NO link is issued yet. " +
         "Show the preview to the user verbatim and wait for their reply. Call again with the returned " +
@@ -4774,8 +4782,8 @@ export function registerGmailTools(
           )
           .optional()
           .describe(
-            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
-              "the approved batch is read back from the manifest.",
+            "Attachments to mint links for. Required to build a plan (first call, no manifest_id/user_reply). " +
+              "Ignored on the execute call — the approved batch is read back from the manifest.",
           ),
         ttlMinutes: z
           .number()
@@ -4783,14 +4791,22 @@ export function registerGmailTools(
           .min(1)
           .max(MAX_TTL_MINUTES)
           .optional()
-          .describe(`How long each link stays valid. Default ${DEFAULT_TTL_MINUTES} minutes.`),
+          .describe(
+            `How long each link stays valid. Default ${DEFAULT_TTL_MINUTES} minutes, hard maximum ` +
+              `${MAX_TTL_MINUTES} minutes (${MAX_TTL_MINUTES / 60} hours). Part of what is confirmed.`,
+          ),
         manifest_id: z
           .string()
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
-      annotations: { destructiveHint: false },
+      // НЕ readOnlyHint и НЕ «безобидное» действие: инструмент выдаёт
+      // неаутентифицированный, неотзываемый доступ тому, кому попадёт ссылка —
+      // тот же класс, что drive_share в соседнем репозитории. Поэтому
+      // destructiveHint: true (последствие необратимо) + openWorldHint: true
+      // (ссылка уходит во внешний мир).
+      annotations: { destructiveHint: true, openWorldHint: true },
     },
     guard(async ({ account, items, ttlMinutes, manifest_id, user_reply }) => {
       if (!downloadsAvailable()) {
@@ -4819,6 +4835,9 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        // План перечитывает MIME-дерево каждого письма (format=full) и берёт
+        // ЖИВЫЕ имя/тип/размер вложения — байты не качаются, ссылка не
+        // выдаётся, пока человек не подтвердит.
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план выдачи ссылок.");
@@ -4826,13 +4845,22 @@ export function registerGmailTools(
           const snapshot = await downloadUrlBindingSnapshot(g, items);
           const payload: DownloadUrlPayload = { account: accountName, ttlMinutes: ttl, items };
           const lines = snapshot.map((s) => {
-            const head = `- **«${safeText(s.filename ?? s.attachmentId, 60)}»**`;
+            // В превью человек видит ЖИВОЕ имя из письма, а не то, которое
+            // подставил вызывающий: иначе согласие можно было бы получить под
+            // подменённым именем файла («invoice.pdf» вместо «passport.jpg»).
+            // Имя от вызывающего показывается отдельной пометкой.
+            const head = `- **«${safeText(s.filename ?? s.saveAs ?? s.attachmentId, 60)}»**`;
+            const renamed =
+              s.saveAs && s.saveAs !== s.filename ? `; будет отдан под именем «${safeText(s.saveAs, 60)}»` : "";
             if (!s.found) {
-              return `${head} — ⚠️ письмо ${safeText(s.messageId, 40)} перечитать не удалось (удалено/нет доступа); ссылка будет выдана по данным вызывающего`;
+              return (
+                `${head} — ⚠️ письмо ${safeText(s.messageId, 40)} перечитать не удалось (удалено/нет доступа); ` +
+                `имя и тип не проверены — ссылка будет выдана по данным вызывающего${renamed}`
+              );
             }
             return (
               `${head} (${safeText(s.mimeType ?? "", 40)}, ${s.size ?? "?"} байт)` +
-              ` — из письма «${safeText(s.subject ?? "(без темы)", 60)}» от ${safeText(s.from ?? "(?)", 60)}`
+              ` — из письма «${safeText(s.subject ?? "(без темы)", 60)}» от ${safeText(s.from ?? "(?)", 60)}${renamed}`
             );
           });
           const preview =
@@ -4973,7 +5001,8 @@ export function registerGmailTools(
         "Ask Google how an upload started by gmail_create_upload_session is doing. Pass the `sessionId` that " +
         "session returned — the upload address itself is kept server-side and is NOT accepted as an argument. " +
         "Reports `complete` (the file is ready to attach), `in_progress` (how many bytes arrived, so the client " +
-        "knows where to resume), or `expired` (session gone — open a new one). Uploads nothing itself.",
+        "knows where to resume), or `expired` (session gone — open a new one). Uploads nothing itself. " +
+        "The body of an unexpected answer is never echoed back into the conversation.",
       inputSchema: {
         uploads: z
           .array(
@@ -4994,7 +5023,12 @@ export function registerGmailTools(
           )
           .min(1),
       },
-      annotations: { readOnlyHint: true },
+      // НЕ readOnlyHint: инструмент делает исходящий запрос наружу (пусть и по
+      // адресу, который сервер хранит у себя, а не принимает от модели) и
+      // читает собственное хранилище сессий. Пометка «только чтение» прятала
+      // его и от теста покрытия гейтов, и от группировки разрешений клиента —
+      // ровно так обе дыры и прожили незамеченными.
+      annotations: { destructiveHint: false, openWorldHint: true },
     },
     guard(async ({ uploads }) => {
       const results = await mapWithLimit(uploads, async ({ sessionId, sizeBytes }) => {
@@ -5010,6 +5044,9 @@ export function registerGmailTools(
         try {
           // An empty PUT with "bytes */total" asks for status instead of sending
           // content; the session URI carries its own authorisation.
+          // Перенаправления `safeGoogleFetch` вслепую не выполняет: каждый
+          // `Location` проходит те же проверки, а обычный ответ «шли дальше» —
+          // это 308 БЕЗ `Location`, его это не задевает.
           const res = await safeGoogleFetch(
             session.uploadUrl,
             {
@@ -5047,7 +5084,16 @@ export function registerGmailTools(
               error: "Google no longer knows this session (expired, cancelled, or finished long ago). Open a new one.",
             };
           }
-          return { sessionId, error: `Unexpected status ${res.status}: ${(await res.text()).slice(0, 500)}` };
+          // Тело неожиданного ответа НАРУЖУ НЕ УХОДИТ. Адрес сюда больше не
+          // приходит от модели, но эхо чужого тела в диалог — это канал утечки
+          // сам по себе (security-checklist.md §6): наружу идёт только номер
+          // статуса. Тело даже не читается.
+          return {
+            sessionId,
+            error:
+              `🛑 Неожиданный ответ на проверку загрузки: HTTP ${res.status}. ` +
+              "Тело ответа наружу не передаётся; при повторении — открыть новую загрузочную сессию.",
+          };
         } catch (e) {
           return { sessionId, error: String(e instanceof Error ? e.message : e) };
         }

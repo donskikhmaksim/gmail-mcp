@@ -6,8 +6,34 @@
  * Unlike every other test file here, this one does NOT hand-pick which tools
  * to exercise. It lists the tools from the REAL registered MCP registry
  * (`client.listTools()`, i.e. what a model actually sees) and, for every tool
- * classified as a write (no `readOnlyHint: true` — the exact rule the task
- * specifies), checks it against an explicit allowlist:
+ * classified as a write, checks it against an explicit allowlist.
+ *
+ * HOW A WRITE IS RECOGNISED (changed 2026-08-06). It used to be one line:
+ *
+ *     writes = tools.filter(t => t.annotations?.readOnlyHint !== true)
+ *
+ * i.e. the tool's own self-declaration. That is exactly how
+ * `gmail_get_download_url` (hands out an unauthenticated download link) and
+ * `gmail_confirm_upload` (PUTs to a URL supplied by the model) sat outside
+ * this test for months: both simply carried `readOnlyHint: true`. A label is
+ * not evidence.
+ *
+ * Classification is now derived from the SOURCE: `src/tools/*.ts` (+
+ * `src/accounts.ts`) are parsed, each `server.registerTool("name", …)` block
+ * is taken together with the bodies of the module-level functions it calls
+ * (transitively — every mutation in this repo lives in an `execute*Core`
+ * helper outside the registration block), and that code is scanned for
+ * side-effect markers: mutating Google API calls, a raw `fetch(`, a capability
+ * being minted (`issueDownloadLink(`), or a write to this server's own store.
+ * A tool carrying any marker MUST be either in `GATED_TOOLS` or in
+ * `UNGATED_WRITE_ALLOWLIST` with a written reason, and MUST NOT claim
+ * `readOnlyHint: true`. Hiding behind an annotation no longer works.
+ *
+ * The old annotation rule is kept as a SECOND, weaker signal (a tool without
+ * `readOnlyHint` still has to be accounted for), so the check is strictly
+ * stronger than before, never weaker.
+ *
+ * For every tool classified as a write:
  *
  *  - every entry in `GATED_TOOLS` (the 4 A3 send tools PLUS T1's 11
  *    priority-2 tools) gets a real BEHAVIOURAL check: calling it WITHOUT
@@ -19,14 +45,19 @@
  *    gmail.ts without going through requireConsent (or being consciously
  *    exempted) breaks CI instead of shipping silently ungated.
  *
- * After T1, only TWO tools remain in the allowlist, both with the
- * orchestrator's explicit per-tool verdict (2026-08-04) as reason, not a
- * placeholder: gmail_cancel_scheduled_send (itself protective — it cancels a
- * send) and gmail_get_attachment_text (read/OCR; its transient Google Doc
- * gets a reliable finally-cleanup, not a gate).
+ * Three tools remain in the allowlist, each with an explicit per-tool verdict
+ * as its reason, not a placeholder: gmail_cancel_scheduled_send (itself
+ * protective — it cancels a send), gmail_get_attachment_text (read/OCR; its
+ * transient Google Doc gets a reliable finally-cleanup, not a gate) and
+ * gmail_confirm_upload (mutates nothing — a status probe that no longer takes
+ * an address at all: the server looks the upload URI up in its own store by an
+ * opaque `sessionId` and goes there through `safeGoogleFetch`).
  *
  * Usage: node scripts/test-gate-coverage.mjs
  */
+import { readFileSync, readdirSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -35,8 +66,8 @@ import { registerAccountTools } from "../dist/accounts.js";
 import { initDownloads } from "../dist/downloads.js";
 import { registeredAutoExecuteTools } from "../dist/autoExecute.js";
 
-// gmail_get_download_url refuses before the gate when the server doesn't know
-// its own public URL — give it one so the gate itself is what gets exercised.
+// gmail_get_download_url refuses before the gate when the server does not know
+// its own public URL — give it one so the PLAN phase is actually reached here.
 initDownloads("https://mail.example.test");
 
 let failures = 0;
@@ -45,6 +76,121 @@ const check = (label, cond, extra = "") => {
   if (!cond) failures++;
 };
 const text = (r) => r.content[0].text;
+
+// ── static side-effect analysis of the tool sources ─────────────────────────
+//
+// Same parsing approach as scripts/gen-guide.mjs (`registerTool(...)` + a
+// balanced-brace reader), extended with a call graph: a registration block on
+// its own contains almost no mutations, because every gated tool delegates to
+// a module-level `execute*Core` helper. So the block's code is unioned with
+// the bodies of every module-level function it calls, transitively.
+
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const SOURCE_FILES = [
+  ...readdirSync(join(ROOT, "src", "tools"))
+    .filter((f) => f.endsWith(".ts"))
+    .map((f) => join(ROOT, "src", "tools", f)),
+  join(ROOT, "src", "accounts.ts"),
+];
+
+/** Markers of a real side effect. Each is a genuine change out in the world
+ * (or a capability handed out), not a naming convention. */
+const SIDE_EFFECT_MARKERS = [
+  ["gmail messages.send", /\bmessages\s*\.\s*send\s*\(/],
+  ["gmail messages.trash/untrash", /\bmessages\s*\.\s*(?:trash|untrash)\s*\(/],
+  ["gmail messages.modify", /\bmessages\s*\.\s*(?:modify|batchModify)\s*\(/],
+  ["gmail messages.delete", /\bmessages\s*\.\s*(?:delete|batchDelete)\s*\(/],
+  ["gmail drafts.*", /\bdrafts\s*\.\s*(?:create|send|update|delete)\s*\(/],
+  ["gmail labels.*", /\blabels\s*\.\s*(?:create|update|patch|delete)\s*\(/],
+  ["drive files.*", /\bfiles\s*\.\s*(?:create|update|delete|copy)\s*\(/],
+  ["drive permissions.*", /\bpermissions\s*\./],
+  ["raw fetch()", /(?<![A-Za-z0-9_$.])fetch\s*\(/],
+  // Исходящий запрос через проверенный транспорт — всё равно запрос НАРУЖУ, и
+  // прятаться за тем, что он «безопасный», этому списку нельзя: маркер ловит
+  // ровно то же, что старый `fetch(`, просто после переезда на safeFetch.ts.
+  ["outbound request (safeGoogleFetch)", /\bsafeGoogleFetch\s*\(/],
+  ["capability minted (issueDownloadLink)", /\bissueDownloadLink\s*\(/],
+  ["own store write", /\b(?:addSnooze|addScheduledSend|cancelScheduledSend|rememberUploadSession)\s*\(/],
+];
+
+/** Reads the balanced {...} block that starts at/after `from`. */
+function bracedBlockAt(src, from) {
+  const start = src.indexOf("{", from);
+  if (start < 0) return "";
+  let depth = 0;
+  for (let i = start; i < src.length; i++) {
+    const c = src[i];
+    if (c === "{") depth++;
+    else if (c === "}" && --depth === 0) return src.slice(start, i + 1);
+  }
+  return src.slice(start);
+}
+
+/** Module-level functions, by name → body. Covers both declaration styles
+ * used in this repo (`function f()` and `const f = async (…) => {`). */
+function moduleFunctions(src) {
+  const out = new Map();
+  const decl = /^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z0-9_$]+)\s*\(/gm;
+  const arrow = /^(?:export\s+)?const\s+([A-Za-z0-9_$]+)\s*(?::[^=\n]+)?=\s*(?:async\s*)?\([^)]*\)\s*(?::[^=>\n]+)?=>\s*\{/gm;
+  for (const re of [decl, arrow]) {
+    let m;
+    while ((m = re.exec(src))) out.set(m[1], bracedBlockAt(src, m.index));
+  }
+  return out;
+}
+
+/** Every `server.registerTool("name", …)` block: from its own call up to the
+ * next registration (or EOF). */
+function toolBlocks(src) {
+  const re = /server\.registerTool\(\s*["']([^"']+)["']/g;
+  const marks = [];
+  let m;
+  while ((m = re.exec(src))) marks.push({ name: m[1], at: m.index });
+  return marks.map((mk, i) => ({
+    name: mk.name,
+    code: src.slice(mk.at, i + 1 < marks.length ? marks[i + 1].at : src.length),
+  }));
+}
+
+/** Block code + the bodies of every module-level function it reaches. */
+function reachableCode(blockCode, fns) {
+  const seen = new Set();
+  const parts = [blockCode];
+  const queue = [blockCode];
+  const callRe = /\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
+  while (queue.length) {
+    const code = queue.shift();
+    let m;
+    callRe.lastIndex = 0;
+    while ((m = callRe.exec(code))) {
+      const name = m[1];
+      if (seen.has(name) || !fns.has(name)) continue;
+      seen.add(name);
+      const body = fns.get(name);
+      parts.push(body);
+      queue.push(body);
+    }
+  }
+  return parts.join("\n");
+}
+
+/** name → [marker labels] for every tool found in source. */
+function scanSideEffects() {
+  const found = new Map();
+  for (const file of SOURCE_FILES) {
+    const src = readFileSync(file, "utf8");
+    const fns = moduleFunctions(src);
+    for (const { name, code } of toolBlocks(src)) {
+      const all = reachableCode(code, fns);
+      const markers = SIDE_EFFECT_MARKERS.filter(([, re]) => re.test(all)).map(([label]) => label);
+      const prev = found.get(name) ?? [];
+      found.set(name, [...new Set([...prev, ...markers])]);
+    }
+  }
+  return found;
+}
+
+const SIDE_EFFECTS = scanSideEffects();
 
 // ── explicit allowlist of write tools NOT (yet) behind the consent gate ─────
 // Each entry names WHY it is here, so the list can't silently grow without a
@@ -58,6 +204,11 @@ const text = (r) => r.content[0].text;
 const UNGATED_WRITE_ALLOWLIST = {
   gmail_cancel_scheduled_send: "защитное действие (отмена отправки), сознательно вне гейта",
   gmail_get_attachment_text: "по сути read (OCR), Drive-файл временный — надёжный finally-cleanup, не гейт",
+  gmail_confirm_upload:
+    "ничего не мутирует — статус-запрос; адрес НЕ приходит от модели вообще (сервер хранит его сам, " +
+    "наружу отдан непрозрачный sessionId), исходящий запрос идёт через safeGoogleFetch " +
+    "(только хосты Google + проверка реального адреса соединения + перенаправления не вслепую), " +
+    "тело ответа наружу не идёт",
 };
 
 /** Every tool the gate covers (A3's 4 send tools + T1's 11 priority-2 tools),
@@ -90,17 +241,15 @@ const GATED_TOOLS = {
   },
   gmail_export_thread_eml: { args: { threadId: "T1" }, counterKey: "driveCreate", destructive: false },
   gmail_create_upload_session: { args: { files: [{ name: "big.pdf" }] }, counterKey: "driveCreate", destructive: false },
-  // Выдача ссылки-доступа на вложение. Раньше стояла с `readOnlyHint: true` и
-  // вызывалась без единой кнопки — «только чтение» здесь ложь: ссылка САМА
-  // является доступом (скачает любой, у кого она есть; отозвать нельзя).
-  // Мутация тут не проходит через фейковый Google-клиент (ссылка пишется в
-  // хранилище ссылок сервера), поэтому вместо счётчика вызовов проверяется
-  // прямое доказательство: в ответе фазы плана нет ни одной выданной ссылки.
+  // Not a mailbox mutation but a CAPABILITY handed out: an unauthenticated,
+  // non-revocable link to one attachment (same class as drive_share).
+  // `forbidInPlan` is the extra proof that the plan phase mints nothing —
+  // no counter can express "a link was issued", but a /dl/ URL in the body can.
   gmail_get_download_url: {
     args: { items: [{ messageId: "M1", attachmentId: "ATT1" }] },
-    counterKey: null,
-    planMustNotContain: "/dl/",
-    destructive: false,
+    counterKey: "driveCreate",
+    destructive: true,
+    forbidInPlan: /\/dl\//,
   },
 };
 
@@ -267,16 +416,32 @@ const { cli, counters } = await harness();
 const tools = (await cli.listTools()).tools;
 check("registry is non-empty (sanity)", tools.length > 10, String(tools.length));
 
-const writes = tools.filter((t) => t.annotations?.readOnlyHint !== true);
-const reads = tools.filter((t) => t.annotations?.readOnlyHint === true);
-console.log(`   ${tools.length} tool(s) total: ${reads.length} read-only, ${writes.length} write`);
+// Classification: the SOURCE decides (markers of a real side effect), with the
+// tool's own annotation kept only as a second, weaker signal. A tool that
+// mutates cannot hide by declaring itself read-only.
+const markersOf = (name) => SIDE_EFFECTS.get(name) ?? [];
+const hasSideEffect = (name) => markersOf(name).length > 0;
+const writes = tools.filter((t) => hasSideEffect(t.name) || t.annotations?.readOnlyHint !== true);
+const reads = tools.filter((t) => !writes.includes(t));
+console.log(`   ${tools.length} tool(s) total: ${reads.length} read, ${writes.length} write`);
 
-console.log("\n[2] every write tool is EITHER one of the 4 gated tools OR in the explicit allowlist");
+console.log("\n[1b] the static analysis actually saw every registered tool (parser sanity)");
+for (const t of tools) {
+  check(`${t.name} found in source`, SIDE_EFFECTS.has(t.name), "not parsed out of src/ — the source scan is broken");
+}
+check(
+  "the scan found side effects at all (it is not silently matching nothing)",
+  tools.filter((t) => hasSideEffect(t.name)).length >= 10,
+  String(tools.filter((t) => hasSideEffect(t.name)).length),
+);
+
+console.log("\n[2] every tool with a REAL side effect is gated or explicitly allowlisted");
 const unexpected = [];
 for (const t of writes) {
   const gated = t.name in GATED_TOOLS;
   const allowlisted = t.name in UNGATED_WRITE_ALLOWLIST;
-  check(`${t.name} — gated or allowlisted`, gated || allowlisted, `neither (new ungated write tool!)`);
+  const why = hasSideEffect(t.name) ? `side effects: ${markersOf(t.name).join(", ")}` : "no readOnlyHint";
+  check(`${t.name} — gated or allowlisted (${why})`, gated || allowlisted, "neither (ungated write tool!)");
   if (!gated && !allowlisted) unexpected.push(t.name);
 }
 check(
@@ -284,6 +449,21 @@ check(
   unexpected.length === 0,
   unexpected.join(", "),
 );
+
+console.log("\n[2b] a tool with a real side effect must NOT claim readOnlyHint (no hiding)");
+for (const t of tools) {
+  if (!hasSideEffect(t.name)) continue;
+  check(
+    `${t.name} does not claim readOnlyHint (${markersOf(t.name).join(", ")})`,
+    t.annotations?.readOnlyHint !== true,
+    JSON.stringify(t.annotations),
+  );
+}
+
+console.log("\n[2c] every gated/allowlisted entry really does have a side effect (list is not decorative)");
+for (const name of [...Object.keys(GATED_TOOLS), ...Object.keys(UNGATED_WRITE_ALLOWLIST)]) {
+  check(`${name} — source shows a side effect`, hasSideEffect(name), "no marker found — stale list entry or broken scan");
+}
 
 console.log("\n[3] every GATED_TOOLS entry is actually registered as a write (schema sanity)");
 for (const [name, spec] of Object.entries(GATED_TOOLS)) {
@@ -302,25 +482,19 @@ for (const [name, spec] of Object.entries(GATED_TOOLS)) {
 
 console.log("\n[4] behavioural proof: calling each gated tool WITHOUT manifest_id/user_reply never mutates");
 for (const [name, spec] of Object.entries(GATED_TOOLS)) {
-  const before = spec.counterKey ? counters[spec.counterKey] : null;
+  const before = counters[spec.counterKey];
   const resp = await cli.callTool({ name, arguments: spec.args });
   const body = text(resp);
-  if (spec.counterKey) {
-    check(`${name} plan call: mutation counter (${spec.counterKey}) unchanged`, counters[spec.counterKey] === before, String(counters[spec.counterKey]));
-  }
-  if (spec.planMustNotContain) {
-    check(
-      `${name} plan call: nothing was handed out (no «${spec.planMustNotContain}» in the plan)`,
-      !body.includes(spec.planMustNotContain),
-      body.slice(0, 200),
-    );
-  }
+  check(`${name} plan call: mutation counter (${spec.counterKey}) unchanged`, counters[spec.counterKey] === before, String(counters[spec.counterKey]));
   check(`${name} plan call: response is a plan, not a success/failure header`, body.includes("### 📤 План"), body.slice(0, 60));
   check(`${name} plan call: no ✅/✉️/❌ success-style header`, !/^[✅✉️❌]/.test(body), body.slice(0, 10));
+  if (spec.forbidInPlan) {
+    check(`${name} plan call: nothing was handed out (${spec.forbidInPlan})`, !spec.forbidInPlan.test(body), body.slice(0, 120));
+  }
 }
 
 console.log("\n[5] read tools genuinely carry readOnlyHint (spot-check, not exhaustive)");
-for (const name of ["gmail_list_scheduled_sends", "gmail_confirm_upload", "list_accounts"]) {
+for (const name of ["gmail_list_scheduled_sends", "gmail_get_message", "gmail_list_labels", "list_accounts"]) {
   const t = tools.find((x) => x.name === name);
   check(`${name} readOnlyHint: true`, t?.annotations?.readOnlyHint === true, JSON.stringify(t?.annotations));
 }

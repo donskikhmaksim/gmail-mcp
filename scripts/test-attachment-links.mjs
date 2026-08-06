@@ -243,6 +243,24 @@ check("строка кнопки: сказано, что именно она д�
 check("строка кнопки: отозвать нельзя", /отозвать нельзя/i.test(buttonLine), buttonLine);
 check("строка кнопки: назван срок жизни", /\d+\s*мин/.test(buttonLine), buttonLine);
 
+// Превью должно называть файл ЖИВЫМ именем из письма. Иначе согласие можно
+// получить под подменённым именем: модель показывает человеку «invoice.pdf»,
+// а ссылка ведёт на «Договор №7.pdf». Имя от вызывающего показывается, но
+// отдельной пометкой — как то, под каким именем файл будет отдан.
+{
+  const renamed = (
+    await raw("gmail_get_download_url", {
+      items: [{ messageId: "MSG1", attachmentId: "ATT1", filename: "invoice.pdf" }],
+    })
+  ).content[0].text;
+  check("превью называет ЖИВОЕ имя вложения из письма", /Договор №7\.pdf/.test(renamed), renamed.slice(0, 300));
+  check(
+    "подставленное вызывающим имя не выдаётся за настоящее",
+    /будет отдан под именем «invoice\.pdf»/.test(renamed),
+    renamed.slice(0, 400),
+  );
+}
+
 console.log("\n[3] link for an attachment, metadata looked up automatically");
 out = await planThenExecute("gmail_get_download_url", { items: [{ messageId: "MSG1", attachmentId: "ATT1" }] });
 let r = out.results[0];
@@ -390,6 +408,27 @@ check(
   out.results.length === 2 && out.results.every((x) => /socket hang up/.test(x.error ?? "")),
   JSON.stringify(out.results),
 );
+
+console.log("\n[10a] тело неожиданного ответа наружу не уходит");
+{
+  const s6 = await newSession("c.bin", "S6");
+  let bodyRead = false;
+  responder = () => ({
+    ok: false,
+    status: 500,
+    headers: { get: () => null },
+    text: async () => {
+      bodyRead = true;
+      return "SUPER-SECRET-INTERNAL-BODY";
+    },
+  });
+  const resp = await raw("gmail_confirm_upload", { uploads: [{ sessionId: s6 }] });
+  const whole = resp.content[0].text;
+  out = JSON.parse(whole);
+  check("тела ответа нет во всём результате инструмента", !whole.includes("SUPER-SECRET-INTERNAL-BODY"), whole.slice(0, 200));
+  check("номер статуса всё же сообщён", /500/.test(out.results[0].error ?? ""), JSON.stringify(out.results[0]));
+  check("тело даже не читалось", bodyRead === false, String(bodyRead));
+}
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);

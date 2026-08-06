@@ -298,8 +298,14 @@ export async function safeGoogleFetch(
   let url = assertAllowedGoogleUrl(rawUrl, allowed);
   for (let hop = 0; ; hop++) {
     const addrs = await resolveVettedAddresses(url.hostname.replace(/^\[|\]$/g, ""), lookup);
+    // Таймауты на ВСЕ фазы, не только на установление соединения: иначе
+    // «соединились и молчим» держало бы вызов минутами (undici по умолчанию
+    // ждёт заголовки/тело по 5 минут). Гейт подтверждения от этого не зависит,
+    // но подвисший инструмент — это тоже отказ в обслуживании.
     const dispatcher = new UndiciAgent({
       connect: { lookup: pinnedLookup(addrs), timeout: FETCH_TIMEOUT_MS },
+      headersTimeout: FETCH_TIMEOUT_MS,
+      bodyTimeout: FETCH_TIMEOUT_MS,
     });
     let res: Awaited<ReturnType<SafeFetchImpl>>;
     try {

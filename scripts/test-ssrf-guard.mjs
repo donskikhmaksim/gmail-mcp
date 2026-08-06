@@ -51,6 +51,11 @@ const ALLOWED = [
   "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=X",
   "https://storage.googleapis.com/upload/x",
   "https://lh3.googleusercontent.com/x",
+  // Формы одного и того же законного адреса, на которых наивная проверка
+  // строки спотыкается в другую сторону — ложный отказ тоже баг.
+  "https://googleapis.com/upload/drive/v3/files?upload_id=X", // апекс без www
+  "https://www.googleapis.com:443/upload/drive/v3/files?upload_id=X", // явный стандартный порт
+  "https://www.googleapis.com./upload/drive/v3/files?upload_id=X", // точка в конце имени — тот же хост
 ];
 for (const u of ALLOWED) {
   check(`принимает ${u.slice(0, 48)}…`, throws(() => assertAllowedGoogleUrl(u)) === null, String(throws(() => assertAllowedGoogleUrl(u))));
@@ -71,7 +76,10 @@ const BLOCKED = {
   "https://172.16.5.5/": "приватный диапазон 172.16/12",
   "https://100.64.0.1/": "CGNAT 100.64/10",
   "http://www.googleapis.com/upload/x": "правильный хост, но http",
-  "https://www.googleapis.com.evil.example/x": "похожий хост-подделка",
+  "https://www.googleapis.com.evil.example/x": "похожий хост-подделка (суффикс)",
+  "https://evil-googleapis.com/upload/drive/v3/files": "похожий хост-подделка (префикс, без точки)",
+  "https://evil.example.com/googleapis.com/upload": "разрешённое имя спрятано в ПУТИ чужого хоста",
+  "https://www.googleapis.com@evil.test/upload/drive/v3/files": "разрешённое имя как логин, хост чужой",
   "https://evil.example/?redir=https://www.googleapis.com": "чужой хост, Google только в query",
   "https://www.googleapis.com:8443/x": "нестандартный порт",
   "https://user:pass@www.googleapis.com/x": "встроенные учётные данные",
