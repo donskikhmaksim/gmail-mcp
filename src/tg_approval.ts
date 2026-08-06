@@ -341,11 +341,33 @@ export function secretTokenMatches(provided: string, expected: string): boolean 
  *  6. editMessageReplyMarkup — removes the buttons after ANY decision is
  *     recorded, so a second tap has nothing left to press.
  *  7. anything that isn't `callback_query` is ignored (early return).
+ *
+ * `onApproved` (опционально, Максим 2026-08-06: «отчёт пришёл спустя секунд
+ * 10, надо ускорять») — ХУК НЕМЕДЛЕННОГО ИСПОЛНЕНИЯ. До него единственным
+ * исполнителем был фоновый поллер с шагом 10 с (`http.ts`'s
+ * `runAutoExecutePoller`), из-за чего между нажатием кнопки и результатом
+ * стабильно проходило до 10 лишних секунд ожидания следующего тика. Обработчик
+ * нажатия УЖЕ держит в руках выигравшее решение — он же и запускает исполнение,
+ * поллер остаётся страховкой на случай, если процесс упал/перезапустился между
+ * решением и исполнением.
+ *
+ * Контракт хука (важен для портируемости — этот файл копируется байт-в-байт в
+ * остальные MCP-репозитории):
+ *  • вызывается ТОЛЬКО когда атомарный `consumeTgDecisionAnyServer` реально
+ *    вернул строку (то есть именно это нажатие выиграло гонку) и решение —
+ *    APPROVED. Одноразовость по-прежнему закрыта ОДНИМ неделимым UPDATE в БД,
+ *    здесь никакой второй проверки нет и быть не должно;
+ *  • НЕ ожидается (`await` намеренно отсутствует): исполнение — фоновая работа,
+ *    HTTP-ответ Telegram'у (200) и снятие кнопок не должны её ждать. Телеграм
+ *    ретраит по таймауту, а ретрай на уже потреблённой строке — no-op;
+ *  • ошибки хука проглатываются здесь же, чтобы упавшее исполнение не сорвало
+ *    `answerCallbackQuery` (спиннер на кнопке у человека).
  */
 export async function handleWebhook(
   cfg: TgApprovalConfig,
   store: TgApprovalStore,
   update: TelegramCallbackUpdate,
+  onApproved?: (row: TgApprovalRow) => void | Promise<void>,
 ): Promise<void> {
   const cq = update.callback_query;
   if (!cq) return; // (7)
@@ -369,6 +391,20 @@ export async function handleWebhook(
   // filter here — the manifest being decided may belong to any of them.
   // Safe because `manifest_id` is globally unique (tg_approvals' PRIMARY KEY).
   const consumed = await store.consumeTgDecisionAnyServer(manifestId, decision);
+
+  if (consumed && decision === "APPROVED" && onApproved) {
+    // Немедленное исполнение — СРАЗУ после выигранного консюма и ДО правки
+    // сообщения/ответа Telegram: чем раньше стартует фоновая работа, тем
+    // меньше пауза до отчёта. Намеренно без `await` (см. док-комментарий):
+    // ни этот обработчик, ни HTTP-ответ 200 не ждут исполнения.
+    try {
+      void Promise.resolve(onApproved(consumed)).catch((err) =>
+        console.error(`TG approval: немедленное исполнение ${manifestId} упало:`, err),
+      );
+    } catch (err) {
+      console.error(`TG approval: хук немедленного исполнения ${manifestId} бросил синхронно:`, err);
+    }
+  }
 
   if (consumed) {
     // (6) Remove the buttons -- best-effort, never blocks the decision itself.

@@ -13,7 +13,9 @@ import {
   setDefaultAccount,
   renameAccount,
   listApprovedUnexecuted,
+  getApprovedUnexecuted,
   storeReady,
+  type AutoExecuteCandidateRow,
 } from "./store.js";
 import { renderDashboard } from "./dashboard.js";
 import { logDashboardLocation } from "./logRedaction.js";
@@ -157,57 +159,107 @@ async function runAutoExecutePoller(config: Config): Promise<void> {
   const candidates = await listApprovedUnexecuted(consentServerConfig.server, Date.now());
   if (!candidates.length) return;
 
-  const user = (await userFromGoogleAccounts(config)) ?? config.users[0] ?? null;
-  if (!user) {
+  // Один ctx на весь тик — тот же объект уходит и в rehash (для тулов с
+  // настоящим биндингом, которым нужен живой `g`), и в execute, см.
+  // `autoExecute.ts`'s `AutoExecutorCtx` doc-comment.
+  const ctx = await buildAutoExecuteCtx(config);
+  if (!ctx) {
     console.error("TG auto-execute: нет доступного пользователя — пропускаю тик поллера");
     return;
   }
-  const clients = buildUserClients(user);
-  // Один ctx на весь тик — тот же объект уходит и в rehash (для тулов с
-  // настоящим биндингом, которым нужен живой `g`), и в execute, см.
-  // `autoExecute.ts`'s `AutoExecutorCtx` doc-comment. `store` — ТОТ ЖЕ
-  // адаптер, что per-request путь получает как `snoozeCtx.store`
-  // (server.ts's `buildMcpServer`) — `null` ровно когда DATABASE_URL не
-  // настроен, честно как и там.
-  const ctx: AutoExecutorCtx = {
-    clients,
+
+  for (const c of candidates) {
+    await executeApprovedCandidate(c, ctx);
+  }
+}
+
+/**
+ * Собирает контекст исполнения (аккаунты Google + адаптеры хранилища) — общий
+ * для ОБОИХ путей исполнения: фонового поллера (тик) и немедленного запуска по
+ * нажатию кнопки (`executeApprovedNow`). `store` — ТОТ ЖЕ адаптер, что
+ * per-request путь получает как `snoozeCtx.store` (server.ts's
+ * `buildMcpServer`) — `null` ровно когда DATABASE_URL не настроен, честно как и
+ * там. Возвращает null, когда ни одного Google-аккаунта нет — исполнять нечем.
+ */
+async function buildAutoExecuteCtx(config: Config): Promise<AutoExecutorCtx | null> {
+  const user = (await userFromGoogleAccounts(config)) ?? config.users[0] ?? null;
+  if (!user) return null;
+  return {
+    clients: buildUserClients(user),
     consentStore: consentStoreAdapter,
     userToken: user.token ?? null,
     store: storeReady() ? pgStoreAdapter : null,
   };
+}
 
-  for (const c of candidates) {
-    const executor = getAutoExecutor(c.tool);
-    if (!executor) {
-      // Инструмент ещё не переведён на новый паттерн (см. autoExecute.ts) —
-      // манифест останется PENDING/APPROVED и будет исполнен, как только
-      // модель сама позовёт execute (старый путь), либо когда этот тул
-      // получит свой executor. НЕ ошибка, просто ещё не покрыто.
-      continue;
-    }
-    try {
-      const result = await tryAutoExecute(
-        { manifestId: c.manifestId, tool: c.tool, accountLabel: c.accountLabel },
-        executor.rehash,
-        consentStoreAdapter,
-        consentServerConfig,
-        ctx,
-      );
-      if (!result) continue; // гонка/дрейф/истёк — тихо пропускаем, это не ошибка
-      const reportText = await executor.execute(result.payload, result.auditId, ctx);
-      await reportAutoExecutionResult(tgApprovalConfig, c.chatId, c.messageId, reportText);
-    } catch (err) {
-      console.error(`TG auto-execute: ошибка при исполнении ${c.tool}/${c.manifestId}:`, err);
-      // НЕ помечаем как исполненное при ошибке ДО tryAutoExecute — если он
-      // успел вызвать consumeManifest (манифест одноразовый), повторной
-      // попытки уже не будет; отчёт об ошибке всё равно стоит попытаться
-      // отправить, чтобы Максим не остался с зависшими кнопками в боте.
-      await reportAutoExecutionResult(
-        tgApprovalConfig, c.chatId, c.messageId,
-        `🛑 Ошибка при автоисполнении «${c.tool}»: ${err instanceof Error ? err.message : String(err)}`,
-      ).catch(() => {});
-    }
+/**
+ * Исполняет ОДИН одобренный кандидат. Единственное место, где живёт связка
+ * «захват → исполнение → отчёт», общая для поллера и для немедленного пути:
+ * захват (одноразовость) — атомарный `consumeManifest` ВНУТРИ `tryAutoExecute`,
+ * поэтому два одновременных вызова этой функции на один манифест дают ровно
+ * одно исполнение (второй получит `null` и молча выйдет). Никогда не бросает.
+ */
+async function executeApprovedCandidate(c: AutoExecuteCandidateRow, ctx: AutoExecutorCtx): Promise<void> {
+  const executor = getAutoExecutor(c.tool);
+  if (!executor) {
+    // Инструмент ещё не переведён на новый паттерн (см. autoExecute.ts) —
+    // манифест останется PENDING/APPROVED и будет исполнен, как только
+    // модель сама позовёт execute (старый путь), либо когда этот тул
+    // получит свой executor. НЕ ошибка, просто ещё не покрыто.
+    return;
   }
+  try {
+    const result = await tryAutoExecute(
+      { manifestId: c.manifestId, tool: c.tool, accountLabel: c.accountLabel },
+      executor.rehash,
+      consentStoreAdapter,
+      consentServerConfig,
+      ctx,
+    );
+    if (!result) return; // гонка/дрейф/истёк — тихо пропускаем, это не ошибка
+    const reportText = await executor.execute(result.payload, result.auditId, ctx);
+    await reportAutoExecutionResult(tgApprovalConfig, c.chatId, c.messageId, reportText);
+  } catch (err) {
+    console.error(`TG auto-execute: ошибка при исполнении ${c.tool}/${c.manifestId}:`, err);
+    // НЕ помечаем как исполненное при ошибке ДО tryAutoExecute — если он
+    // успел вызвать consumeManifest (манифест одноразовый), повторной
+    // попытки уже не будет; отчёт об ошибке всё равно стоит попытаться
+    // отправить, чтобы Максим не остался с зависшими кнопками в боте.
+    await reportAutoExecutionResult(
+      tgApprovalConfig, c.chatId, c.messageId,
+      `🛑 Ошибка при автоисполнении «${c.tool}»: ${err instanceof Error ? err.message : String(err)}`,
+    ).catch(() => {});
+  }
+}
+
+/**
+ * НЕМЕДЛЕННОЕ исполнение по нажатию кнопки (Максим, 2026-08-06: «отчёт пришёл
+ * спустя секунд 10, надо ускорять» — фактический замер по проду: кнопка нажата
+ * 13:22:28, аудит исполнения 13:22:34, то есть ожидание следующего тика
+ * поллера съедало до 10 с на ровном месте).
+ *
+ * Вызывается из хука `handleWebhook`'s `onApproved` — то есть ТОЛЬКО когда
+ * атомарный консюм решения в БД уже выиграл именно это нажатие. Основной путь;
+ * поллер ниже остаётся страховкой (перезапуск процесса, упавший хук, решение,
+ * принятое пока сервер лежал).
+ *
+ * Server-scoping: вебхук-владелец получает нажатия по манифестам ВСЕХ
+ * серверов, делящих один бот-токен, поэтому чужие здесь отсекаются дважды —
+ * явной проверкой `row.server` у вызывающего и `m.server = $2` внутри
+ * `getApprovedUnexecuted`. Чужой манифест исполнит поллер его собственного
+ * сервера, ровно как и раньше.
+ */
+async function executeApprovedNow(config: Config, manifestId: string): Promise<void> {
+  const candidate = await getApprovedUnexecuted(manifestId, consentServerConfig.server, Date.now());
+  // null — либо манифест не наш/истёк/уже потреблён (например поллер успел
+  // первым), либо тул ещё не покрыт авто-исполнением: это не ошибка.
+  if (!candidate) return;
+  const ctx = await buildAutoExecuteCtx(config);
+  if (!ctx) {
+    console.error("TG auto-execute: нет доступного пользователя — немедленное исполнение отложено до поллера");
+    return;
+  }
+  await executeApprovedCandidate(candidate, ctx);
 }
 
 export async function startHttpServer(config: Config): Promise<void> {
@@ -257,7 +309,20 @@ export async function startHttpServer(config: Config): Promise<void> {
       return;
     }
     try {
-      await handleWebhook(tgApprovalConfig, tgApprovalStoreAdapter, req.body);
+      // 4-й аргумент — хук немедленного исполнения (Максим, 2026-08-06:
+      // «исполнять прямо в обработчике нажатия, не дожидаясь опроса»).
+      // Намеренно СИНХРОННЫЙ по отношению к этому обработчику: он лишь
+      // ЗАПУСКАЕТ фоновую работу и тут же возвращает управление, поэтому ни
+      // снятие кнопок, ни `answerCallbackQuery`, ни ответ 200 её не ждут —
+      // Telegram получает подтверждение доставки сразу, как и раньше.
+      await handleWebhook(tgApprovalConfig, tgApprovalStoreAdapter, req.body, (row) => {
+        // Чужой сервер (общий бот на 6 MCP-серверов) — не наш манифест, его
+        // исполнит поллер того сервера. См. `executeApprovedNow`.
+        if (row.server !== consentServerConfig.server) return;
+        void executeApprovedNow(config, row.manifestId).catch((err) =>
+          console.error(`TG auto-execute: немедленное исполнение ${row.manifestId} упало:`, err),
+        );
+      });
     } catch (err) {
       console.error("TG approval webhook error:", err);
     }
