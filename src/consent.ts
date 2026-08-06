@@ -907,6 +907,27 @@ export async function requireConsent<T = unknown>(
 
   // (1) Манифест существует, наш server, тот же tool/account, ещё AWAITING.
   const row = await store.getManifest(manifestId, cfg.server);
+  // Частный случай для внятности: план УЖЕ исполнен — и исполнен КНОПКОЙ (его
+  // забрал фоновый исполнитель). Общая формулировка «не найден / истёк / уже
+  // исполнен» тут сбивает с толку: модель начинает искать проблему там, где
+  // всё в порядке, и может попытаться построить план заново, продублировав
+  // действие.
+  if (
+    row &&
+    row.tool === tool &&
+    row.accountLabel === accountLabel &&
+    row.status === "DONE" &&
+    row.tgNotified
+  ) {
+    checks.manifest = "already_executed_by_button";
+    return refuse(
+      "Уже исполнено кнопкой в Telegram",
+      "Этот план подтверждён кнопкой и УЖЕ исполнен сервером — отчёт ушёл в сообщение бота. " +
+        "Повторять действие не нужно: не строй план заново, иначе операция продублируется.",
+      checks,
+      { manifestId, objectHash: row.objectHash },
+    );
+  }
   if (
     !row ||
     row.tool !== tool ||
