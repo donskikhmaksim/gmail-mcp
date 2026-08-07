@@ -2072,7 +2072,7 @@ async function executeDraftBatchCore(
   return buildMutationResult({
     results,
     total: payload.drafts.length,
-    verb: "Created",
+    verb: "Создано",
     summaryIcon: "📝",
     verify: (r) => postVerifyDraftExists(g, r.draftId, r.subject),
     reportTitle: "Независимая проверка создания черновика",
@@ -2117,7 +2117,7 @@ async function executeArchiveCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Archived",
+    verb: "Архивировано",
     summaryIcon: "📥",
     verify: (r) => postVerifyNotInInbox(g, r.id, r.subject),
     reportTitle: "Независимая проверка архивирования",
@@ -2154,7 +2154,7 @@ async function executeTrashCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Trashed",
+    verb: "Удалено (в корзину)",
     summaryIcon: "🗑",
     verify: (r) => postVerifyInTrash(g, r.id, r.subject),
     reportTitle: "Независимая проверка удаления в Корзину",
@@ -2216,7 +2216,7 @@ async function executeModifyLabelsCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Modified",
+    verb: "Изменено",
     summaryIcon: "🏷️",
     verify: (r) => postVerifyLabelsApplied(g, r.id, r.subject, r.addLabelIds, r.removeLabelIds),
     reportTitle: "Независимая проверка изменения меток",
@@ -2280,7 +2280,7 @@ async function executeSnoozeCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Snoozed",
+    verb: "Отложено",
     summaryIcon: "⏰",
     verify: (r) => postVerifyNotInInbox(g, r.id, r.subject),
     reportTitle: "Независимая проверка отложенного возврата",
@@ -2517,7 +2517,7 @@ async function executeCancelScheduledSendCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Canceled",
+    verb: "Отменено",
     summaryIcon: "🚫",
     verify: (r) => postVerifyScheduledSendCanceled(store, payload.account, r.id, r.subject),
     reportTitle: "Независимая проверка отмены отложенных отправок",
@@ -2596,7 +2596,7 @@ async function executeSaveAttachmentCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Saved",
+    verb: "Сохранено",
     summaryIcon: "💾",
     verify: (r) => postVerifyDriveFileExists(g, r.fileId, r.fileName),
     reportTitle: "Независимая проверка сохранения в Drive",
@@ -2645,7 +2645,7 @@ async function executeCreateLabelCore(
   return buildMutationResult({
     results,
     total: payload.labels.length,
-    verb: "Created",
+    verb: "Создано",
     summaryIcon: "🏷️",
     verify: (r) => postVerifyLabelExists(g, r.id ?? "", r.name),
     reportTitle: "Независимая проверка создания меток",
@@ -2701,7 +2701,7 @@ async function executeUpdateLabelCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Updated",
+    verb: "Обновлено",
     summaryIcon: "✏️",
     verify: (r) => postVerifyLabelExists(g, r.id, r.name),
     reportTitle: "Независимая проверка изменения меток",
@@ -2748,7 +2748,7 @@ async function executeDeleteLabelCore(
   return buildMutationResult({
     results,
     total: payload.labels.length,
-    verb: "Deleted",
+    verb: "Удалено",
     summaryIcon: "🗑️",
     verify: (r) => postVerifyLabelGone(g, r.id, r.name),
     reportTitle: "Независимая проверка удаления меток",
@@ -2881,7 +2881,7 @@ async function executeExportThreadCore(
   const result = await buildMutationResult({
     results: produced,
     total: produced.length,
-    verb: "Exported",
+    verb: "Экспортировано",
     summaryIcon: "📧",
     verify: (r) => postVerifyDriveFileExists(g, r.fileId, r.fileName ?? payload.subject),
     reportTitle: "Независимая проверка экспорта треда",
@@ -2997,7 +2997,7 @@ async function executeUploadSessionCore(
   const result = await buildMutationResult({
     results,
     total: payload.files.length,
-    verb: "Opened",
+    verb: "Открыто",
     summaryIcon: "🚀",
     verify: (r) => postVerifyDriveFileExists(g, r.driveFileId, r.name),
     reportTitle: "Независимая проверка загрузочных сессий",
@@ -4266,8 +4266,9 @@ export function registerGmailTools(
       const { store, userToken, consentStore, consentCfg, tg } = snoozeCtx;
       if (!store) {
         return fail(
-          "Scheduled send requires DATABASE_URL (Railway Postgres) to be configured on this server — " +
-            "without it there is nowhere to hold the message until sendAt. Use gmail_send for immediate delivery.",
+          "Отложенная отправка недоступна: на сервере не настроен DATABASE_URL (Railway Postgres). Без него " +
+            "негде хранить письмо до момента sendAt (запланированного времени отправки). Используйте " +
+            "gmail_send, чтобы отправить прямо сейчас.",
         );
       }
       if (!consentStore) {

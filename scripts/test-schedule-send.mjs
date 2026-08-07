@@ -288,7 +288,7 @@ check("still listed as pending after the plan call", out.results.some((x) => x.i
 // 9b. Execute with the manifest + a verbatim human reply.
 out = await planThenExecute(client, "gmail_cancel_scheduled_send", { ids: [idToCancel] }, "да, отменяй");
 check("canceled after confirmation", scheduledRows.get(idToCancel).canceled === true, JSON.stringify(out));
-check("summary reports 1/1 canceled", /Canceled 1\/1/.test(out.summary), JSON.stringify(out.summary));
+check("summary reports 1/1 canceled", /Отменено 1\/1/.test(out.summary), JSON.stringify(out.summary));
 check("post-verify re-read the live queue", /отменена, подтверждено по живой очереди/.test(out.verification ?? ""), JSON.stringify(out.verification));
 out = parse(await client.callTool({ name: "gmail_list_scheduled_sends", arguments: {} }));
 check("canceled item no longer listed", !out.results.some((x) => x.id === idToCancel), JSON.stringify(out.results));
@@ -319,7 +319,7 @@ const driftOut = (await client.callTool({
   arguments: { manifest_id: driftManifest, user_reply: "да, отменяй" },
 })).content[0].text;
 check("stale plan is refused after the queue changed", /Состояние изменилось после планирования/.test(driftOut), driftOut.slice(0, 200));
-check("no success header on a refused stale plan", !/Canceled 1\/1/.test(driftOut), driftOut.slice(0, 120));
+check("no success header on a refused stale plan", !/Отменено 1\/1/.test(driftOut), driftOut.slice(0, 120));
 
 // 9e. Post-verify must RE-READ the queue, never trust the UPDATE's own answer.
 //     A store that reports success while the row stays pending is exactly the

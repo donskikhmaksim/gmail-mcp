@@ -203,7 +203,7 @@ await runHappyPath(
   {},
   (calls, text) => {
     check("черновик создан (drafts.create)", calls.draftsCreate.length === 1);
-    check("текст упоминает 'Created'", text.includes("Created"), text);
+    check("текст упоминает 'Создано'", text.includes("Создано"), text);
   },
 );
 
@@ -214,7 +214,7 @@ await runHappyPath(
   {},
   (calls, text) => {
     check("messages.modify вызван с removeLabelIds INBOX", calls.modify.length === 1 && calls.modify[0].requestBody.removeLabelIds.includes("INBOX"));
-    check("текст упоминает 'Archived'", text.includes("Archived"), text);
+    check("текст упоминает 'Архивировано'", text.includes("Архивировано"), text);
   },
 );
 
@@ -225,7 +225,7 @@ await runHappyPath(
   {},
   (calls, text) => {
     check("messages.trash вызван", calls.trash.length === 1);
-    check("текст упоминает 'Trashed'", text.includes("Trashed"), text);
+    check("текст упоминает 'Удалено (в корзину)'", text.includes("Удалено (в корзину)"), text);
   },
 );
 
@@ -236,7 +236,7 @@ await runHappyPath(
   {},
   (calls, text) => {
     check("messages.modify вызван с addLabelIds/removeLabelIds", calls.modify.length === 1 && calls.modify[0].requestBody.addLabelIds.includes("STARRED"));
-    check("текст упоминает 'Modified'", text.includes("Modified"), text);
+    check("текст упоминает 'Изменено'", text.includes("Изменено"), text);
   },
 );
 
@@ -252,7 +252,7 @@ await runHappyPath(
       check("addSnooze вызван РОВНО один раз (персистентность через ctx.store)", fakeStore.snoozeCalls.length === 1);
       check("userToken из ctx дошёл до addSnooze (не потерян)", fakeStore.snoozeCalls[0]?.userToken === "user-token-123");
       check("accountName корректен", fakeStore.snoozeCalls[0]?.accountName === "work");
-      check("текст упоминает 'Snoozed'", text.includes("Snoozed"), text);
+      check("текст упоминает 'Отложено'", text.includes("Отложено"), text);
     },
   );
 }
@@ -294,7 +294,7 @@ await runHappyPath(
   (calls, text) => {
     check("attachments.get вызван", calls.attachmentsGet.length === 1);
     check("drive.files.create вызван", calls.driveFilesCreate.length === 1);
-    check("текст упоминает 'Saved'", text.includes("Saved"), text);
+    check("текст упоминает 'Сохранено'", text.includes("Сохранено"), text);
   },
 );
 
@@ -305,7 +305,7 @@ await runHappyPath(
   {},
   (calls, text) => {
     check("labels.create вызван с правильным именем", calls.labelsCreate.length === 1 && calls.labelsCreate[0].requestBody.name === "NewLabel");
-    check("текст упоминает 'Created'", text.includes("Created"), text);
+    check("текст упоминает 'Создано'", text.includes("Создано"), text);
   },
 );
 
@@ -316,7 +316,7 @@ await runHappyPath(
   {},
   (calls, text) => {
     check("labels.patch вызван", calls.labelsPatch.length === 1 && calls.labelsPatch[0].requestBody.name === "New");
-    check("текст упоминает 'Updated'", text.includes("Updated"), text);
+    check("текст упоминает 'Обновлено'", text.includes("Обновлено"), text);
   },
 );
 
@@ -327,7 +327,7 @@ await runHappyPath(
   {},
   (calls, text) => {
     check("labels.delete вызван", calls.labelsDelete.length === 1 && calls.labelsDelete[0].id === "Label_1");
-    check("текст упоминает 'Deleted'", text.includes("Deleted"), text);
+    check("текст упоминает 'Удалено'", text.includes("Удалено"), text);
   },
 );
 
@@ -339,7 +339,7 @@ await runHappyPath(
   (calls, text) => {
     check("threads.get вызван (минимум format=minimal)", calls.threadsGet.some((c) => c.format === "minimal"));
     check("файл экспорта создан в Drive", calls.driveFilesCreate.length === 1);
-    check("текст упоминает 'Exported'", text.includes("Exported"), text);
+    check("текст упоминает 'Экспортировано'", text.includes("Экспортировано"), text);
   },
 );
 
@@ -394,7 +394,7 @@ await runHappyPath(
           /^https:\/\/www\.googleapis\.com\//.test(String(fetchCalls[0]?.url)),
           String(fetchCalls[0]?.url),
         );
-        check("текст упоминает 'Opened'", text.includes("Opened"), text);
+        check("текст упоминает 'Открыто'", text.includes("Открыто"), text);
         // Отчёт теперь человекочитаемый (не JSON-дамп), поэтому поле ищем в
         // строке «Детали», а не по `"sessionId": "…"`. Смысл проверки прежний:
         // наружу уходит непрозрачный идентификатор, а не сам адрес загрузки.
