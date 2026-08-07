@@ -368,7 +368,7 @@ export function loadConsentGateConfig(): ConsentGateConfig {
 export interface TgApprovalConfig {
   /** Env TG_APPROVAL_ENABLED, default false. */
   enabled: boolean;
-  /** Env TG_BOT_TOKEN. Required when enabled. */
+  /** Env TG_BOT_TOKEN_OVERRIDE if set, else TG_BOT_TOKEN. Required when enabled. */
   botToken: string;
   /** Env TG_OWNER_CHAT_ID — the only chat id the webhook accepts callbacks from. */
   ownerChatId: string;
@@ -400,11 +400,40 @@ export interface TgApprovalConfig {
    * self-guards on this field (defense-in-depth beyond the call-site check).
    */
   webhookOwner: boolean;
+  /**
+   * Env TG_BOT_TOKEN_OVERRIDE, default false (unset). Per-server escape hatch
+   * from the shared-bot model above: when set, THIS server talks to its OWN
+   * Telegram bot (its own token, its own chat, its own webhook) instead of
+   * the bot every MCP server shares by default via TG_BOT_TOKEN. `botToken`
+   * already resolves to the override when present (see loadTgApprovalConfig),
+   * so every existing call site that just reads `cfg.botToken` keeps working
+   * unchanged — `ownBot` exists ONLY to flip the two behaviours that assume
+   * "one bot, many servers" and would otherwise be wrong for an own-bot
+   * server: (1) the `/tg/webhook` route gate in http.ts (an own-bot server
+   * must accept its webhook even without TG_WEBHOOK_OWNER — that flag is
+   * about the SHARED bot, not this one), and (2) `handleWebhook`'s decision
+   * consume in tg_approval.ts (an own-bot server's webhook only ever carries
+   * ITS OWN manifests, so it must consume server-scoped via `consumeTgDecision`,
+   * not the shared `consumeTgDecisionAnyServer` — a global manifest_id lookup
+   * across the shared table would be both unnecessary and, if that Postgres
+   * happens to be shared too, would let this server react to callback taps
+   * that were never meant for it).
+   *
+   * UNSET (default) => false => every existing server (gmail-mcp today, plus
+   * whichever of sheets/calendar/docs/drive/ticktick adopt this same file
+   * later) behaves byte-for-byte as before this field existed: shared bot,
+   * shared webhook ownership via TG_WEBHOOK_OWNER, shared-table consume via
+   * consumeTgDecisionAnyServer. Rollback is just unsetting the env var — no
+   * redeploy of code, no migration.
+   */
+  ownBot: boolean;
 }
 
 export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
   const enabled = process.env.TG_APPROVAL_ENABLED?.trim().toLowerCase() === "true";
-  const botToken = process.env.TG_BOT_TOKEN?.trim() || "";
+  const botTokenOverride = process.env.TG_BOT_TOKEN_OVERRIDE?.trim() || "";
+  const botToken = botTokenOverride || process.env.TG_BOT_TOKEN?.trim() || "";
+  const ownBot = !!botTokenOverride;
   const ownerChatId = process.env.TG_OWNER_CHAT_ID?.trim() || "";
   const webhookSecret = process.env.TG_APPROVAL_WEBHOOK_SECRET?.trim() || "";
   const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN?.trim();
@@ -427,7 +456,7 @@ export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
   // feature or serve mutations without the second factor it claims to enforce.
   if (enabled && (!botToken || !ownerChatId || !webhookSecret || !publicBaseUrl)) {
     const missing = [
-      !botToken && "TG_BOT_TOKEN",
+      !botToken && "TG_BOT_TOKEN (or TG_BOT_TOKEN_OVERRIDE)",
       !ownerChatId && "TG_OWNER_CHAT_ID",
       !webhookSecret && "TG_APPROVAL_WEBHOOK_SECRET",
       !publicBaseUrl && "PUBLIC_BASE_URL (or RAILWAY_PUBLIC_DOMAIN)",
@@ -450,6 +479,7 @@ export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
     toolsAllowlist,
     ttlMs,
     webhookOwner,
+    ownBot,
   };
 }
 

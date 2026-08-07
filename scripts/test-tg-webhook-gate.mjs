@@ -48,6 +48,11 @@ import { fileURLToPath } from "node:url";
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 const BOT_TOKEN = "TESTTOKEN";
+// Deliberately a DIFFERENT string from BOT_TOKEN (not just a second alias for
+// the same value) — proves `botToken = TG_BOT_TOKEN_OVERRIDE || TG_BOT_TOKEN`
+// actually PICKS the override, rather than the test coincidentally passing
+// because both env vars happened to hold the same token.
+const OWN_BOT_TOKEN = "OWNBOTTOKEN";
 const OWNER_CHAT_ID = "555";
 const WEBHOOK_SECRET = "wh-secret-xyz";
 
@@ -67,11 +72,22 @@ async function runWorker() {
   agent.enableNetConnect(/^127\.0\.0\.1/);
   setGlobalDispatcher(agent);
   let setWebhookCalls = 0;
-  agent
-    .get("https://api.telegram.org")
+  let ownBotSetWebhookCalls = 0;
+  const pool = agent.get("https://api.telegram.org");
+  pool
     .intercept({ path: `/bot${BOT_TOKEN}/setWebhook`, method: "POST" })
     .reply(() => {
       setWebhookCalls++;
+      return { statusCode: 200, data: { ok: true, result: true }, headers: { "content-type": "application/json" } };
+    })
+    .persist();
+  // Separate interceptor, separate counter, DIFFERENT bot token path — lets
+  // own-bot scenarios prove `registerWebhook` called `setWebhook` against
+  // THIS bot specifically, not (accidentally-indistinguishably) the shared one.
+  pool
+    .intercept({ path: `/bot${OWN_BOT_TOKEN}/setWebhook`, method: "POST" })
+    .reply(() => {
+      ownBotSetWebhookCalls++;
       return { statusCode: 200, data: { ok: true, result: true }, headers: { "content-type": "application/json" } };
     })
     .persist();
@@ -121,6 +137,10 @@ async function runWorker() {
 
   const handlerErrorLines = loggedErrors.filter((l) => l.includes("TG approval webhook error:"));
   const reachedStoreNotInitialised = handlerErrorLines.some((l) => l.includes("Store not initialised"));
+  // TG_BOT_TOKEN_OVERRIDE (own-bot) hazard warning — registerWebhook logs this
+  // loudly when BOTH TG_WEBHOOK_OWNER=true and the override are set on the
+  // same process (see tg_approval.ts's registerWebhook doc comment).
+  const sawBothFlagsWarning = loggedErrors.some((l) => l.includes("TG_WEBHOOK_OWNER=true И"));
 
   process.stdout.write(
     JSON.stringify({
@@ -129,6 +149,8 @@ async function runWorker() {
       handlerErrorLineCount: handlerErrorLines.length,
       reachedStoreNotInitialised,
       setWebhookCalls,
+      ownBotSetWebhookCalls,
+      sawBothFlagsWarning,
     }) + "\n",
   );
   process.exit(0);
@@ -142,7 +164,7 @@ function runOrchestrator() {
     if (!cond) failures++;
   };
 
-  function spawnScenario(scenario, port, webhookOwnerEnv) {
+  function spawnScenario(scenario, port, webhookOwnerEnv, botTokenOverrideEnv = null) {
     const result = spawnSync(process.execPath, [THIS_FILE], {
       encoding: "utf8",
       env: {
@@ -155,6 +177,7 @@ function runOrchestrator() {
         TG_APPROVAL_WEBHOOK_SECRET: WEBHOOK_SECRET,
         PUBLIC_BASE_URL: "https://example.test",
         ...(webhookOwnerEnv === null ? {} : { TG_WEBHOOK_OWNER: webhookOwnerEnv }),
+        ...(botTokenOverrideEnv === null ? {} : { TG_BOT_TOKEN_OVERRIDE: botTokenOverrideEnv }),
         DATABASE_URL: "",
       },
       timeout: 15_000,
@@ -221,6 +244,60 @@ function runOrchestrator() {
         r,
       );
       check("registerWebhook по-прежнему вызывает setWebhook ровно один раз при старте (happy path не сломан)", r.setWebhookCalls === 1, r.setWebhookCalls);
+    }
+  }
+
+  // ═══ [d] own-bot (TG_BOT_TOKEN_OVERRIDE) + TG_WEBHOOK_OWNER unset → 200, handler DOES run ═══
+  // A server with its own bot owns its own webhook unconditionally — no
+  // dependency on the shared-bot TG_WEBHOOK_OWNER flag at all. Same "reached
+  // Store not initialised" proof as scenario [c], now via cfg.ownBot instead
+  // of cfg.webhookOwner.
+  console.log("\n[d] own-bot (TG_BOT_TOKEN_OVERRIDE) без TG_WEBHOOK_OWNER → 200, handler ВЫЗЫВАЕТСЯ");
+  {
+    const r = spawnScenario("own-bot-only", 34963, null, OWN_BOT_TOKEN);
+    check("worker завершился и вернул результат", !!r, "worker crashed or printed no JSON");
+    if (r) {
+      check("статус 200 (own-bot принимает вебхук без TG_WEBHOOK_OWNER)", r.status === 200, r.status);
+      check(
+        "handleWebhook РЕАЛЬНО вызывался ровно один раз",
+        r.handlerErrorLineCount === 1,
+        r.handlerErrorLineCount,
+      );
+      check(
+        "вызов дошёл до store.consumeTgDecision (упал на 'Store not initialised', а не раньше)",
+        r.reachedStoreNotInitialised === true,
+        r,
+      );
+      check(
+        "registerWebhook вызывает setWebhook на СВОЙ бот-токен (override), НЕ на общий",
+        r.ownBotSetWebhookCalls === 1 && r.setWebhookCalls === 0,
+        r,
+      );
+      check("никакого предупреждения о конфликте флагов (только ownBot, не webhookOwner тоже)", r.sawBothFlagsWarning === false, r);
+    }
+  }
+
+  // ═══ [e] both flags true (legacy webhookOwner=true + own-bot override) → still 200, but LOUD warning ═══
+  // The explicit hazard called out in the task: gmail-mcp keeps its legacy
+  // TG_WEBHOOK_OWNER=true (shared-bot webhook owner for the other 5 servers)
+  // while ALSO getting its own TG_BOT_TOKEN_OVERRIDE one day. The route gate
+  // must not 404 (both flags individually satisfy it — no double-mounting,
+  // it's the same single Express handler either way), but registerWebhook
+  // must log a loud warning that it just silently switched THIS process's
+  // Telegram identity to the override, dropping the shared bot's webhook.
+  console.log("\n[e] контроль конфликта: TG_WEBHOOK_OWNER=true И TG_BOT_TOKEN_OVERRIDE заданы одновременно → 200 + громкое предупреждение");
+  {
+    const r = spawnScenario("own-bot-plus-webhook-owner", 34964, "true", OWN_BOT_TOKEN);
+    check("worker завершился и вернул результат", !!r, "worker crashed or printed no JSON");
+    if (r) {
+      check("статус 200 (маршрут не 404 — хотя бы один из флагов истинен)", r.status === 200, r.status);
+      check("handleWebhook по-прежнему вызывается", r.handlerErrorLineCount === 1, r.handlerErrorLineCount);
+      check(
+        "setWebhook вызван на СВОЙ бот-токен (override победил) — общий бот НЕ регистрируется этим процессом",
+        r.ownBotSetWebhookCalls === 1 && r.setWebhookCalls === 0,
+        r,
+      );
+      check("предупреждение о конфликте флагов ЗАЛОГИРОВАНО", r.sawBothFlagsWarning === true, r);
     }
   }
 

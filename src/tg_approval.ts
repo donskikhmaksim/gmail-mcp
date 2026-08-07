@@ -330,13 +330,25 @@ export function secretTokenMatches(provided: string, expected: string): boolean 
  *  2. owner-only          — `callback_query.from.id === TG_OWNER_CHAT_ID`.
  *  3. callback_data is an ADDRESS, not a trust fact — the decision is read
  *     back from the store by manifest_id; the button's own label is never
- *     taken at face value. The manifest may belong to ANY of the servers
- *     sharing this bot token (single shared webhook — see `registerWebhook`'s
- *     `TG_WEBHOOK_OWNER` guard), not necessarily this process's own `cfg.
- *     server` — hence `consumeTgDecisionAnyServer` below, not the server-
- *     scoped `consumeTgDecision`.
- *  4. anti-replay         — atomic `consumeTgDecisionAnyServer` (`WHERE
- *     status = 'PENDING'`); a second tap on the same callback is a no-op here.
+ *     taken at face value. TWO consume paths, chosen by `cfg.ownBot`
+ *     (TG_BOT_TOKEN_OVERRIDE, config.ts):
+ *       - `cfg.ownBot === false` (default, shared bot): the manifest may
+ *         belong to ANY of the servers sharing this bot token (single shared
+ *         webhook — see `registerWebhook`'s `TG_WEBHOOK_OWNER` guard), not
+ *         necessarily this process's own `cfg.server` — hence
+ *         `consumeTgDecisionAnyServer`, not the server-scoped
+ *         `consumeTgDecision`. This is the byte-for-byte pre-existing path.
+ *       - `cfg.ownBot === true` (this server has its own bot, its own
+ *         webhook): every update arriving here was sent BY THIS SERVER'S OWN
+ *         `notifyPlan` call to ITS OWN bot, so every manifest it could
+ *         possibly be addressing already belongs to `cfg.server` — using the
+ *         server-scoped `consumeTgDecision` here is both correct (no other
+ *         server's approval can arrive on this webhook at all) and safer if
+ *         Postgres happens to still be the same shared instance as the other
+ *         5 servers (an own-bot server must never be able to decide a
+ *         manifest that isn't its own, even if `manifest_id` collided).
+ *  4. anti-replay         — atomic consume (`WHERE status = 'PENDING'`,
+ *     either variant above); a second tap on the same callback is a no-op here.
  *  5. answerCallbackQuery — always called, so the tap's spinner clears.
  *  6. editMessageReplyMarkup — removes the buttons after ANY decision is
  *     recorded, so a second tap has nothing left to press.
@@ -385,12 +397,21 @@ export async function handleWebhook(
 
   // (3) + (4): callback_data only ADDRESSES the manifest; the atomic UPDATE
   // is what actually decides + closes the replay race, in one statement.
-  // Server-agnostic on purpose: this ONE webhook (owned by whichever server
-  // has TG_WEBHOOK_OWNER=true) services approval buttons for EVERY server
-  // sharing this bot token, so `cfg.server` (always "$self") is the WRONG
-  // filter here — the manifest being decided may belong to any of them.
-  // Safe because `manifest_id` is globally unique (tg_approvals' PRIMARY KEY).
-  const consumed = await store.consumeTgDecisionAnyServer(manifestId, decision);
+  //
+  // `cfg.ownBot === true`: this webhook belongs to THIS server's own bot —
+  // every manifest it could possibly see is this server's own, so consume
+  // server-scoped (also closes off cross-server manifest_id collisions on a
+  // shared Postgres, belt-and-braces).
+  //
+  // `cfg.ownBot === false` (default): server-agnostic on purpose — this ONE
+  // webhook (owned by whichever server has TG_WEBHOOK_OWNER=true) services
+  // approval buttons for EVERY server sharing this bot token, so `cfg.server`
+  // (always "$self") is the WRONG filter here — the manifest being decided
+  // may belong to any of them. Safe because `manifest_id` is globally unique
+  // (tg_approvals' PRIMARY KEY). Byte-for-byte the pre-existing behaviour.
+  const consumed = cfg.ownBot
+    ? await store.consumeTgDecision(manifestId, cfg.server, decision)
+    : await store.consumeTgDecisionAnyServer(manifestId, decision);
 
   if (consumed && decision === "APPROVED" && onApproved) {
     // Немедленное исполнение — СРАЗУ после выигранного консюма и ДО правки
@@ -446,15 +467,40 @@ export async function handleWebhook(
  */
 export async function registerWebhook(cfg: TgApprovalConfig): Promise<void> {
   if (!cfg.enabled) return;
-  if (!cfg.webhookOwner) {
+  if (!cfg.webhookOwner && !cfg.ownBot) {
     console.error(
-      `TG approval: TG_APPROVAL_ENABLED=true but TG_WEBHOOK_OWNER is not "true" -- this server will ` +
-        `NOT call setWebhook and will not receive Telegram button taps. When one bot token is shared ` +
-        `across several MCP servers, exactly ONE of them must set TG_WEBHOOK_OWNER=true; every other ` +
-        `server must leave it unset (default false), or their setWebhook calls will silently overwrite ` +
-        `each other and approvals for whichever server registered last will stop reaching anyone.`,
+      `TG approval: TG_APPROVAL_ENABLED=true but TG_WEBHOOK_OWNER is not "true" and TG_BOT_TOKEN_OVERRIDE ` +
+        `is not set -- this server will NOT call setWebhook and will not receive Telegram button taps. ` +
+        `When one bot token is shared across several MCP servers, exactly ONE of them must set ` +
+        `TG_WEBHOOK_OWNER=true; every other server must leave it unset (default false), or their ` +
+        `setWebhook calls will silently overwrite each other and approvals for whichever server ` +
+        `registered last will stop reaching anyone. (Alternatively, set TG_BOT_TOKEN_OVERRIDE to give ` +
+        `this server its own bot -- it then owns its own webhook unconditionally, see below.)`,
     );
     return;
+  }
+  // `cfg.ownBot` (TG_BOT_TOKEN_OVERRIDE): `cfg.botToken` has ALREADY resolved
+  // to the override at this point (config.ts's loadTgApprovalConfig), so the
+  // `setWebhook` call below registers THIS server's own bot -- correct and
+  // expected. The one sharp edge: if this SAME process also still carries
+  // the legacy `TG_WEBHOOK_OWNER=true` (e.g. gmail-mcp, today's default
+  // shared-bot webhook owner, later getting its own override too), that
+  // flag's meaning silently flips underneath it -- `cfg.botToken` is no
+  // longer the shared bot, so this call registers the webhook for the OWN
+  // bot instead, and the shared bot's webhook (which some OTHER server was
+  // relying on this process to keep registering) is never (re-)registered
+  // by anyone. Loud warning instead of silent breakage -- this is a real
+  // config hazard, not a hypothetical one, if TG_WEBHOOK_OWNER is ever left
+  // on by mistake after adopting an own bot.
+  if (cfg.webhookOwner && cfg.ownBot) {
+    console.error(
+      `TG approval: ВНИМАНИЕ — на этом сервере (${cfg.server}) одновременно TG_WEBHOOK_OWNER=true И ` +
+        `TG_BOT_TOKEN_OVERRIDE заданы. setWebhook ниже зарегистрирует ТОЛЬКО свой собственный бот ` +
+        `(TG_BOT_TOKEN_OVERRIDE) — общий бот (TG_BOT_TOKEN), для которого этот сервер был вебхук-` +
+        `владельцем для ОСТАЛЬНЫХ серверов, вебхук больше не получит от НЕГО. Если так и задумано (этот ` +
+        `сервер окончательно переезжает на свой бот) — ок, но передайте TG_WEBHOOK_OWNER=true другому ` +
+        `серверу на общем боте; если нет — снимите TG_WEBHOOK_OWNER здесь.`,
+    );
   }
   const url = `${cfg.publicBaseUrl.replace(/\/+$/, "")}/tg/webhook`;
   try {

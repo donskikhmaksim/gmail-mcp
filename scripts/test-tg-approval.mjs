@@ -174,6 +174,7 @@ function tgCfg(overrides = {}) {
     toolsAllowlist: null,
     ttlMs: 3_600_000,
     webhookOwner: false, // TG_WEBHOOK_OWNER default — most tests don't touch registerWebhook at all
+    ownBot: false, // TG_BOT_TOKEN_OVERRIDE default — most tests don't touch own-bot mode at all
     ...overrides,
   };
 }
@@ -639,6 +640,152 @@ console.log("\n[14] runApprovalSweep — чистка чата бота");
   await runApprovalSweep(tgCfg({ enabled: true, webhookOwner: false }), store2, now);
   check("webhookOwner=false → sweep вообще не трогает store (не-владелец молчит)",
     store2.approvals.get("expired-2").status === "PENDING" && tgCalls.length === 0);
+}
+
+// ═══ [15] own-bot (TG_BOT_TOKEN_OVERRIDE): webhook консюмит ТОЛЬКО свои манифесты ═══
+// Задача: каждый MCP-сервер может получить свой отдельный бот/токен
+// (TG_BOT_TOKEN_OVERRIDE, config.ts). Когда `cfg.ownBot === true`,
+// `handleWebhook` обязан переключиться со server-agnostic
+// `consumeTgDecisionAnyServer` (модель "один бот на все серверы") на
+// server-scoped `consumeTgDecision` — этот вебхук физически принадлежит
+// ТОЛЬКО этому серверу, чужих approval он видеть не должен, даже если
+// Postgres тот же самый и manifest_id случайно совпал бы с чужим сервером.
+console.log("\n[15] own-bot: handleWebhook консюмит СВОИ манифесты server-scoped, чужие — не трогает");
+{
+  const { mock } = resetTelegramMocks();
+  mock("answerCallbackQuery", () => ({ statusCode: 200, data: { ok: true }, headers: { "content-type": "application/json" } }));
+  mock("editMessageReplyMarkup", () => ({ statusCode: 200, data: { ok: true }, headers: { "content-type": "application/json" } }));
+
+  const cfg = tgCfg({ server: "gmail", ownBot: true });
+  const tgStore = makeTgStore();
+
+  // (a) approval, реально принадлежащий этому серверу — должен консьюмиться.
+  await tgStore.createTgApproval({
+    manifestId: "m-own-bot-mine",
+    server: "gmail",
+    chatId: cfg.ownerChatId,
+    messageId: 61,
+    createdAt: now(),
+    expiresAt: now() + 3_600_000,
+  });
+  await handleWebhook(cfg, tgStore, {
+    callback_query: {
+      id: "cbq-own-bot-mine",
+      from: { id: Number(cfg.ownerChatId) },
+      data: "a:m-own-bot-mine",
+      message: { message_id: 61, chat: { id: cfg.ownerChatId } },
+    },
+  });
+  check("own-bot: свой манифест консьюмится в APPROVED", tgStore.approvals.get("m-own-bot-mine").status === "APPROVED");
+
+  // (b) approval ЧУЖОГО сервера (симулирует общий Postgres по ошибке/переходный
+  // период) — server-scoped consumeTgDecision обязан НЕ тронуть чужую строку.
+  await tgStore.createTgApproval({
+    manifestId: "m-own-bot-foreign",
+    server: "calendar", // не наш server
+    chatId: cfg.ownerChatId,
+    messageId: 62,
+    createdAt: now(),
+    expiresAt: now() + 3_600_000,
+  });
+  const answersBefore = tgCalls.filter((c) => c.method === "answerCallbackQuery").length;
+  await handleWebhook(cfg, tgStore, {
+    callback_query: {
+      id: "cbq-own-bot-foreign",
+      from: { id: Number(cfg.ownerChatId) },
+      data: "a:m-own-bot-foreign",
+      message: { message_id: 62, chat: { id: cfg.ownerChatId } },
+    },
+  });
+  check(
+    "own-bot: чужой манифест (server=calendar) остаётся PENDING — server-scoped consume не тронул его",
+    tgStore.approvals.get("m-own-bot-foreign").status === "PENDING",
+    JSON.stringify(tgStore.approvals.get("m-own-bot-foreign")),
+  );
+  check(
+    "own-bot: editMessageReplyMarkup НЕ вызван для чужого манифеста (ничего не решено)",
+    !tgCalls.some((c) => c.method === "editMessageReplyMarkup" && c.body.message_id === 62),
+  );
+  check(
+    "own-bot: answerCallbackQuery всё же вызван для чужого манифеста (спиннер гасится «уже обработано»)",
+    tgCalls.filter((c) => c.method === "answerCallbackQuery").length === answersBefore + 1,
+  );
+}
+
+// ═══ [16] own-bot: default (ownBot=false) поведение gmail НЕ затронуто — контрольная проверка ═══
+// Тот же update, что и [15](b) (чужой манифест server=calendar), но БЕЗ
+// ownBot (обычный дефолтный режим gmail — единственного вебхук-владельца
+// общего бота): здесь чужой манифест ДОЛЖЕН консьюмиться (это и есть штатное
+// поведение consumeTgDecisionAnyServer, покрытое тестом [12] выше) — эта
+// секция подтверждает, что включение own-bot НИГДЕ не задело обычный путь,
+// потому что ветвление идёт строго по cfg.ownBot, а не по побочному эффекту.
+console.log("\n[16] контроль: ownBot=false (дефолт gmail) — чужой манифест по-прежнему консьюмится как раньше");
+{
+  const { mock } = resetTelegramMocks();
+  mock("answerCallbackQuery", () => ({ statusCode: 200, data: { ok: true }, headers: { "content-type": "application/json" } }));
+  mock("editMessageReplyMarkup", () => ({ statusCode: 200, data: { ok: true }, headers: { "content-type": "application/json" } }));
+
+  const cfg = tgCfg({ server: "gmail", ownBot: false, webhookOwner: true }); // дефолтная роль gmail сегодня
+  const tgStore = makeTgStore();
+  await tgStore.createTgApproval({
+    manifestId: "m-default-foreign",
+    server: "calendar",
+    chatId: cfg.ownerChatId,
+    messageId: 63,
+    createdAt: now(),
+    expiresAt: now() + 3_600_000,
+  });
+  await handleWebhook(cfg, tgStore, {
+    callback_query: {
+      id: "cbq-default-foreign",
+      from: { id: Number(cfg.ownerChatId) },
+      data: "a:m-default-foreign",
+      message: { message_id: 63, chat: { id: cfg.ownerChatId } },
+    },
+  });
+  check(
+    "дефолт gmail (ownBot=false): чужой манифест ВСЁ ЕЩЁ консьюмится (byte-for-byte как до фичи)",
+    tgStore.approvals.get("m-default-foreign").status === "APPROVED",
+    JSON.stringify(tgStore.approvals.get("m-default-foreign")),
+  );
+}
+
+// ═══ [17] registerWebhook: own-bot регистрирует СВОЙ вебхук без TG_WEBHOOK_OWNER ═══
+console.log("\n[17] registerWebhook: ownBot=true без webhookOwner → setWebhook вызывается (для своего бота)");
+{
+  const { mock } = resetTelegramMocks();
+  mock("setWebhook", () => ({ statusCode: 200, data: { ok: true, result: true }, headers: { "content-type": "application/json" } }));
+
+  await registerWebhook(tgCfg({ enabled: true, webhookOwner: false, ownBot: true }));
+  check("ownBot=true (webhookOwner=false) → setWebhook ВЫЗВАН ровно один раз", tgCalls.filter((c) => c.method === "setWebhook").length === 1);
+}
+
+// ═══ [18] registerWebhook: оба флага одновременно → всё равно регистрирует, но громко предупреждает ═══
+// Явный кейс из задачи: gmail-mcp остаётся webhookOwner=true (общий бот для
+// остальных 5 серверов) и ГИПОТЕТИЧЕСКИ получает ownBot=true (свой токен) —
+// не должно быть тихого молчаливого поведения: setWebhook по-прежнему
+// вызывается (для СВОЕГО бота, cfg.botToken уже резолвится в override), но в
+// лог обязано уйти явное предупреждение о том, что общий вебхук эта роль
+// больше не обслуживает.
+console.log("\n[18] registerWebhook: webhookOwner=true И ownBot=true одновременно → setWebhook вызван + громкое предупреждение в лог");
+{
+  const { mock } = resetTelegramMocks();
+  mock("setWebhook", () => ({ statusCode: 200, data: { ok: true, result: true }, headers: { "content-type": "application/json" } }));
+
+  const loggedErrors = [];
+  const origConsoleError = console.error;
+  console.error = (...args) => loggedErrors.push(args.map(String).join(" "));
+  try {
+    await registerWebhook(tgCfg({ enabled: true, webhookOwner: true, ownBot: true, server: "gmail" }));
+  } finally {
+    console.error = origConsoleError;
+  }
+  check("оба флага true → setWebhook ВСЁ РАВНО вызван ровно один раз", tgCalls.filter((c) => c.method === "setWebhook").length === 1);
+  check(
+    "громкое предупреждение о конфликте флагов залогировано",
+    loggedErrors.some((l) => l.includes("TG_WEBHOOK_OWNER=true И") && l.includes("TG_BOT_TOKEN_OVERRIDE")),
+    loggedErrors.join("\n---\n"),
+  );
 }
 
 // ── итог ─────────────────────────────────────────────────────────────────

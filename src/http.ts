@@ -299,7 +299,24 @@ export async function startHttpServer(config: Config): Promise<void> {
     // technically-correct secret, and must never depend on whoever ports this
     // file to the other 5 repos remembering to not mount the route --
     // 404 (not 401) so a non-owner server doesn't even reveal the route exists.
-    if (!tgApprovalConfig.webhookOwner) {
+    //
+    // `|| tgApprovalConfig.ownBot` (TG_BOT_TOKEN_OVERRIDE, config.ts): a
+    // server running its OWN Telegram bot owns ITS OWN webhook by
+    // definition -- there is no "shared token, one owner" ambiguity to
+    // guard against for it, so it must accept the route even with
+    // TG_WEBHOOK_OWNER unset/false. Both flags being true on the SAME
+    // process (gmail-mcp keeping its legacy TG_WEBHOOK_OWNER=true while ALSO
+    // getting its own TG_BOT_TOKEN_OVERRIDE one day) does not double-mount
+    // this route -- it's the same single `app.post` handler either way, the
+    // OR just widens which servers pass the gate. That combination is a
+    // real config hazard, but a different one, and it lives one level down:
+    // `cfg.botToken` (this whole process's Telegram identity) switches to
+    // the override, so registerWebhook's `setWebhook` call below registers
+    // THIS server's own bot at this URL, not the shared one anymore --
+    // registerWebhook logs a loud warning for exactly that case (see its
+    // own doc comment in tg_approval.ts) so a deployer catches it in logs
+    // instead of silently losing the shared webhook for the other 5 servers.
+    if (!tgApprovalConfig.webhookOwner && !tgApprovalConfig.ownBot) {
       res.status(404).end();
       return;
     }
