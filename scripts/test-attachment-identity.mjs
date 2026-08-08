@@ -39,12 +39,18 @@ const ATTACHMENTS = {
   ATT_PNG: { data: PNG_BYTES, filename: "снимок.png", mimeType: "image/png" },
   ATT_LOG: { data: LOG_BYTES, filename: "server.log", mimeType: "text/plain" },
   ATT_SMALL: { data: SMALL_PNG, filename: "icon.png", mimeType: "image/png" },
+  // Письмо ЗАНИЖАЕТ размер: в структуре письма 10 байт, по факту приходит
+  // 200 КБ. Так проверяется вторая линия — сверка по фактически скачанному.
+  // Только предварительной проверки (по `size` из письма) мало: `size` даёт
+  // Google, он может отсутствовать или расходиться с телом, и тогда защита от
+  // переполнения контекста держалась бы на честном слове чужого API.
+  ATT_LIAR: { data: Buffer.alloc(200_000, 0x41), filename: "врун.txt", mimeType: "text/plain", declaredSize: 10 },
 };
 
 const part = (attId) => ({
   filename: ATTACHMENTS[attId].filename,
   mimeType: ATTACHMENTS[attId].mimeType,
-  body: { attachmentId: attId, size: ATTACHMENTS[attId].data.length },
+  body: { attachmentId: attId, size: ATTACHMENTS[attId].declaredSize ?? ATTACHMENTS[attId].data.length },
 });
 
 const MESSAGES = {
@@ -53,7 +59,7 @@ const MESSAGES = {
     id: "MSG_WITH",
     threadId: "T1",
     internalDate: "1754000000000",
-    payload: { mimeType: "multipart/mixed", headers: [], parts: [part("ATT_PNG"), part("ATT_LOG"), part("ATT_SMALL")] },
+    payload: { mimeType: "multipart/mixed", headers: [], parts: [part("ATT_PNG"), part("ATT_LOG"), part("ATT_SMALL"), part("ATT_LIAR")] },
   },
   // Письмо БЕЗ вложений вообще — цель подмены из Н-5.
   MSG_EMPTY: {
@@ -134,6 +140,16 @@ const bigLog = (await call("gmail_get_attachment", {
 })).results[0];
 check("настоящий text/plain сверх лимита — отказ", typeof bigLog.error === "string", bigLog.error ?? null);
 check("текст не отдан", bigLog.text === undefined, bigLog.text?.length);
+
+reset();
+// Письмо утверждает 10 байт, приходит 200 000 — ловит только сверка по факту.
+const liar = (await call("gmail_get_attachment", {
+  items: [{ messageId: "MSG_WITH", attachmentId: "ATT_LIAR", maxBytes: 1000 }],
+})).results[0];
+check("занижённый в письме размер не обманывает лимит", typeof liar.error === "string", liar.error ?? null);
+check("содержимое НЕ отдано ни текстом, ни base64", liar.text === undefined && liar.content === undefined, [liar.text?.length, liar.content?.length]);
+check("в отказе назван ФАКТИЧЕСКИЙ размер", String(liar.error).includes("200000"), liar.error);
+check("байты при этом действительно качались (проверка по факту)", attachmentGetCalls === 1, attachmentGetCalls);
 
 // --- 2. текстовый путь работает, когда влезает -----------------------------
 
