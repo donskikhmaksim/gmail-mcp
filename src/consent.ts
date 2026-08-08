@@ -291,10 +291,27 @@ export function sha256(value: unknown): string {
   return createHash("sha256").update(canonicalJson(value)).digest("hex");
 }
 
+/**
+ * ЕДИНСТВЕННЫЙ пояс, в котором сервер показывает время (ТЗ A.4 — всегда LA,
+ * не UTC). Экспортируется наружу, чтобы читающие инструменты приводили даты
+ * писем ТЕМ ЖЕ поясом, а не заводили себе вторую копию: до 2026-08-07
+ * приведение к LA существовало только здесь, в гейте, а `gmail_search`/
+ * `gmail_get_message`/`gmail_get_thread` отдавали `date` сырым заголовком, то
+ * есть в поясе ОТПРАВИТЕЛЯ — на 100 письмах это 9 разных смещений и 12 писем
+ * с чужим календарным днём. Надстройки над этим поясом (`laIso`,
+ * `laDateStamp`) живут в `util.ts`.
+ *
+ * Почему константа и функция остались ЗДЕСЬ, а не переехали в `util.ts`:
+ * этот файл переносится в 4 соседних MCP-репо и потому не имеет ни одного
+ * runtime-импорта (его же напрямую грузят тесты — `scripts/test-consent.mjs`,
+ * `test-tg-approval.mjs`, — где `./util.js` рядом с `.ts` просто нет).
+ */
+export const LA_TZ = "America/Los_Angeles";
+
 /** Время в America/Los_Angeles как «5 авг, 07:15» (ТЗ A.4 — всегда LA, не UTC). */
 export function formatLaTime(epochMs: number): string {
   return new Intl.DateTimeFormat("ru-RU", {
-    timeZone: "America/Los_Angeles",
+    timeZone: LA_TZ,
     day: "numeric",
     month: "short",
     hour: "2-digit",
@@ -345,7 +362,18 @@ function renderRefusal(header: string, body: string): string {
  */
 function inlineReply(s: string, max = 80): string {
   const one = s.replace(/[\r\n]+/g, " ").trim();
-  return one.length > max ? one.slice(0, max) + "…" : one;
+  if (one.length <= max) return one;
+  // Обрезка по КОДОВЫМ ТОЧКАМ, а не по UTF-16-единицам: `slice` разрывал бы
+  // эмодзи пополам и выпускал наружу непарный суррогат — строку, которую
+  // клиент не может закодировать в UTF-8 (та же поломка, что нашлась в
+  // `safeText`, см. `util.ts`). Здесь повторено локально, потому что этот
+  // файл сознательно не имеет ни одного импорта (переносится в соседние репо).
+  let out = "";
+  for (const ch of one) {
+    if (out.length + ch.length > max) break;
+    out += ch;
+  }
+  return out + "…";
 }
 
 // ───────────────────────── Классификация user_reply ────────────────────────

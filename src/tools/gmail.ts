@@ -9,7 +9,19 @@ import net from "node:net";
 import { Agent as UndiciAgent, fetch as pinnedFetch } from "undici";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { gmail_v1 } from "googleapis";
-import { ok, okVerbatim, fail, guard, isTextual, mapWithLimit, safeText, safeBlock } from "../util.js";
+import {
+  ok,
+  okVerbatim,
+  fail,
+  guard,
+  isTextual,
+  mapWithLimit,
+  safeText,
+  safeBlock,
+  laIso,
+  laDateStamp,
+  plural,
+} from "../util.js";
 import { accountField, type UserClients } from "../accounts.js";
 import type { GoogleClients } from "../google.js";
 import { documentToPlainText } from "./docs.js";
@@ -270,15 +282,47 @@ function extractBody(payload?: gmail_v1.Schema$MessagePart): string {
   );
 }
 
+/**
+ * Абсолютный момент письма в epoch-миллисекундах, или null.
+ *
+ * Приоритет у `internalDate` (Gmail отдаёт его при любом format, включая
+ * `metadata`) — это время, по которому сам Gmail фильтрует запросы вида
+ * `after:`/`before:`. Заголовок `Date` — запасной путь: его пишет отправитель,
+ * он может быть кривым или отсутствовать.
+ */
+function messageEpochMs(msg: gmail_v1.Schema$Message, dateHeader: string): number | null {
+  const internal = Number(msg.internalDate);
+  if (Number.isFinite(internal) && internal > 0) return internal;
+  const parsed = Date.parse(dateHeader);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+/**
+ * Поля письма для выдачи читающих инструментов.
+ *
+ * `date` — ВСЕГДА в America/Los_Angeles (ISO со смещением, `laIso`), а не в
+ * поясе отправителя. До 2026-08-07 сюда клался сырой заголовок `Date`: на
+ * выборке из 100 писем это давало 9 разных смещений и у 12 писем — чужой
+ * календарный день, вплоть до самопротиворечия (письмо из выборки
+ * `after:2026/08/07 before:2026/08/08` печаталось как «8 Aug»).
+ *
+ * Сырой заголовок никуда не делся — он рядом, в `dateHeader`; абсолютное время
+ * для машинной сортировки — в `internalDate`. Если время не удалось установить
+ * вообще, `date` пустой: выдавать за LA то, что к LA не приведено, нельзя.
+ */
 function summarise(msg: gmail_v1.Schema$Message) {
   const h = msg.payload?.headers;
+  const dateHeader = header(h, "Date");
+  const ms = messageEpochMs(msg, dateHeader);
   return {
     id: msg.id,
     threadId: msg.threadId,
     from: header(h, "From"),
     to: header(h, "To"),
     subject: header(h, "Subject"),
-    date: header(h, "Date"),
+    date: ms === null ? "" : laIso(ms),
+    dateHeader,
+    internalDate: ms,
     snippet: msg.snippet ?? "",
     labelIds: msg.labelIds ?? [],
   };
@@ -1848,11 +1892,16 @@ function sanitizeName(s: string): string {
     .slice(0, 120) || "untitled";
 }
 
-/** YYYY-MM-DD from an RFC 822 Date header, or "" if unparseable. */
+/**
+ * YYYY-MM-DD из заголовка `Date`, или "" если он не разбирается.
+ *
+ * День — по Лос-Анджелесу (`laDateStamp`), а не по UTC: письмо, пришедшее в
+ * 17:00 PT, раньше попадало в имя файла экспорта уже СЛЕДУЮЩИМ днём.
+ */
 function dateStamp(dateHeader: string): string {
   if (!dateHeader) return "";
   const d = new Date(dateHeader);
-  return isNaN(d.getTime()) ? "" : d.toISOString().slice(0, 10);
+  return isNaN(d.getTime()) ? "" : laDateStamp(d.getTime());
 }
 
 /** mbox "From " separator line for one message (date is informational only). */
@@ -3321,7 +3370,7 @@ export function registerGmailTools(
           }),);
       const msgs = messages.map((r) => summarise(r.data));
       return ok({
-        summary: `🔍 Gmail search "${q || "(all)"}" — ${msgs.length} message(s)${list.data.nextPageToken ? " (has next page)" : ""}`,
+        summary: `🔍 Поиск Gmail «${q || "(всё)"}» — ${msgs.length} ${plural(msgs.length, "письмо", "письма", "писем")}${list.data.nextPageToken ? " (есть следующая страница)" : ""}`,
         resultSizeEstimate: list.data.resultSizeEstimate ?? ids.length,
         nextPageToken: list.data.nextPageToken ?? null,
         messages: msgs,
@@ -3378,7 +3427,7 @@ export function registerGmailTools(
         pages++;
       } while (pageToken && pages < MAX_PAGES);
       return ok({
-        summary: `📊 ${count}${!!pageToken ? "+" : ""} ${countThreads ? "thread(s)" : "message(s)"} for query "${q || "(all mail)"}"`,
+        summary: `📊 ${count}${!!pageToken ? "+" : ""} ${countThreads ? plural(count, "переписка", "переписки", "переписок") : plural(count, "письмо", "письма", "писем")} по запросу «${q || "(вся почта)"}»`,
         unit: countThreads ? "threads" : "messages",
         query: q || "(all mail)",
         count,
@@ -3416,7 +3465,7 @@ export function registerGmailTools(
       const ok_ = results.filter((r) => !("error" in r));
       const err_ = results.filter((r) => "error" in r);
       return ok({
-        summary: `📧 Fetched ${ok_.length}/${messageIds.length} message(s)${err_.length ? ` (${err_.length} error(s))` : ""}`,
+        summary: `📧 Получено ${ok_.length}/${messageIds.length} ${plural(messageIds.length, "письмо", "письма", "писем")}${err_.length ? ` (ошибок: ${err_.length})` : ""}`,
         results,
       });
     }),
@@ -3452,7 +3501,7 @@ export function registerGmailTools(
         });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
-        summary: `📧 Fetched ${ok_.length}/${threadIds.length} thread(s)`,
+        summary: `📧 Получено ${ok_.length}/${threadIds.length} ${plural(threadIds.length, "цепочка", "цепочки", "цепочек")}`,
         results,
       });
     }),
@@ -4360,7 +4409,7 @@ export function registerGmailTools(
     guard(async ({ account, status }) => {
       const { store } = snoozeCtx;
       if (!store) {
-        return ok({ summary: "No scheduled sends — DATABASE_URL is not configured, so nothing can be queued.", results: [] });
+        return ok({ summary: "Отложенных отправок нет — DATABASE_URL не настроен, очередь физически негде хранить.", results: [] });
       }
       const accountName = clients.canonicalName(account);
       const wanted = status ?? "pending";
@@ -4373,13 +4422,16 @@ export function registerGmailTools(
           ? `⚠️ есть ${failedCount} провалившаяся(ихся) отправка(ок) — посмотрите status='failed'.`
           : undefined;
       return ok({
-        summary: `🕗 ${rows.length} message(s) with status='${wanted}'`,
+        summary: `🕗 ${rows.length} ${plural(rows.length, "письмо", "письма", "писем")} со статусом «${wanted}»`,
         ...(note ? { note } : {}),
         results: rows.map((r) => ({
           id: r.id,
           to: r.toPreview,
           subject: r.subjectPreview,
-          sendAt: r.sendAt.toISOString(),
+          // Время — по Лос-Анджелесу (как в превью плана и журнале согласий),
+          // а не в UTC: раньше два места одного сервера показывали одно и то же
+          // событие в поясах, расходящихся летом на семь часов.
+          sendAt: laIso(r.sendAt.getTime()),
           status: r.status ?? wanted,
           // Show the full error for anything that failed, so the reason is visible.
           ...(r.error ? { error: r.error } : {}),
@@ -4476,7 +4528,9 @@ export function registerGmailTools(
       title: "Download email attachments",
       description:
         "Download one or more attachments' content. Get `attachmentId` from gmail_get_message's `attachments`. " +
-        "Text attachments return as text; binaries as base64.",
+        "The attachment's real filename and MIME type are read FROM THE MESSAGE (they are not taken from the " +
+        "call arguments), and an attachmentId that does not belong to the given messageId is refused outright. " +
+        "Text attachments return as text; binaries as base64; `maxBytes` caps BOTH.",
       inputSchema: {
         account,
         items: z
@@ -4484,8 +4538,6 @@ export function registerGmailTools(
             z.object({
               messageId: z.string(),
               attachmentId: z.string(),
-              mimeType: z.string().optional().describe("Attachment MIME type (from gmail_get_message)."),
-              filename: z.string().optional(),
               maxBytes: z.number().int().min(1).max(8_000_000).default(750_000).optional(),
             }),
           )
@@ -4495,7 +4547,66 @@ export function registerGmailTools(
     },
     guard(async ({ account, items }) => {
       const g = clients.resolve(account);
+      // Identity-guard (mcp-development-standard §4): что за файл скачан —
+      // решает ПИСЬМО, а не аргументы вызова. Приёмка 2026-08-07 показала три
+      // следствия старого поведения: (1) `filename`/`mimeType` в ответе были
+      // эхом аргументов («ВЫДУМАННОЕ-ИМЯ.zip» возвращалось как есть), то есть
+      // проверить, что именно скачано, было нечем; (2) по этому же эху
+      // выбиралась ветка «текст или base64», из-за чего `mimeType:"text/plain"`
+      // на PNG снимал лимит; (3) `attachmentId` из письма А, поданный с
+      // `messageId` письма Б (без вложений вовсе), возвращал 4619 байт и
+      // «1/1 успешно» — сервер эхом подтверждал привязку, которой не было.
+      // Теперь на каждое письмо делается один запрос за его структурой (кэш на
+      // батч), и attachmentId обязан в этой структуре найтись.
+      const metaCache = new Map<string, Promise<Map<string, { filename: string; mimeType: string; size: number }>>>();
+      const attachmentsOf = (messageId: string) => {
+        let pending = metaCache.get(messageId);
+        if (!pending) {
+          pending = (async () => {
+            const res = await g.gmail.users.messages.get({ userId: "me", id: messageId, format: "full" });
+            const map = new Map<string, { filename: string; mimeType: string; size: number }>();
+            for (const a of collectAttachments(res.data.payload)) {
+              map.set(a.attachmentId, { filename: a.filename, mimeType: a.mimeType, size: a.size });
+            }
+            return map;
+          })();
+          metaCache.set(messageId, pending);
+        }
+        return pending;
+      };
       const results = await mapWithLimit(items, async (item) => {
+          const base = { messageId: item.messageId, attachmentId: item.attachmentId };
+          let known: { filename: string; mimeType: string; size: number } | undefined;
+          try {
+            known = (await attachmentsOf(item.messageId)).get(item.attachmentId);
+          } catch (e) {
+            // Fail-closed: не смогли прочитать письмо — не скачиваем вслепую.
+            return {
+              ...base,
+              filename: null,
+              mimeType: null,
+              error: `🛑 Не удалось прочитать письмо ${item.messageId}, чтобы сверить с ним вложение: ${safeText(e instanceof Error ? e.message : e, 200)}. Ничего не скачано.`,
+            };
+          }
+          if (!known) {
+            return {
+              ...base,
+              filename: null,
+              mimeType: null,
+              error: `🛑 Вложение ${item.attachmentId} не принадлежит письму ${item.messageId} — в этом письме такого вложения нет. Возьмите attachmentId из поля attachments того же письма (gmail_get_message). Ничего не скачано.`,
+            };
+          }
+          const limit = item.maxBytes ?? 750_000;
+          const meta = { ...base, filename: known.filename, mimeType: known.mimeType };
+          const tooLarge = (bytes: number) =>
+            `Вложение «${safeText(known!.filename, 80)}» — ${bytes} ${plural(bytes, "байт", "байта", "байт")}, это больше лимита maxBytes=${limit}. Поднимите maxBytes (до 8 МБ) или сохраните файл на Диск через gmail_save_attachment_to_drive. Ничего не скачано.`;
+          // Лимит проверяется ДО скачивания — по размеру из письма, — и
+          // ПОВТОРНО по факту. Раньше проверка стояла после ветки isTextual,
+          // и для текстовых вложений не работала вовсе: лог/csv/json любого
+          // размера вливался в диалог целиком.
+          if (known.size > limit) {
+            return { ...meta, bytes: known.size, error: tooLarge(known.size) };
+          }
           try {
             const res = await g.gmail.users.messages.attachments.get({
               userId: "me",
@@ -4503,22 +4614,19 @@ export function registerGmailTools(
               id: item.attachmentId,
             });
             const buf = Buffer.from(res.data.data ?? "", "base64url");
-            const base = { messageId: item.messageId, attachmentId: item.attachmentId, filename: item.filename ?? null, mimeType: item.mimeType ?? null, bytes: buf.length };
-            if (item.mimeType && isTextual(item.mimeType)) {
-              return { ...base, text: buf.toString("utf8"), encoding: "text" };
+            const full = { ...meta, bytes: buf.length };
+            if (buf.length > limit) return { ...full, error: tooLarge(buf.length) };
+            if (isTextual(known.mimeType)) {
+              return { ...full, text: buf.toString("utf8"), encoding: "text" };
             }
-            const limit = item.maxBytes ?? 750_000;
-            if (buf.length > limit) {
-              return { ...base, error: `Attachment is ${buf.length} bytes — too large to inline. Raise maxBytes (max 8MB) or use gmail_save_attachment_to_drive.` };
-            }
-            return { ...base, content: buf.toString("base64"), encoding: "base64" };
+            return { ...full, content: buf.toString("base64"), encoding: "base64" };
           } catch (e) {
-            return { messageId: item.messageId, attachmentId: item.attachmentId, error: String(e instanceof Error ? e.message : e) };
+            return { ...meta, error: String(e instanceof Error ? e.message : e) };
           }
         });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
-        summary: `📎 Fetched ${ok_.length}/${items.length} attachment(s)`,
+        summary: `📎 Получено ${ok_.length}/${items.length} ${plural(items.length, "вложение", "вложения", "вложений")}`,
         results,
       });
     }),
@@ -4610,7 +4718,7 @@ export function registerGmailTools(
         });
       const ok_ = results.filter((r) => !("error" in r));
       return ok({
-        summary: `📄 Extracted text from ${ok_.length}/${items.length} attachment(s)`,
+        summary: `📄 Текст извлечён из ${ok_.length}/${items.length} ${plural(items.length, "вложения", "вложений", "вложений")}`,
         ...(leftovers.length ? { warning: ocrLeftoverWarning(leftovers), leftoverTempFiles: leftovers } : {}),
         results,
       });
@@ -4747,7 +4855,7 @@ export function registerGmailTools(
       const userLabels = labels.filter((l) => l.type === "user");
       const systemLabels = labels.filter((l) => l.type === "system");
       return ok({
-        summary: `🏷️ ${labels.length} label(s) — ${systemLabels.length} system, ${userLabels.length} user-defined`,
+        summary: `🏷️ ${labels.length} ${plural(labels.length, "ярлык", "ярлыка", "ярлыков")} — системных: ${systemLabels.length}, пользовательских: ${userLabels.length}`,
         labels,
       });
     }),
@@ -5507,7 +5615,7 @@ export function registerGmailTools(
         }
       });
       return ok({
-        summary: `📶 Checked ${uploads.length} upload session(s)`,
+        summary: `📶 Проверено ${uploads.length} ${plural(uploads.length, "сессия", "сессии", "сессий")} загрузки`,
         results,
       });
     }),
@@ -5559,14 +5667,14 @@ export function registerGmailTools(
       const { auditStore, consentCfg } = snoozeCtx;
       if (!auditStore) {
         return ok({
-          summary: "Audit log unavailable — DATABASE_URL is not configured, so nothing has been recorded.",
+          summary: "Журнал согласий недоступен — DATABASE_URL не настроен, значит ничего и не записывалось.",
           results: [],
         });
       }
       const parseWhen = (label: string, s?: string): number | undefined => {
         if (!s) return undefined;
         const t = Date.parse(s);
-        if (Number.isNaN(t)) throw new Error(`Cannot parse ${label}="${s}". Use ISO 8601, e.g. 2026-08-04T00:00:00-07:00.`);
+        if (Number.isNaN(t)) throw new Error(`Не могу разобрать ${label}="${s}". Нужен формат ISO 8601, например 2026-08-04T00:00:00-07:00.`);
         return t;
       };
       const filters = {
