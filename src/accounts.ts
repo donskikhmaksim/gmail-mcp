@@ -99,15 +99,15 @@ export function registerAccountTools(server: McpServer, clients: UserClients): v
     },
     async () => {
       const lines = clients.names.map(
-        (n) => `- ${n}${n === clients.defaultName ? " (default)" : ""}`,
+        (n) => `- ${n}${n === clients.defaultName ? " (по умолчанию)" : ""}`,
       );
       return {
         content: [
           {
             type: "text",
             text:
-              (lines.length ? lines.join("\n") : "No accounts configured.") +
-              `\n\nPass \`account\` with one of these names to pick an account; omitted uses "${clients.defaultName}".`,
+              (lines.length ? lines.join("\n") : "Аккаунты не настроены.") +
+              `\n\nПередайте \`account\` с одним из этих имён, чтобы выбрать аккаунт; без него используется «${clients.defaultName}».`,
           },
         ],
       };

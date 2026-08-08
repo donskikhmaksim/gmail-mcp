@@ -155,7 +155,20 @@ async function withRetry<R>(fn: () => Promise<R>, attempts = 3): Promise<R> {
  * Written as a standalone, portable function (util.ts is NOT byte-identical
  * across the five MCP repos — copy the function, not the file).
  */
-const LEGEND_EMOJI = /[✅⚠️❌🛑↷🧾]/g; // ✅⚠️❌🛑↷🧾
+/**
+ * Замороженная статус-легенда (output-format.md §7.2), которую внешнему тексту
+ * иметь нельзя. АЛЬТЕРНАЦИЯ с флагом `u`, а НЕ символьный класс `[…]`.
+ *
+ * Почему это принципиально: без флага `u` символьный класс распадается на
+ * UTF-16-единицы, и `🛑` (U+1F6D1) попадает в него как ДВЕ отдельные половины
+ * — `\uD83D` и `\uDED1`. А `\uD83D` — общая первая половина у сотен обычных
+ * эмодзи (🚀 😀 📎 🔍 …). В результате `safeText("Привет 🚀")` вырезала из
+ * ракеты первую половину и отдавала наружу непарный суррогат `\uDE80` — даже
+ * когда обрезки не было вовсе. Это вторая (и более широкая) причина того, что
+ * ответ `gmail_consent_audit` не кодировался в UTF-8: рвало не только на
+ * границе лимита, а на любом эмодзи из этого диапазона.
+ */
+const LEGEND_EMOJI = /(?:✅|⚠️|❌|🛑|↷|🧾)/gu;
 export function safeText(s: unknown, max = 120): string {
   if (s === null || s === undefined) return "";
   let t = String(s);
@@ -170,8 +183,33 @@ export function safeText(s: unknown, max = 120): string {
   // collapse the whitespace introduced by the substitutions.
   t = t.replace(/\s{2,}/g, " ").trim();
   // (d) length clamp with an ellipsis.
-  if (t.length > max) t = t.slice(0, max - 1).trimEnd() + "…";
+  if (t.length > max) t = clampCodePoints(t, max) + "…";
   return t;
+}
+
+/**
+ * Обрезка строки, которая НИКОГДА не разрывает суррогатную пару.
+ *
+ * Зачем (приёмка 2026-08-07): здесь стоял `t.slice(0, max - 1)`. `slice`
+ * режет по UTF-16-единицам, а эмодзи (всё, что вне BMP — 😀 🚀 𝕏) занимает
+ * ДВЕ такие единицы. Если граница обрезки попадала между ними, наружу уезжала
+ * половина пары — непарный суррогат. Такую строку `JSON.parse` ещё проглотит,
+ * а `.encode('utf-8')` на стороне клиента уже падает: в выдаче
+ * `gmail_consent_audit` на 100 записях таких половинок нашлось 10.
+ * И это не только про журнал: та же `safeText` (и `safeBlock` поверх неё)
+ * строит ПРЕВЬЮ ПЛАНА — текст, который человек читает перед нажатием ✅.
+ *
+ * Считаем по кодовым точкам (`for…of` итерирует именно так), но бюджет
+ * ведём в UTF-16-единицах, чтобы обещание «не длиннее max» осталось честным
+ * для получателей с лимитом в UTF-16 (Telegram, БД-колонки).
+ */
+function clampCodePoints(t: string, max: number): string {
+  let out = "";
+  for (const ch of t) {
+    if (out.length + ch.length > max - 1) break;
+    out += ch;
+  }
+  return out.trimEnd();
 }
 
 /**
@@ -222,6 +260,75 @@ export function safeBlock(
   while (out.length && out[out.length - 1] === "") out.pop();
   if (truncated) out.push("…");
   return out.map((l) => (l === "" ? "" : indent + l)).join("\n");
+}
+
+// ───────────────────────────── Время: всегда LA ─────────────────────────────
+
+/**
+ * Пояс и человекочитаемый формат берутся из `consent.ts` — там они и жили с
+ * самого начала (ТЗ A.4: «всегда LA, не UTC»), но применялись ТОЛЬКО в гейте
+ * подтверждения, а читающие инструменты отдавали `date` сырым заголовком
+ * письма, то есть в поясе ОТПРАВИТЕЛЯ. Приёмка 2026-08-07: на 100 письмах —
+ * 9 разных смещений, у 12 писем календарный день не совпадал с днём в
+ * Лос-Анджелесе, и `gmail_search` печатал «8 Aug» у письма, которое сам же
+ * относил к 7 августа (`after:2026/08/07 before:2026/08/08` его находил).
+ *
+ * Поэтому здесь НЕ заводится вторая реализация приведения: реэкспорт того же
+ * пояса и той же функции, плюс два формата поверх них (`laIso`,
+ * `laDateStamp`), которых гейту не требовалось. Направление зависимости
+ * именно такое, потому что `consent.ts` переносится в соседние MCP-репо и не
+ * имеет ни одного runtime-импорта.
+ */
+export { LA_TZ, formatLaTime } from "./consent.js";
+import { LA_TZ } from "./consent.js";
+
+/**
+ * Смещение LA от UTC в минутах на конкретный момент (учитывает переход на
+ * летнее время: −420 летом, −480 зимой).
+ *
+ * Как считается без внешних библиотек: `sv-SE` даёт «YYYY-MM-DD HH:mm:ss» —
+ * настенные часы LA; если ту же строку разобрать КАК ЕСЛИ БЫ она была в UTC,
+ * разница с исходным моментом и есть смещение.
+ */
+function laOffsetMinutes(epochMs: number): number {
+  const wall = new Date(epochMs).toLocaleString("sv-SE", { timeZone: LA_TZ });
+  const asUtc = Date.parse(wall.replace(" ", "T") + "Z");
+  return Math.round((asUtc - Math.floor(epochMs / 1000) * 1000) / 60_000);
+}
+
+/**
+ * Момент времени как ISO-8601 в поясе LA, со ЯВНЫМ смещением:
+ * `2026-08-07T16:16:37-07:00`. Машинно сравнимо (`Date.parse` даёт тот же
+ * epoch), человеку сразу виден календарный день по Лос-Анджелесу.
+ */
+export function laIso(epochMs: number): string {
+  const wall = new Date(epochMs).toLocaleString("sv-SE", { timeZone: LA_TZ });
+  const off = laOffsetMinutes(epochMs);
+  const sign = off < 0 ? "-" : "+";
+  const abs = Math.abs(off);
+  const hh = String(Math.floor(abs / 60)).padStart(2, "0");
+  const mm = String(abs % 60).padStart(2, "0");
+  return `${wall.replace(" ", "T")}${sign}${hh}:${mm}`;
+}
+
+/** Календарный день в LA как `YYYY-MM-DD` (для имён файлов и группировок). */
+export function laDateStamp(epochMs: number): string {
+  return laIso(epochMs).slice(0, 10);
+}
+
+/**
+ * Русское склонение при числительном: `plural(2, "письмо", "письма", "писем")`.
+ * Нужен потому, что весь видимый Максиму текст — по-русски
+ * (mcp-development-standard §7.4), а «2 письмо(писем)» русским текстом не
+ * является.
+ */
+export function plural(n: number, one: string, few: string, many: string): string {
+  const abs = Math.abs(n) % 100;
+  const last = abs % 10;
+  if (abs > 10 && abs < 20) return many;
+  if (last > 1 && last < 5) return few;
+  if (last === 1) return one;
+  return many;
 }
 
 /** True for MIME types whose bytes are safe to return inline as UTF-8 text. */

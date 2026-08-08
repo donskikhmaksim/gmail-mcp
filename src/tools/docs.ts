@@ -4,7 +4,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { docs_v1 } from "googleapis";
-import { ok, guard } from "../util.js";
+import { ok, guard, plural } from "../util.js";
 import { accountField, type UserClients } from "../accounts.js";
 
 /** Flattens a Docs document body into plain text. */
@@ -82,7 +82,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients) {
       });
       const files = res.data.files ?? [];
       return ok({
-        summary: `📋 ${files.length} document(s)${nameContains ? ` matching "${nameContains}"` : ""} on account "${account ?? "default"}"`,
+        summary: `📋 ${files.length} ${plural(files.length, "документ", "документа", "документов")}${nameContains ? ` по подстроке «${nameContains}»` : ""} в аккаунте «${account ?? "по умолчанию"}»`,
         files,
       });
     }),
@@ -106,7 +106,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients) {
       if (raw) return ok(res.data);
       const text = documentToPlainText(res.data);
       return ok({
-        summary: `📖 Read "${res.data.title ?? documentId}" — ${text.length} char(s)`,
+        summary: `📖 Прочитан «${res.data.title ?? documentId}» — ${text.length} ${plural(text.length, "символ", "символа", "символов")}`,
         title: res.data.title,
         documentId: res.data.documentId,
         text,
@@ -139,7 +139,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients) {
         });
       }
       return ok({
-        summary: `📄 Created document "${created.data.title ?? title}"`,
+        summary: `📄 Создан документ «${created.data.title ?? title}»`,
         documentId,
         title: created.data.title,
         url: `https://docs.google.com/document/d/${documentId}/edit`,
@@ -167,7 +167,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients) {
         requestBody: { requests: [{ insertText: { location: { index }, text } }] },
       });
       return ok({
-        summary: `📝 Appended ${text.length} char(s) to "${doc.data.title ?? documentId}"`,
+        summary: `📝 Дописано ${text.length} ${plural(text.length, "символ", "символа", "символов")} в «${doc.data.title ?? documentId}»`,
         ok: true,
         writeControl: res.data.writeControl ?? null,
       });
@@ -199,7 +199,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients) {
         requestBody: { requests: [{ insertText: { location: { index }, text } }] },
       });
       return ok({
-        summary: `📝 Inserted ${text.length} char(s) at index ${index} in "${docTitle ?? documentId}"`,
+        summary: `📝 Вставлено ${text.length} ${plural(text.length, "символ", "символа", "символов")} на позицию ${index} в «${docTitle ?? documentId}»`,
         ok: true,
       });
     }),
@@ -240,7 +240,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients) {
       });
       const occurrencesChanged = res.data.replies?.[0]?.replaceAllText?.occurrencesChanged ?? 0;
       return ok({
-        summary: `🔄 Replaced "${find}" → "${replace}" in "${docTitle ?? documentId}" — ${occurrencesChanged} occurrence(s)`,
+        summary: `🔄 Замена «${find}» → «${replace}» в «${docTitle ?? documentId}» — ${occurrencesChanged} ${plural(occurrencesChanged, "совпадение", "совпадения", "совпадений")}`,
         occurrencesChanged,
       });
     }),
@@ -265,7 +265,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients) {
         requestBody: { requests: requests as object[] },
       });
       return ok({
-        summary: `⚙️ Applied ${requests.length} raw request(s) to document ${documentId}`,
+        summary: `⚙️ Применено ${requests.length} ${plural(requests.length, "низкоуровневый запрос", "низкоуровневых запроса", "низкоуровневых запросов")} к документу ${documentId}`,
         documentId: res.data.documentId,
         replies: res.data.replies,
         writeControl: res.data.writeControl,
