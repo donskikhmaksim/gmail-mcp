@@ -302,6 +302,15 @@ export async function ensureSchema(): Promise<void> {
     )
   `);
   await p.query(`ALTER TABLE tg_automation_windows ADD COLUMN IF NOT EXISTS scope TEXT`);
+  // docs/TZ_automation_key_duration_labels.md раздел 1 — настраиваемый срок
+  // жизни, включая «бессрочно». `NULL` = бессрочно, число = unix ms
+  // истечения (как раньше). Идемпотентно: повторный `DROP NOT NULL` на уже
+  // nullable-колонке — не ошибка, а no-op (тот же приём, что уже применён
+  // выше к легаси-`server`). Выполняется БЕЗУСЛОВНО (не только в ветке
+  // легаси-таблицы) — новые деплойменты без легаси-`server` тоже создают
+  // `expires_at BIGINT NOT NULL` через `CREATE TABLE IF NOT EXISTS` выше и
+  // точно так же нуждаются в снятии этого constraint.
+  await p.query(`ALTER TABLE tg_automation_windows ALTER COLUMN expires_at DROP NOT NULL`);
   const legacyServerCol = await p.query(
     `SELECT 1 FROM information_schema.columns WHERE table_name = 'tg_automation_windows' AND column_name = 'server'`,
   );
@@ -1581,7 +1590,8 @@ export interface AutomationWindowRow {
   scope: string;
   label: string | null;
   createdAt: number;
-  expiresAt: number;
+  /** `null` = бессрочно (docs/TZ_automation_key_duration_labels.md раздел 1). */
+  expiresAt: number | null;
   revokedAt: number | null;
   createdByChat: string;
 }
@@ -1592,7 +1602,7 @@ function rowToAutomationWindow(row: {
   scope: string | null;
   label: string | null;
   created_at: string | number;
-  expires_at: string | number;
+  expires_at: string | number | null;
   revoked_at: string | number | null;
   created_by_chat: string;
 }): AutomationWindowRow {
@@ -1602,21 +1612,22 @@ function rowToAutomationWindow(row: {
     scope: row.scope ?? "",
     label: row.label,
     createdAt: Number(row.created_at),
-    expiresAt: Number(row.expires_at),
+    expiresAt: row.expires_at === null ? null : Number(row.expires_at),
     revokedAt: row.revoked_at === null ? null : Number(row.revoked_at),
     createdByChat: row.created_by_chat,
   };
 }
 
 /** Inserts a fresh window row. `windowId` is minted by the caller
- * (automation_key.ts — random, unguessable, e.g. `randomBytes(6).toString("hex")`). */
+ * (automation_key.ts — random, unguessable, e.g. `randomBytes(6).toString("hex")`).
+ * `expiresAt: null` = бессрочно. */
 export async function createAutomationWindow(input: {
   windowId: string;
   tokenHash: string;
   scope: string;
   label?: string | null;
   createdAt: number;
-  expiresAt: number;
+  expiresAt: number | null;
   createdByChat: string;
 }): Promise<void> {
   const p = getPool();
@@ -1628,15 +1639,33 @@ export async function createAutomationWindow(input: {
   );
 }
 
-/** Active windows only (not revoked, not expired), newest first — powers
- * `/automation_key list`. */
+/** Active windows only (not revoked, not expired — `expires_at IS NULL` counts
+ * as ACTIVE/бессрочно, never expired), newest first. Still used where only
+ * the active subset matters (offline tests, potential future callers) —
+ * `/automation_key list` itself now goes through `listAllAutomationWindows`
+ * below (docs/TZ_automation_key_duration_labels.md раздел 3). */
 export async function listActiveAutomationWindows(nowMs: number): Promise<AutomationWindowRow[]> {
   const p = getPool();
   const res = await p.query(
-    `SELECT * FROM tg_automation_windows WHERE revoked_at IS NULL AND expires_at > $1 ORDER BY created_at DESC`,
+    `SELECT * FROM tg_automation_windows
+      WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > $1)
+      ORDER BY created_at DESC`,
     [nowMs],
   );
   return res.rows.map(rowToAutomationWindow);
+}
+
+/** ВСЕ когда-либо выданные окна (активные + истёкшие + отозванные), самые
+ * свежие сверху, максимум `limit` строк — powers `/automation_key list`
+ * (docs/TZ_automation_key_duration_labels.md раздел 3). `total` — реальное
+ * количество строк в таблице (игнорируя `limit`), чтобы вызывающий код мог
+ * честно показать «показаны последние N из M», а не молча обрезать. */
+export async function listAllAutomationWindows(limit: number): Promise<{ windows: AutomationWindowRow[]; total: number }> {
+  const p = getPool();
+  const totalRes = await p.query(`SELECT COUNT(*)::int AS n FROM tg_automation_windows`);
+  const total = totalRes.rows[0]?.n ?? 0;
+  const res = await p.query(`SELECT * FROM tg_automation_windows ORDER BY created_at DESC LIMIT $1`, [limit]);
+  return { windows: res.rows.map(rowToAutomationWindow), total };
 }
 
 /** One window by id, regardless of active/revoked/expired — used to confirm

@@ -173,6 +173,28 @@ export function renderAutomationKeyMiniAppPage(): string {
   }
   button:disabled { opacity: .5; }
   #status { margin-top: 12px; font-size: 14px; color: var(--tg-theme-hint-color, #999); min-height: 1.2em; }
+  .field-label { font-size: 13px; color: var(--tg-theme-hint-color, #999); margin: 0 0 6px; }
+  .dur-row { display: flex; gap: 8px; margin-bottom: 8px; }
+  .dur-row input[type="number"], .dur-row select {
+    flex: 1;
+    padding: 10px;
+    border-radius: 10px;
+    border: none;
+    background: var(--tg-theme-secondary-bg-color, #f2f2f2);
+    color: var(--tg-theme-text-color, #000000);
+    font-size: 15px;
+  }
+  #labelInput {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: none;
+    background: var(--tg-theme-secondary-bg-color, #f2f2f2);
+    color: var(--tg-theme-text-color, #000000);
+    font-size: 15px;
+    margin-bottom: 8px;
+  }
 </style>
 </head>
 <body>
@@ -181,6 +203,21 @@ export function renderAutomationKeyMiniAppPage(): string {
       ${checkboxes}
   </div>
   <label class="row"><input type="checkbox" id="all"> Все сразу</label>
+  <div class="sep"></div>
+  <p class="field-label">Срок действия</p>
+  <div class="dur-row">
+    <input type="number" id="durNum" min="1" step="1" value="3">
+    <select id="durUnit">
+      <option value="hours" selected>часы</option>
+      <option value="days">дни</option>
+      <option value="weeks">недели</option>
+      <option value="months">месяцы</option>
+    </select>
+  </div>
+  <label class="row"><input type="checkbox" id="infinite"> Бессрочно</label>
+  <div class="sep"></div>
+  <p class="field-label">Название (необязательно)</p>
+  <input type="text" id="labelInput" placeholder="например: рабочий ноутбук">
   <div class="sep"></div>
   <button id="go" disabled>Получить ключ</button>
   <div id="status"></div>
@@ -194,6 +231,14 @@ export function renderAutomationKeyMiniAppPage(): string {
   var allBox = document.getElementById("all");
   var goBtn = document.getElementById("go");
   var statusEl = document.getElementById("status");
+  var durNum = document.getElementById("durNum");
+  var durUnit = document.getElementById("durUnit");
+  var infiniteBox = document.getElementById("infinite");
+  var labelInput = document.getElementById("labelInput");
+
+  // Единицы срока → миллисекунды (ТЗ раздел 1). "months" — условно 30 дней,
+  // как и везде в этой экосистеме, где нет полноценного календаря месяцев.
+  var UNIT_MS = { hours: 3600000, days: 86400000, weeks: 7 * 86400000, months: 30 * 86400000 };
 
   function selected() {
     return svcBoxes.filter(function (b) { return b.checked; }).map(function (b) { return b.value; });
@@ -215,9 +260,32 @@ export function renderAutomationKeyMiniAppPage(): string {
     });
   });
 
+  infiniteBox.addEventListener("change", function () {
+    durNum.disabled = infiniteBox.checked;
+    durUnit.disabled = infiniteBox.checked;
+  });
+
+  // Возвращает { ok: true, durationMs } или { ok: false } — false на кривом
+  // вводе (пусто/0/отрицательное/не число), чтобы кнопка отказалась слать
+  // запрос ДО backend'а (который тоже проверяет — см. http.ts, ТЗ раздел 1:
+  // "не отрицательное, не абсурдно маленькое типа 0").
+  function computeDuration() {
+    if (infiniteBox.checked) return { ok: true, durationMs: null };
+    var n = parseFloat(durNum.value);
+    if (!isFinite(n) || n <= 0) return { ok: false };
+    var unitMs = UNIT_MS[durUnit.value] || UNIT_MS.hours;
+    return { ok: true, durationMs: Math.round(n * unitMs) };
+  }
+
   goBtn.addEventListener("click", function () {
     var services = selected();
     if (services.length === 0) return; // fail-closed на фронтенде тоже, но backend не полагается на это
+    var duration = computeDuration();
+    if (!duration.ok) {
+      statusEl.textContent = "Укажи положительный срок или отметь «Бессрочно».";
+      return;
+    }
+    var label = labelInput.value.trim();
     goBtn.disabled = true;
     statusEl.textContent = "Генерирую...";
     fetch("/automation-key-app/generate", {
@@ -226,6 +294,8 @@ export function renderAutomationKeyMiniAppPage(): string {
       body: JSON.stringify({
         initData: tg ? tg.initData : "",
         services: services,
+        durationMs: duration.durationMs,
+        label: label === "" ? null : label,
       }),
     })
       .then(function (res) {

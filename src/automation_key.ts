@@ -76,7 +76,8 @@ export interface AutomationWindowRow {
   scope: string;
   label: string | null;
   createdAt: number;
-  expiresAt: number;
+  /** `null` = бессрочно (docs/TZ_automation_key_duration_labels.md раздел 1). */
+  expiresAt: number | null;
   revokedAt: number | null;
   createdByChat: string;
 }
@@ -86,11 +87,16 @@ export interface AutomationWindowStore {
     windowId: string;
     tokenHash: string;
     scope: string;
+    label?: string | null;
     createdAt: number;
-    expiresAt: number;
+    expiresAt: number | null;
     createdByChat: string;
   }): Promise<void>;
   listActiveWindows(nowMs: number): Promise<AutomationWindowRow[]>;
+  /** ВСЕ когда-либо выданные окна (активные + истёкшие + отозванные), самые
+   * свежие сверху, не более `limit` строк, плюс честный `total` (для «показаны
+   * последние N из M» — раздел 3 ТЗ). */
+  listAllWindows(limit: number): Promise<{ windows: AutomationWindowRow[]; total: number }>;
   getWindow(windowId: string): Promise<AutomationWindowRow | null>;
   /** true = действительно отозвано сейчас; false = не найдено ИЛИ уже было отозвано. */
   revokeWindow(windowId: string, nowMs: number): Promise<boolean>;
@@ -133,6 +139,34 @@ function maskToHumanList(mask: number): string {
   return AUTOMATION_SERVICES.filter((_, i) => (mask & (1 << i)) !== 0).join(", ");
 }
 
+// ───────────────────── Настраиваемый срок жизни ключа ───────────────────────
+// docs/TZ_automation_key_duration_labels.md раздел 1. Дефолт — 3 часа (индекс
+// 1 ниже), НЕ 1 час — владелец явно поправил себя с «час» на «три часа».
+
+export const DURATION_PRESETS: ReadonlyArray<{ label: string; ms: number | null }> = [
+  { label: "1 час", ms: 60 * 60 * 1000 },
+  { label: "3 часа (по умолчанию)", ms: 3 * 60 * 60 * 1000 },
+  { label: "24 часа", ms: 24 * 60 * 60 * 1000 },
+  { label: "7 дней", ms: 7 * 24 * 60 * 60 * 1000 },
+  { label: "30 дней", ms: 30 * 24 * 60 * 60 * 1000 },
+  { label: "Бессрочно", ms: null },
+];
+
+export const DEFAULT_DURATION_INDEX = 1;
+
+/** Разумный потолок против абсурдных/переполняющих значений с фронтенда
+ * мини-аппа (~100 лет — заведомо больше любого реального сценария, но всё ещё
+ * далеко от переполнения `Number`/переполнения `expires_at BIGINT`). */
+const MAX_DURATION_MS = 100 * 365 * 24 * 60 * 60 * 1000;
+
+/** `durationMs` из тела POST-запроса мини-аппа: `null` (бессрочно) валиден
+ * сам по себе и проверяется вызывающим кодом отдельно (`=== null`) — эта
+ * функция валидирует только "число ли это и разумное" (ТЗ раздел 1: "не
+ * отрицательное, не абсурдно маленькое типа 0"). */
+export function isValidDurationMs(x: unknown): x is number {
+  return typeof x === "number" && Number.isFinite(x) && x > 0 && x <= MAX_DURATION_MS;
+}
+
 // ───────────────────────── Клавиатура выбора ────────────────────────────────
 
 interface TgCallbackButton {
@@ -172,7 +206,10 @@ function buildSelectionKeyboard(mask: number, publicBaseUrl?: string): { inline_
   }
   const allChecked = mask === ALL_MASK;
   rows.push([{ text: `${allChecked ? "✓" : "✗"} Все сразу`, callback_data: `ak:all:${mask}` }]);
-  rows.push([{ text: "Получить ключ", callback_data: `ak:gen:${mask}` }]);
+  // «Получить ключ» больше НЕ генерирует сразу — открывает второй экран
+  // (выбор срока, ниже). ТЗ раздел 1 "Бот (кнопки)" — второй экран
+  // обязательный, не пропускаемый.
+  rows.push([{ text: "Получить ключ", callback_data: `ak:dur:${mask}` }]);
   if (publicBaseUrl) {
     rows.push([{ text: "Открыть как мини-апп", web_app: { url: `${publicBaseUrl}/automation-key-app` } }]);
   }
@@ -180,6 +217,23 @@ function buildSelectionKeyboard(mask: number, publicBaseUrl?: string): { inline_
 }
 
 const SELECTION_PROMPT = "Выбери сервисы, на которые должен действовать automation_key:";
+const DURATION_PROMPT = "Выбери срок действия ключа:";
+
+/** Второй экран — 6 кнопок-пресетов срока, 2 в ряд. Маска отмеченных
+ * сервисов из первого экрана переносится в `callback_data` целиком
+ * (`ak:gen:<mask>:<durationIndex>`) — никакого сервер-side состояния между
+ * двумя апдейтами (тот же приём, что маска сервисов в первом экране). */
+function buildDurationKeyboard(mask: number): { inline_keyboard: TgCallbackButton[][] } {
+  const rows: TgCallbackButton[][] = [];
+  for (let i = 0; i < DURATION_PRESETS.length; i += 2) {
+    const row: TgCallbackButton[] = [];
+    for (let j = i; j < Math.min(i + 2, DURATION_PRESETS.length); j++) {
+      row.push({ text: DURATION_PRESETS[j].label, callback_data: `ak:gen:${mask}:${j}` });
+    }
+    rows.push(row);
+  }
+  return { inline_keyboard: rows };
+}
 
 // ───────────────────────── Owner-only guard ─────────────────────────────────
 
@@ -231,6 +285,18 @@ function scheduleMessageDelete(cfg: TgApprovalConfig, chatId: string, messageId:
  * ВСЕГДА уходит только обычным сообщением в чат с 10с-самоудалением, никогда
  * в HTTP-ответе. `mask === 0` — ничего не создаёт, возвращает `null` (тот же
  * fail-closed принцип на пустой выбор, что и у кнопочной версии).
+ *
+ * `durationMs` — `null` значит бессрочно (docs/TZ_automation_key_duration_
+ * labels.md раздел 1); иначе окно живёт `durationMs` от текущего момента.
+ * Оба вызывающих кода (кнопочный `ak:gen:<mask>:<idx>` и мини-апп) обязаны
+ * передать его явно — здесь нет тихого дефолта на случай кривого ввода
+ * (`akCfg` больше не подставляет `ttlMs` сама; параметр оставлен ради
+ * стабильности сигнатуры/на случай будущих server-wide настроек, но сейчас
+ * не используется).
+ *
+ * `label` — необязательное название ключа (`null` = без названия). Раздел 2
+ * ТЗ: в боте ВСЕГДА `null` (свободный текст туда сознательно не подключён в
+ * этом заходе) — только мини-апп передаёт реальное значение.
  */
 export async function generateAndDeliverKey(
   cfg: TgApprovalConfig,
@@ -238,29 +304,37 @@ export async function generateAndDeliverKey(
   store: AutomationWindowStore,
   chatId: string,
   mask: number,
+  durationMs: number | null,
+  label: string | null = null,
   now: () => number = Date.now,
 ): Promise<{ windowId: string; scope: string } | null> {
+  void akCfg; // см. doc-comment выше — срок больше не берётся отсюда
   if (mask === 0) return null;
 
   const scope = maskToScope(mask);
   const rawToken = generateRawToken();
   const windowId = generateWindowId();
   const nowMs = now();
+  const expiresAt = durationMs === null ? null : nowMs + durationMs;
   await store.createWindow({
     windowId,
     tokenHash: sha256Hex(rawToken),
     scope,
+    label,
     createdAt: nowMs,
-    expiresAt: nowMs + akCfg.ttlMs,
+    expiresAt,
     createdByChat: chatId,
   });
 
+  const untilLine = expiresAt === null ? "До: бессрочно" : `До: ${formatLaTime(expiresAt)}`;
+  const labelLine = label ? `Название: ${label}\n` : "";
   const sent = await tgCall(cfg, "sendMessage", {
     chat_id: chatId,
     text:
       `🔑 ${rawToken}\n\n` +
+      labelLine +
       `Действует на: ${maskToHumanList(mask)}\n` +
-      `До: ${formatLaTime(nowMs + akCfg.ttlMs)}\n\n` +
+      `${untilLine}\n\n` +
       `Сообщение самоудалится через 10 секунд.`,
   });
   const sentMessageId = (sent.result as { message_id?: number } | undefined)?.message_id;
@@ -271,22 +345,56 @@ export async function generateAndDeliverKey(
 }
 
 // ───────────────────────── Список / текст ───────────────────────────────────
+// Менеджер (docs/TZ_automation_key_duration_labels.md раздел 3) — показывает
+// ВСЕ когда-либо выданные окна, не только активные, со статусом у каждого.
 
-function formatWindowLine(w: AutomationWindowRow, index: number): string {
-  return `${index + 1}. #${w.windowId} · ${w.scope} · до ${formatLaTime(w.expiresAt)}`;
+const LIST_LIMIT = 30;
+
+type WindowStatus = "active" | "expired" | "revoked";
+
+function windowStatus(w: AutomationWindowRow, nowMs: number): WindowStatus {
+  if (w.revokedAt !== null) return "revoked";
+  if (w.expiresAt !== null && w.expiresAt <= nowMs) return "expired";
+  return "active";
 }
 
-async function renderActiveList(
+function humanScope(scope: string): string {
+  return scope === "all" ? "все" : scope;
+}
+
+function formatAllWindowLine(w: AutomationWindowRow, nowMs: number, index: number): string {
+  const status = windowStatus(w, nowMs);
+  let statusText: string;
+  if (status === "revoked") {
+    statusText = `🚫 отозван ${formatLaTime(w.revokedAt as number)}`;
+  } else if (status === "expired") {
+    statusText = `⌛ истёк ${formatLaTime(w.expiresAt as number)}`;
+  } else if (w.expiresAt === null) {
+    statusText = "♾ бессрочно";
+  } else {
+    statusText = `✅ активен (до ${formatLaTime(w.expiresAt)})`;
+  }
+  const labelPart = w.label ? ` · ${w.label}` : ""; // без label — молча пропускаем, не "(без названия)"
+  return `${index + 1}. #${w.windowId}${labelPart} · ${humanScope(w.scope)} · ${statusText}`;
+}
+
+async function renderAllList(
   store: AutomationWindowStore,
   now: number,
 ): Promise<{ text: string; keyboard: { inline_keyboard: TgButton[][] } }> {
-  const windows = await store.listActiveWindows(now);
+  const { windows, total } = await store.listAllWindows(LIST_LIMIT);
   if (!windows.length) {
-    return { text: "Нет активных окон automation_key.", keyboard: { inline_keyboard: [] } };
+    return { text: "Ключей automation_key ещё не выдавалось.", keyboard: { inline_keyboard: [] } };
   }
-  const text = "Активные окна automation_key:\n\n" + windows.map(formatWindowLine).join("\n");
+  let text = "Все окна automation_key:\n\n" + windows.map((w, i) => formatAllWindowLine(w, now, i)).join("\n");
+  if (total > windows.length) {
+    text += `\n\nПоказаны последние ${windows.length} из ${total}.`;
+  }
   const keyboard = {
-    inline_keyboard: windows.map((w) => [{ text: `Отозвать #${w.windowId}`, callback_data: `ak:revoke:${w.windowId}` }]),
+    // «Отозвать» — только у активных строк (истёкшие/уже отозванные нечего отзывать).
+    inline_keyboard: windows
+      .filter((w) => windowStatus(w, now) === "active")
+      .map((w) => [{ text: `Отозвать #${w.windowId}`, callback_data: `ak:revoke:${w.windowId}` }]),
   };
   return { text, keyboard };
 }
@@ -330,7 +438,7 @@ export async function handleAutomationKeyMessage(
   }
 
   if (rest === "list") {
-    const { text: listText, keyboard } = await renderActiveList(store, now());
+    const { text: listText, keyboard } = await renderAllList(store, now());
     await tgCall(cfg, "sendMessage", { chat_id: chatId, text: listText, reply_markup: keyboard });
     return true;
   }
@@ -419,8 +527,10 @@ export async function handleAutomationKeyCallback(
     return true;
   }
 
-  // ak:gen:<mask> — сгенерировать ключ по текущему выбору.
-  if (parts[0] === "ak" && parts[1] === "gen") {
+  // ak:dur:<mask> — «Получить ключ» с первого экрана: открывает ВТОРОЙ,
+  // обязательный экран выбора срока (ТЗ раздел 1 "Бот (кнопки)") — сама
+  // генерация происходит только на `ak:gen:<mask>:<idx>` ниже.
+  if (parts[0] === "ak" && parts[1] === "dur") {
     const mask = Number(parts[2] ?? "0") | 0;
     if (mask === 0) {
       await tgCall(cfg, "answerCallbackQuery", {
@@ -432,6 +542,37 @@ export async function handleAutomationKeyCallback(
     }
 
     if (cq.messageId != null) {
+      await tgCall(cfg, "editMessageText", {
+        chat_id: chatId,
+        message_id: cq.messageId,
+        text: DURATION_PROMPT,
+        reply_markup: buildDurationKeyboard(mask),
+      }).catch(() => {});
+    }
+    await tgCall(cfg, "answerCallbackQuery", { callback_query_id: cq.id }).catch(() => {});
+    return true;
+  }
+
+  // ak:gen:<mask>:<durationIndex> — второй экран: сгенерировать ключ с уже
+  // отмеченными сервисами (маска) и выбранным сроком (индекс в
+  // DURATION_PRESETS) — весь контекст пришёл ОДНИМ нажатием, без
+  // сервер-side состояния между двумя апдейтами (ТЗ раздел 1).
+  if (parts[0] === "ak" && parts[1] === "gen") {
+    const mask = Number(parts[2] ?? "0") | 0;
+    const idx = Number(parts[3] ?? "");
+    if (mask === 0 || !Number.isInteger(idx) || idx < 0 || idx >= DURATION_PRESETS.length) {
+      // Отсутствующий/битый индекс срока — например нажатие на клавиатуру
+      // старого формата, оставшуюся в чате с прошлого деплоя. Fail-closed:
+      // НЕ генерируем с молчаливым дефолтом (ТЗ: второй экран обязателен).
+      await tgCall(cfg, "answerCallbackQuery", {
+        callback_query_id: cq.id,
+        text: "Некорректный выбор — начни заново через /automation_key.",
+        show_alert: true,
+      }).catch(() => {});
+      return true;
+    }
+
+    if (cq.messageId != null) {
       await tgCall(cfg, "editMessageReplyMarkup", {
         chat_id: chatId,
         message_id: cq.messageId,
@@ -440,7 +581,8 @@ export async function handleAutomationKeyCallback(
     }
     await tgCall(cfg, "answerCallbackQuery", { callback_query_id: cq.id, text: "Ключ сгенерирован" }).catch(() => {});
 
-    await generateAndDeliverKey(cfg, akCfg, store, chatId, mask, now);
+    // Бот label не поддерживает в этом заходе (ТЗ раздел 2) — всегда null.
+    await generateAndDeliverKey(cfg, akCfg, store, chatId, mask, DURATION_PRESETS[idx].ms, null, now);
     return true;
   }
 
@@ -452,7 +594,7 @@ export async function handleAutomationKeyCallback(
       callback_query_id: cq.id,
       text: ok ? "Отозвано" : "Уже отозвано или не найдено",
     }).catch(() => {});
-    const { text: listText, keyboard } = await renderActiveList(store, now());
+    const { text: listText, keyboard } = await renderAllList(store, now());
     if (cq.messageId != null) {
       await tgCall(cfg, "editMessageText", {
         chat_id: chatId,

@@ -31,7 +31,13 @@ import {
   automationWindowStoreAdapter,
 } from "./server.js";
 import { handleWebhook, registerWebhook, runApprovalSweep, reportAutoExecutionResult, secretTokenMatches } from "./tg_approval.js";
-import { handleAutomationKeyMessage, handleAutomationKeyCallback, generateAndDeliverKey, servicesToMask } from "./automation_key.js";
+import {
+  handleAutomationKeyMessage,
+  handleAutomationKeyCallback,
+  generateAndDeliverKey,
+  servicesToMask,
+  isValidDurationMs,
+} from "./automation_key.js";
 import { renderAutomationKeyMiniAppPage, verifyTelegramInitData } from "./automation_key_miniapp.js";
 import { tryAutoExecute } from "./consent.js";
 import { getAutoExecutor, type AutoExecutorCtx } from "./autoExecute.js";
@@ -422,6 +428,25 @@ export async function startHttpServer(config: Config): Promise<void> {
 
     const services = Array.isArray(req.body?.services) ? (req.body.services as unknown[]).filter((s) => typeof s === "string") : [];
     const mask = servicesToMask(services as string[]);
+
+    // durationMs: null (бессрочно) — валиден как есть; иначе обязано пройти
+    // isValidDurationMs (положительное, конечное, разумных размеров) — любая
+    // другая ерунда с фронтенда (отсутствует, строка, 0, отрицательное,
+    // NaN/Infinity) отклоняется явным 400, backend НЕ подставляет тихий
+    // дефолт (ТЗ раздел 1).
+    const rawDuration: unknown = req.body?.durationMs;
+    if (rawDuration !== null && !isValidDurationMs(rawDuration)) {
+      res.status(400).json({ error: "invalid_duration" });
+      return;
+    }
+    const durationMs: number | null = rawDuration === null ? null : (rawDuration as number);
+
+    // label: пустая/отсутствующая строка → null (ТЗ раздел 2), иначе как есть
+    // (обрезано до разумной длины, чтобы не раздувать хранилище/сообщение).
+    const rawLabel = req.body?.label;
+    const trimmedLabel = typeof rawLabel === "string" ? rawLabel.trim() : "";
+    const label: string | null = trimmedLabel === "" ? null : trimmedLabel.slice(0, 200);
+
     let result: Awaited<ReturnType<typeof generateAndDeliverKey>>;
     try {
       result = await generateAndDeliverKey(
@@ -430,6 +455,8 @@ export async function startHttpServer(config: Config): Promise<void> {
         automationWindowStoreAdapter,
         tgApprovalConfig.ownerChatId,
         mask,
+        durationMs,
+        label,
       );
     } catch (err) {
       console.error("automation-key-app/generate error:", err);

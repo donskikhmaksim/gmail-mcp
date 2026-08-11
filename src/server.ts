@@ -30,6 +30,7 @@ import {
   claimStaleDecidedApprovals,
   createAutomationWindow,
   listActiveAutomationWindows,
+  listAllAutomationWindows,
   getAutomationWindow,
   revokeAutomationWindow,
 } from "./store.js";
@@ -151,6 +152,7 @@ export const automationKeyConfig = loadAutomationKeyConfig();
 export const automationWindowStoreAdapter: AutomationWindowStore = {
   createWindow: createAutomationWindow,
   listActiveWindows: listActiveAutomationWindows,
+  listAllWindows: listAllAutomationWindows,
   getWindow: getAutomationWindow,
   revokeWindow: revokeAutomationWindow,
 };
