@@ -523,6 +523,55 @@ export async function registerWebhook(cfg: TgApprovalConfig): Promise<void> {
   }
 }
 
+/**
+ * Best-effort регистрация постоянных UI-точек входа бота
+ * (`docs/TZ_automation_key_note_delivery_and_buttons.md` раздел 2):
+ *  1. `setMyCommands` — `/automation_key` появляется в автодополнении команд
+ *     Telegram при наборе `/` в чате с ботом (не нужно печатать вручную).
+ *  2. `setChatMenuButton` — постоянная кнопка РЯДОМ С ПОЛЕМ ВВОДА (не в
+ *     клавиатуре сообщения, отдельный persistent UI-элемент Telegram),
+ *     открывающая мини-апп `automation-key-app` в одно касание.
+ *
+ * Оба вызова идемпотентны — Telegram просто переустанавливает то же самое
+ * значение на каждом старте, без вреда, поэтому безопасно звать это на
+ * КАЖДОМ старте КАЖДОГО сервера (в отличие от `registerWebhook`, которым
+ * владеет ровно один сервер через `TG_WEBHOOK_OWNER` — здесь такого
+ * ограничения нет, даже если бот-токен общий на всех шестерых). Каждый из
+ * двух вызовов — независимый best-effort try/catch: сбой одного не мешает
+ * другому и не бросает исключение наружу — вызывающий код (http.ts) зовёт
+ * эту функцию без своего try/catch именно поэтому.
+ */
+export async function registerBotUiEntryPoints(cfg: TgApprovalConfig): Promise<void> {
+  if (!cfg.enabled) return;
+
+  try {
+    const res = await tgCall(cfg, "setMyCommands", {
+      commands: [{ command: "automation_key", description: "Ключ для автоматики (временный/постоянный)" }],
+    });
+    if (!res.ok) {
+      console.error(`TG approval: setMyCommands FAILED (${res.description ?? "unknown error"})`);
+    }
+  } catch (err) {
+    console.error(`TG approval: setMyCommands threw: ${(err as Error).message}`);
+  }
+
+  if (!cfg.publicBaseUrl) {
+    console.error("TG approval: publicBaseUrl не задан — кнопка меню чата (мини-апп) не устанавливается.");
+    return;
+  }
+  try {
+    const url = `${cfg.publicBaseUrl.replace(/\/+$/, "")}/automation-key-app`;
+    const res = await tgCall(cfg, "setChatMenuButton", {
+      menu_button: { type: "web_app", text: "Ключ", web_app: { url } },
+    });
+    if (!res.ok) {
+      console.error(`TG approval: setChatMenuButton FAILED (${res.description ?? "unknown error"}) -- url=${url}`);
+    }
+  } catch (err) {
+    console.error(`TG approval: setChatMenuButton threw: ${(err as Error).message}`);
+  }
+}
+
 // ───────────────────────── Sweep (bot chat hygiene) ──────────────────────────
 
 /**

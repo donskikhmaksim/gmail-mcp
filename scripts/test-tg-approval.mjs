@@ -11,7 +11,14 @@
  */
 import { MockAgent, setGlobalDispatcher } from "undici";
 import { requireConsent, sha256 } from "../src/consent.ts";
-import { createTgApprovalGate, handleWebhook, registerWebhook, runApprovalSweep, secretTokenMatches } from "../src/tg_approval.ts";
+import {
+  createTgApprovalGate,
+  handleWebhook,
+  registerWebhook,
+  registerBotUiEntryPoints,
+  runApprovalSweep,
+  secretTokenMatches,
+} from "../src/tg_approval.ts";
 
 // ── управляемые часы (как в test-consent.mjs) ───────────────────────────────
 const clock = { t: 1_700_000_000_000 };
@@ -786,6 +793,61 @@ console.log("\n[18] registerWebhook: webhookOwner=true И ownBot=true однов
     loggedErrors.some((l) => l.includes("TG_WEBHOOK_OWNER=true И") && l.includes("TG_BOT_TOKEN_OVERRIDE")),
     loggedErrors.join("\n---\n"),
   );
+}
+
+// ═══ [19] registerBotUiEntryPoints — /automation_key в автодополнении + кнопка меню чата ═══
+// docs/TZ_automation_key_note_delivery_and_buttons.md раздел 2: оба вызова —
+// setMyCommands/setChatMenuButton — best-effort при старте, не гейтуются
+// TG_WEBHOOK_OWNER (в отличие от setWebhook), не должны ронять старт при сбое.
+console.log("\n[19] registerBotUiEntryPoints — setMyCommands + setChatMenuButton вызваны с ожидаемыми аргументами");
+{
+  const { mock } = resetTelegramMocks();
+  mock("setMyCommands", () => ({ statusCode: 200, data: { ok: true, result: true }, headers: { "content-type": "application/json" } }));
+  mock("setChatMenuButton", () => ({ statusCode: 200, data: { ok: true, result: true }, headers: { "content-type": "application/json" } }));
+
+  await registerBotUiEntryPoints(tgCfg({ enabled: true, publicBaseUrl: "https://example.test" }));
+
+  const cmdCall = tgCalls.find((c) => c.method === "setMyCommands");
+  check("setMyCommands вызван", !!cmdCall);
+  check(
+    "setMyCommands содержит команду automation_key с описанием",
+    Array.isArray(cmdCall?.body.commands) &&
+      cmdCall.body.commands.some((c) => c.command === "automation_key" && typeof c.description === "string" && c.description.length > 0),
+    cmdCall?.body,
+  );
+
+  const menuCall = tgCalls.find((c) => c.method === "setChatMenuButton");
+  check("setChatMenuButton вызван", !!menuCall);
+  check("menu_button.type === 'web_app'", menuCall?.body.menu_button?.type === "web_app", menuCall?.body);
+  check(
+    "menu_button.web_app.url указывает на /automation-key-app на publicBaseUrl",
+    menuCall?.body.menu_button?.web_app?.url === "https://example.test/automation-key-app",
+    menuCall?.body,
+  );
+
+  // enabled=false → полный no-op, ни один метод не вызван.
+  const { mock: mock2 } = resetTelegramMocks();
+  mock2("setMyCommands", () => ({ statusCode: 200, data: { ok: true, result: true }, headers: { "content-type": "application/json" } }));
+  mock2("setChatMenuButton", () => ({ statusCode: 200, data: { ok: true, result: true }, headers: { "content-type": "application/json" } }));
+  await registerBotUiEntryPoints(tgCfg({ enabled: false }));
+  check("enabled=false → ни setMyCommands, ни setChatMenuButton не вызваны", tgCalls.length === 0, tgCalls.map((c) => c.method));
+}
+
+console.log("\n[19-bis] registerBotUiEntryPoints — сбой Telegram API не бросает исключение наружу (сервер не должен упасть)");
+{
+  const { mock } = resetTelegramMocks();
+  mock("setMyCommands", () => ({ statusCode: 200, data: { ok: false, description: "boom" }, headers: { "content-type": "application/json" } }));
+  mock("setChatMenuButton", () => {
+    throw new Error("network down");
+  });
+
+  let threw = false;
+  try {
+    await registerBotUiEntryPoints(tgCfg({ enabled: true, publicBaseUrl: "https://example.test" }));
+  } catch {
+    threw = true;
+  }
+  check("[план 5] сбой setMyCommands (ok:false) и setChatMenuButton (throw) не пробрасывается вызывающему", !threw);
 }
 
 // ── итог ─────────────────────────────────────────────────────────────────
