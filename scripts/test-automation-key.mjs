@@ -11,6 +11,12 @@
  * (см. README-запуск ниже); без него раздел молча пропускается, весь
  * остальной файл — чистый offline-тест по стилю test-tg-approval.mjs.
  *
+ * Доставка ключа теперь идёт через self-destroyed-notes
+ * (`docs/TZ_automation_key_note_delivery_and_buttons.md` раздел 1) — тот
+ * POST на `/api/notes` тоже замокан через тот же MockAgent (второй pool,
+ * другой хост), по умолчанию возвращает `{id: "note-N"}`; тесты ниже
+ * проверяют, что в сообщении бота уходит ссылка на заметку, а не сырой токен.
+ *
  * Запуск: node scripts/test-automation-key.mjs
  *   (для раздела [8]: AUTOMATION_KEY_TEST_DB_URL=postgres://... node scripts/test-automation-key.mjs)
  */
@@ -24,16 +30,44 @@ import {
   DEFAULT_DURATION_INDEX,
 } from "../src/automation_key.ts";
 
+// Дубликат константы из `automation_key.ts` (которая сама — намеренный
+// дубликат, см. doc-comment там) — тест не импортирует модуль ради одной
+// строки, просто знает адрес того же публичного сервиса.
+const SELF_DESTROYED_NOTES_BASE_URL = "https://self-destroyed-notes-production.up.railway.app";
+
 const BOT_TOKEN = "TESTTOKEN";
 const OWNER_CHAT_ID = "555";
 let tgCalls = [];
+let noteApiCalls = [];
 
-function resetTelegramMocks() {
+/**
+ * `notesResponder(body)` — необязательный override ответа `POST /api/notes`
+ * (по умолчанию — успех с растущим `id`, чтобы каждая заметка была
+ * различима). Передавать кастомный responder, когда тест намеренно проверяет
+ * сбой self-destroyed-notes (см. раздел про fail-closed доставку ниже).
+ */
+function resetTelegramMocks(notesResponder) {
   tgCalls = [];
+  noteApiCalls = [];
   const agent = new MockAgent();
   agent.disableNetConnect();
   setGlobalDispatcher(agent);
   const pool = agent.get("https://api.telegram.org");
+  const notesPool = agent.get(SELF_DESTROYED_NOTES_BASE_URL);
+  let noteIdCounter = 0;
+  const defaultNotesResponder = () => ({
+    statusCode: 200,
+    data: { id: `note-${++noteIdCounter}` },
+    headers: { "content-type": "application/json" },
+  });
+  notesPool
+    .intercept({ path: "/api/notes", method: "POST" })
+    .reply((opts) => {
+      const body = JSON.parse(opts.body);
+      noteApiCalls.push(body);
+      return (notesResponder ?? defaultNotesResponder)(body);
+    })
+    .persist();
   return {
     mock(method, respond) {
       pool
@@ -202,8 +236,33 @@ console.log("\n[1] генерация с одним отмеченным сер�
   );
   check("label = null (бот не передаёт название — ТЗ раздел 2)", windows[0]?.label === null, windows[0]?.label);
   const sentToken = tgCalls.find((c) => c.method === "sendMessage" && /🔑/.test(c.body.text));
-  check("отдельное сообщение с сырым токеном отправлено", !!sentToken);
+  check("отдельное сообщение с ключом отправлено", !!sentToken);
   check("текст сообщения упоминает ticktick", /ticktick/.test(sentToken?.body.text ?? ""));
+  // [ТЗ раздел 1 / тестовый план п.1] сообщение несёт ссылку на self-destruct-заметку, НЕ сырой токен напрямую.
+  check(
+    "[план 1] сообщение содержит URL self-destroyed-notes /#/n/<id>/<key>",
+    new RegExp(`${SELF_DESTROYED_NOTES_BASE_URL.replace(/[.]/g, "\\.")}/#/n/[^/\\s]+/[^\\s]+`).test(sentToken?.body.text ?? ""),
+    sentToken?.body.text,
+  );
+  check(
+    "[план 1] первая строка после 🔑 — это подпись «Ключ (одноразовая ссылка...», не голый base64-токен",
+    /^🔑 Ключ \(одноразовая ссылка/.test(sentToken?.body.text ?? ""),
+    sentToken?.body.text,
+  );
+  check("ровно один POST /api/notes сделан на этот ключ", noteApiCalls.length === 1, noteApiCalls.length);
+  check(
+    "тело POST /api/notes — зашифрованный payload (v/iv/data/salt/iter), не сырой токен как есть",
+    noteApiCalls[0]?.payload?.v === 1 &&
+      typeof noteApiCalls[0]?.payload?.data === "string" &&
+      typeof noteApiCalls[0]?.payload?.iv === "string" &&
+      typeof noteApiCalls[0]?.payload?.salt === "string",
+    noteApiCalls[0],
+  );
+  check(
+    "[ТЗ раздел 1 п.3] oneView:true, ttl:3600 (час) в теле запроса создания заметки",
+    noteApiCalls[0]?.oneView === true && noteApiCalls[0]?.ttl === 3600,
+    noteApiCalls[0],
+  );
 }
 
 // ═══ [2] Генерация с «Все сразу» → scope = "all" ═══
@@ -537,6 +596,36 @@ console.log("\n[6] owner-only — чужой chat/from не может ни ге
   check("текстовый revoke от чужого тоже не сработал", textRevokeHandled === true);
   const stillActive2 = await store.listActiveWindows(nowFixed());
   check("owner-win всё ещё активно после текстовой попытки чужого", stillActive2.some((w) => w.windowId === "owner-win"));
+}
+
+// ═══ [6-bis] self-destroyed-notes недоступен → окно всё равно создано, НО сырой токен НЕ отправляется текстом ═══
+// docs/TZ_automation_key_note_delivery_and_buttons.md раздел 1 — сознательное
+// решение: сбой сервиса не должен тихо откатываться на отправку сырого
+// токена (это свело бы на нет весь смысл доставки через заметку).
+console.log("\n[6-bis] сбой POST /api/notes → окно создано, ключ НЕ отправлен сырым текстом, есть предупреждение владельцу");
+{
+  const h = resetTelegramMocks(() => ({
+    statusCode: 500,
+    data: { error: "internal" },
+    headers: { "content-type": "application/json" },
+  }));
+  mockDefaults(h);
+  const store = makeStore();
+  const cfg = tgCfg();
+
+  await handleAutomationKeyCallback(
+    cfg, akCfg(), store,
+    { id: "cbq-gen-note-fail", fromId: Number(OWNER_CHAT_ID), data: `ak:gen:1:${DEFAULT_DURATION_INDEX}`, chatId: Number(OWNER_CHAT_ID), messageId: 5 },
+    nowFixed,
+  );
+  const windows = [...store.windows.values()];
+  check("окно всё равно создано в БД, несмотря на сбой доставки", windows.length === 1, windows.length);
+
+  const sent = tgCalls.find((c) => c.method === "sendMessage");
+  check("сообщение всё равно отправлено (с предупреждением, не с ключом)", !!sent);
+  check("сообщение НЕ содержит 🔑 (не пытается отправить сырой токен как есть)", !/🔑/.test(sent?.body.text ?? ""), sent?.body.text);
+  check("сообщение упоминает сбой/недоступность self-destroyed-notes", /self-destroyed-notes/.test(sent?.body.text ?? ""), sent?.body.text);
+  check("окно #<windowId> упомянуто в сообщении об ошибке (можно найти его через /automation_key list)", new RegExp(`#${windows[0]?.windowId}`).test(sent?.body.text ?? ""), sent?.body.text);
 }
 
 // ═══ [7] Сообщение с токеном планируется на удаление примерно через 10с ═══

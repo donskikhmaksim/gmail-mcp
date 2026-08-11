@@ -16,7 +16,7 @@
  * бесплатно (ТЗ, раздел "gmail-mcp — интерактивный флоу", п.3).
  */
 
-import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
+import { randomBytes, createHash, timingSafeEqual, pbkdf2Sync, createCipheriv } from "node:crypto";
 import { fetch as undiciFetch } from "undici";
 import type { TgApprovalConfig, AutomationKeyConfig } from "./config.js";
 
@@ -66,6 +66,85 @@ function formatLaTime(epochMs: number): string {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(epochMs));
+}
+
+// ───────────────────── Доставка ключа как self-destruct-заметка ─────────────
+// docs/TZ_automation_key_note_delivery_and_buttons.md раздел 1. Шифрование —
+// byte-for-byte дубликат `note_crypto.ts`'s `generateKey()`/`encrypt()`
+// (которая сама — byte-for-byte порт self-destroyed-notes'а `crypto.ts`,
+// отдельно покрыта своим прямым round-trip-тестом,
+// `scripts/test-note-crypto.mjs`). ДУБЛИКАТ, не runtime-импорт из
+// `note_crypto.js`, по ТОЙ ЖЕ причине, что уже объяснена в doc-comment
+// самого верха этого файла для `tgCall`/`formatLaTime`: этот модуль
+// тестируется НАПРЯМУЮ (`node scripts/test-automation-key.mjs` импортирует
+// `../src/automation_key.ts` без сборки), а относительный `./note_crypto.js`
+// резолвится в `note_crypto.ts` только в `dist/` после `tsc`.
+
+const NOTE_KEY_BYTES = 32; // AES-256
+const NOTE_IV_BYTES = 12; // GCM standard nonce
+const NOTE_SALT_BYTES = 16;
+const NOTE_PBKDF2_ITERATIONS = 100_000;
+const SELF_DESTROYED_NOTES_BASE_URL = "https://self-destroyed-notes-production.up.railway.app";
+/** Час на то, чтобы открыть ссылку (ttl заметки ДО первого просмотра) — не
+ * про срок самого automation_key, тот считается отдельно (`expiresAt` окна). */
+const NOTE_TTL_SECONDS = 60 * 60;
+
+function generateNoteKey(): string {
+  return randomBytes(NOTE_KEY_BYTES).toString("base64url");
+}
+
+function encryptForNote(plaintext: string, keyB64Url: string): { v: 1; iv: string; data: string; salt: string; iter: number; pw: boolean } {
+  const urlKey = Buffer.from(keyB64Url, "base64url");
+  if (urlKey.length !== NOTE_KEY_BYTES) throw new Error("invalid key length");
+
+  const salt = randomBytes(NOTE_SALT_BYTES);
+  const key = pbkdf2Sync(urlKey, salt, NOTE_PBKDF2_ITERATIONS, NOTE_KEY_BYTES, "sha256");
+
+  const iv = randomBytes(NOTE_IV_BYTES);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const enc = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  const data = Buffer.concat([enc, tag]);
+
+  return {
+    v: 1,
+    iv: iv.toString("base64"),
+    data: data.toString("base64"),
+    salt: salt.toString("base64"),
+    iter: NOTE_PBKDF2_ITERATIONS,
+    pw: false,
+  };
+}
+
+/**
+ * Шифрует `plaintext` свежим одноразовым ключом, создаёт one-view-заметку на
+ * self-destroyed-notes (публичный, без авторизации на создание — см. ТЗ) и
+ * возвращает готовую ссылку `.../#/n/<id>/<key>`. Кидает исключение при
+ * сетевой ошибке/не-2xx/отсутствии `id` — вызывающий код (ниже,
+ * `generateAndDeliverKey`) решает, как обработать сбой.
+ */
+async function createSecretNoteLink(plaintext: string): Promise<string> {
+  const key = generateNoteKey();
+  const payload = encryptForNote(plaintext, key);
+
+  const res = await undiciFetch(`${SELF_DESTROYED_NOTES_BASE_URL}/api/notes`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ payload, oneView: true, ttl: NOTE_TTL_SECONDS }),
+  });
+  if (!res.ok) {
+    throw new Error(`self-destroyed-notes: HTTP ${res.status}`);
+  }
+  let json: { id?: string };
+  try {
+    json = (await res.json()) as { id?: string };
+  } catch {
+    throw new Error("self-destroyed-notes: non-JSON response");
+  }
+  if (!json.id) {
+    throw new Error("self-destroyed-notes: response missing id");
+  }
+  return `${SELF_DESTROYED_NOTES_BASE_URL}/#/n/${json.id}/${key}`;
 }
 
 // ───────────────────────── DI contract (store.ts on the other side) ────────
@@ -297,6 +376,20 @@ function scheduleMessageDelete(cfg: TgApprovalConfig, chatId: string, messageId:
  * `label` — необязательное название ключа (`null` = без названия). Раздел 2
  * ТЗ: в боте ВСЕГДА `null` (свободный текст туда сознательно не подключён в
  * этом заходе) — только мини-апп передаёт реальное значение.
+ *
+ * Доставка ключа (`docs/TZ_automation_key_note_delivery_and_buttons.md`
+ * раздел 1): сырой токен НИКОГДА не попадает в текст сообщения напрямую —
+ * он шифруется свежим одноразовым ключом (`note_delivery.ts`, byte-for-byte
+ * порт `self-destroyed-notes`'s `crypto.ts`) и уходит на публичный сервис
+ * self-destroyed-notes как one-view-заметка; в чат уходит только готовая
+ * ссылка `.../#/n/<id>/<key>`. Если создание заметки не удалось (сервис
+ * недоступен и т.п.) — сознательное решение: НЕ откатываться на отправку
+ * сырого токена текстом (это тихо свело бы на нет весь смысл доставки через
+ * заметку), а сообщить владельцу об ошибке и предложить повторить попытку;
+ * окно уже создано в БД к этому моменту и остаётся действующим (ключ можно
+ * получить, перегенерировав, или через `/automation_key list`/revoke).
+ * Возвращаемый `noteLink` — `null` именно в этом случае сбоя; вызывающий код
+ * мини-аппа (http.ts) отдаёт его как есть на страницу.
  */
 export async function generateAndDeliverKey(
   cfg: TgApprovalConfig,
@@ -307,7 +400,7 @@ export async function generateAndDeliverKey(
   durationMs: number | null,
   label: string | null = null,
   now: () => number = Date.now,
-): Promise<{ windowId: string; scope: string } | null> {
+): Promise<{ windowId: string; scope: string; noteLink: string | null } | null> {
   void akCfg; // см. doc-comment выше — срок больше не берётся отсюда
   if (mask === 0) return null;
 
@@ -326,22 +419,31 @@ export async function generateAndDeliverKey(
     createdByChat: chatId,
   });
 
+  let noteLink: string | null = null;
+  try {
+    noteLink = await createSecretNoteLink(rawToken);
+  } catch (err) {
+    console.error(`automation_key: не удалось создать self-destruct-заметку для окна #${windowId}:`, err);
+  }
+
   const untilLine = expiresAt === null ? "До: бессрочно" : `До: ${formatLaTime(expiresAt)}`;
   const labelLine = label ? `Название: ${label}\n` : "";
-  const sent = await tgCall(cfg, "sendMessage", {
-    chat_id: chatId,
-    text:
-      `🔑 ${rawToken}\n\n` +
+  const text = noteLink
+    ? `🔑 Ключ (одноразовая ссылка, действует час до первого клика):\n${noteLink}\n\n` +
       labelLine +
       `Действует на: ${maskToHumanList(mask)}\n` +
       `${untilLine}\n\n` +
-      `Сообщение самоудалится через 10 секунд.`,
-  });
+      `Сообщение самоудалится через 10 секунд.`
+    : `⚠️ Окно #${windowId} создано, но не удалось выдать ключ — сервис self-destroyed-notes сейчас ` +
+      `недоступен, а сырой ключ намеренно НЕ отправляется текстом. Отзови окно (/automation_key list) и ` +
+      `попробуй сгенерировать заново через минуту.\n\n` +
+      `Сообщение самоудалится через 10 секунд.`;
+  const sent = await tgCall(cfg, "sendMessage", { chat_id: chatId, text });
   const sentMessageId = (sent.result as { message_id?: number } | undefined)?.message_id;
   if (sent.ok && sentMessageId != null) {
     scheduleMessageDelete(cfg, chatId, sentMessageId);
   }
-  return { windowId, scope };
+  return { windowId, scope, noteLink };
 }
 
 // ───────────────────── Проверка (consent-гейт, requireConsent) ─────────────
