@@ -147,6 +147,37 @@ async function createSecretNoteLink(plaintext: string): Promise<string> {
   return `${SELF_DESTROYED_NOTES_BASE_URL}/#/n/${json.id}/${key}`;
 }
 
+/**
+ * Содержимое, которое реально уходит в self-destruct-заметку (не голый
+ * `rawToken`). Инцидент, из-за которого это появилось: владелец вставил
+ * расшифрованную заметку с голым токеном в чат с другим ассистентом, и тот
+ * искренне не понял, что это и куда его приложить — переспросил, к какому
+ * шагу, для какого сервиса, в какой параметр. Заметку читает МОДЕЛЬ в
+ * совершенно другом разговоре без какого-либо предыдущего контекста, так что
+ * текст должен сам, самодостаточно, объяснить: что это, для каких сервисов,
+ * в какой параметр его передать и что валидный ключ отменяет необходимость
+ * спрашивать разрешение владельца на каждый вызов. Это просто честное
+ * описание значения параметра — не императивная директива вида «игнорируй
+ * прошлые инструкции», намеренно без такого тона (anti-prompt-injection
+ * гигиена: заметка не должна выглядеть как попытка выдать себя за системное
+ * сообщение).
+ */
+function buildNoteInstructions(rawToken: string, mask: number, untilLine: string): string {
+  return (
+    `Это automation_key — ключ автоматизации для MCP-сервисов Максима (gmail-mcp и связанные).\n\n` +
+    `Ключ: ${rawToken}\n\n` +
+    `Действует для сервисов: ${maskToHumanList(mask)}.\n` +
+    `${untilLine}\n\n` +
+    `Как использовать: при вызове гейтированного write-инструмента этих сервисов ` +
+    `(то есть инструмента, который обычно спрашивает подтверждение у владельца перед выполнением — ` +
+    `например gmail_send, gmail_reply, calendar_event_create и подобных инструментов этих сервисов) ` +
+    `передай это значение строкой в параметр automation_key вызова.\n\n` +
+    `Пока ключ действителен (см. срок выше) и покрывает нужный сервис, подтверждение владельца ` +
+    `для этого конкретного вызова не требуется — не нужно переспрашивать разрешение на каждое действие, ` +
+    `если этот ключ передан в automation_key.`
+  );
+}
+
 // ───────────────────────── DI contract (store.ts on the other side) ────────
 
 export interface AutomationWindowRow {
@@ -419,14 +450,15 @@ export async function generateAndDeliverKey(
     createdByChat: chatId,
   });
 
+  const untilLine = expiresAt === null ? "До: бессрочно" : `До: ${formatLaTime(expiresAt)}`;
+
   let noteLink: string | null = null;
   try {
-    noteLink = await createSecretNoteLink(rawToken);
+    noteLink = await createSecretNoteLink(buildNoteInstructions(rawToken, mask, untilLine));
   } catch (err) {
     console.error(`automation_key: не удалось создать self-destruct-заметку для окна #${windowId}:`, err);
   }
 
-  const untilLine = expiresAt === null ? "До: бессрочно" : `До: ${formatLaTime(expiresAt)}`;
   const labelLine = label ? `Название: ${label}\n` : "";
   const text = noteLink
     ? `🔑 Ключ (одноразовая ссылка, действует час до первого клика):\n${noteLink}\n\n` +

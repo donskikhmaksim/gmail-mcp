@@ -20,6 +20,7 @@
  * Запуск: node scripts/test-automation-key.mjs
  *   (для раздела [8]: AUTOMATION_KEY_TEST_DB_URL=postgres://... node scripts/test-automation-key.mjs)
  */
+import crypto from "node:crypto";
 import { MockAgent, setGlobalDispatcher } from "undici";
 import {
   handleAutomationKeyMessage,
@@ -80,6 +81,32 @@ function resetTelegramMocks(notesResponder) {
         .persist();
     },
   };
+}
+
+/**
+ * Обратная операция `encryptForNote()` из `src/automation_key.ts` — тот же
+ * алгоритм, что `decryptForTest` в `test-note-crypto.mjs` (AES-256-GCM,
+ * ключ выведен PBKDF2-SHA256(salt, iter) из ключа заметки). Здесь она нужна,
+ * чтобы проверить, что заметка реально несёт инструктивный текст (не голый
+ * `rawToken`) — расшифровать зашифрованный payload из мока `/api/notes`
+ * тем же ключом, что уходит во второй половине ссылки `.../#/n/<id>/<key>`.
+ */
+function decryptNotePayload(payload, keyB64Url) {
+  const urlKey = Buffer.from(keyB64Url, "base64url");
+  const salt = Buffer.from(payload.salt, "base64");
+  const key = crypto.pbkdf2Sync(urlKey, salt, payload.iter, 32, "sha256");
+  const iv = Buffer.from(payload.iv, "base64");
+  const dataAndTag = Buffer.from(payload.data, "base64");
+  const tag = dataAndTag.subarray(dataAndTag.length - 16);
+  const encrypted = dataAndTag.subarray(0, dataAndTag.length - 16);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
+}
+
+/** Ключ заметки — последний сегмент ссылки `.../#/n/<id>/<key>`, отправленной в чат. */
+function noteKeyFromLink(noteLink) {
+  return noteLink.split("/").pop();
 }
 
 function mockDefaults(h) {
@@ -262,6 +289,35 @@ console.log("\n[1] генерация с одним отмеченным сер�
     "[ТЗ раздел 1 п.3] oneView:true, ttl:3600 (час) в теле запроса создания заметки",
     noteApiCalls[0]?.oneView === true && noteApiCalls[0]?.ttl === 3600,
     noteApiCalls[0],
+  );
+
+  // Содержимое самой заметки (не текст сообщения в чат — та ссылка не меняется) должно быть
+  // самодостаточным инструктивным блоком, а не голым rawToken (инцидент: другой ассистент,
+  // впервые увидев голый токен в чужой заметке, не понял, к какому шагу его приложить).
+  const noteLinkMatch = (sentToken?.body.text ?? "").match(
+    new RegExp(`${SELF_DESTROYED_NOTES_BASE_URL.replace(/[.]/g, "\\.")}/#/n/[^/\\s]+/[^\\s]+`),
+  );
+  const noteLink = noteLinkMatch?.[0];
+  const noteKey = noteLink ? noteKeyFromLink(noteLink) : "";
+  const noteBody = noteLink ? decryptNotePayload(noteApiCalls[0].payload, noteKey) : "";
+  const rawTokenUsed = noteBody.match(/Ключ: (\S+)/)?.[1];
+  check("расшифрованная заметка непуста", noteBody.length > 0, noteBody);
+  check(
+    "[инструкция] заметка содержит сам ключ, sha256(этого куска строки) == сохранённый tokenHash",
+    !!rawTokenUsed && crypto.createHash("sha256").update(rawTokenUsed).digest("hex") === windows[0]?.tokenHash,
+    { rawTokenUsed, tokenHash: windows[0]?.tokenHash, noteBody },
+  );
+  check("[инструкция] заметка называет сервис(ы) из scope (ticktick)", /ticktick/.test(noteBody), noteBody);
+  check(
+    "[инструкция] заметка называет параметр automation_key, куда его подставлять",
+    /automation_key/.test(noteBody),
+    noteBody,
+  );
+  check("[инструкция] заметка называет срок действия ключа", /(бессрочно|До:)/.test(noteBody), noteBody);
+  check(
+    "[инструкция] заметка явно говорит, что подтверждение владельца не требуется при валидном ключе",
+    /подтверждени/.test(noteBody),
+    noteBody,
   );
 }
 
