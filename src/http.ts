@@ -30,7 +30,14 @@ import {
   automationKeyConfig,
   automationWindowStoreAdapter,
 } from "./server.js";
-import { handleWebhook, registerWebhook, runApprovalSweep, reportAutoExecutionResult, secretTokenMatches } from "./tg_approval.js";
+import {
+  handleWebhook,
+  registerWebhook,
+  registerBotUiEntryPoints,
+  runApprovalSweep,
+  reportAutoExecutionResult,
+  secretTokenMatches,
+} from "./tg_approval.js";
 import {
   handleAutomationKeyMessage,
   handleAutomationKeyCallback,
@@ -467,7 +474,15 @@ export async function startHttpServer(config: Config): Promise<void> {
       res.status(400).json({ error: "empty_selection" });
       return;
     }
-    res.json({ ok: true });
+    // `noteLink` — ссылка на self-destruct-заметку с зашифрованным ключом
+    // (docs/TZ_automation_key_note_delivery_and_buttons.md раздел 1); `null`
+    // только если сам сервис self-destroyed-notes оказался недоступен
+    // (generateAndDeliverKey уже сообщила об этом отдельным сообщением в
+    // чат). Страница показывает её напрямую (см. automation_key_miniapp.ts)
+    // — ключ ТАКЖЕ продублирован сообщением в чат (та же generateAndDeliverKey,
+    // осознанное решение — см. финальный отчёт задачи, ТЗ раздел "Где
+    // показывается" явно разрешает дублирование).
+    res.json({ ok: true, noteLink: result.noteLink });
   });
 
   initDownloads(config.onboarding.publicBaseUrl);
@@ -696,6 +711,13 @@ export async function startHttpServer(config: Config): Promise<void> {
 
   if (tgApprovalConfig.enabled) {
     await registerWebhook(tgApprovalConfig);
+    // `/automation_key` в автодополнении команд + постоянная кнопка меню
+    // чата → мини-апп (docs/TZ_automation_key_note_delivery_and_buttons.md
+    // раздел 2). Best-effort, как и registerWebhook — своих ошибок наружу
+    // не бросает (см. doc-comment самой функции), поэтому без try/catch
+    // здесь: сбой одного из двух вызовов внутри неё не должен и не может
+    // остановить запуск сервера.
+    await registerBotUiEntryPoints(tgApprovalConfig);
     // Чистка чата бота (Максим, 2026-08-05): снять кнопку у просроченных
     // PENDING, удалить сообщение у решённых после того же TTL — см.
     // runApprovalSweep's own doc-comment. Гейтуется webhookOwner ВНУТРИ

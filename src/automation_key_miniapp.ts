@@ -304,9 +304,36 @@ export function renderAutomationKeyMiniAppPage(): string {
         });
         return res.json();
       })
-      .then(function () {
-        statusEl.textContent = "Готово — ключ отправлен в чат, исчезнет через 10с.";
-        if (tg) setTimeout(function () { tg.close(); }, 1500);
+      .then(function (data) {
+        // Ссылка на self-destruct-заметку показывается ПРЯМО НА СТРАНИЦЕ
+        // (ТЗ раздел "Где показывается") — не только "отправлено в чат"
+        // текстом, как было раньше. Ключ ТАКЖЕ дублируется сообщением в чат
+        // той же generateAndDeliverKey на backend'е — сознательное решение
+        // не убирать дублирование, страница мини-аппа может закрыться раньше,
+        // чем владелец успеет скопировать ссылку.
+        statusEl.textContent = "";
+        if (data && data.noteLink) {
+          var p = document.createElement("div");
+          p.textContent = "Готово — ссылка одноразовая, действует час до первого клика (и продублирована в чат):";
+          statusEl.appendChild(p);
+          var openBtn = document.createElement("button");
+          openBtn.textContent = "Открыть заметку";
+          openBtn.style.marginTop = "8px";
+          openBtn.addEventListener("click", function () {
+            if (tg && tg.openLink) tg.openLink(data.noteLink);
+            else window.open(data.noteLink, "_blank");
+          });
+          statusEl.appendChild(openBtn);
+          var link = document.createElement("a");
+          link.href = data.noteLink;
+          link.textContent = data.noteLink;
+          link.target = "_blank";
+          link.rel = "noopener";
+          link.style.cssText = "display:block;margin-top:8px;word-break:break-all;color:var(--tg-theme-link-color,#2481cc);";
+          statusEl.appendChild(link);
+        } else {
+          statusEl.textContent = "Окно создано, но защищённую ссылку выдать не удалось — подробности в чате (сообщение об ошибке).";
+        }
       })
       .catch(function (err) {
         statusEl.textContent = "Ошибка: " + err.message;

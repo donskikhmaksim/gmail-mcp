@@ -141,7 +141,7 @@ agent.enableNetConnect(/^127\.0\.0\.1/);
 setGlobalDispatcher(agent);
 const tgPool = agent.get("https://api.telegram.org");
 const tgCalls = [];
-for (const method of ["sendMessage", "setWebhook"]) {
+for (const method of ["sendMessage", "setWebhook", "setMyCommands", "setChatMenuButton"]) {
   tgPool
     .intercept({ path: `/bot${BOT_TOKEN}/${method}`, method: "POST" })
     .reply((opts) => {
@@ -163,6 +163,20 @@ for (const method of ["sendMessage", "setWebhook"]) {
     })
     .persist();
 }
+
+// self-destroyed-notes (docs/TZ_automation_key_note_delivery_and_buttons.md
+// раздел 1) — тот же приём, что и в test-automation-key.mjs: `/api/notes`
+// замокан отдельным pool'ом на другом хосте, возвращает растущий `id`.
+const notesPool = agent.get("https://self-destroyed-notes-production.up.railway.app");
+let noteIdCounter = 0;
+notesPool
+  .intercept({ path: "/api/notes", method: "POST" })
+  .reply(() => ({
+    statusCode: 200,
+    data: { id: `note-${++noteIdCounter}` },
+    headers: { "content-type": "application/json" },
+  }))
+  .persist();
 
 const PORT = 34913;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -308,14 +322,26 @@ console.log("\n[4]/[5]/[7] валидный запрос владельца → 
       {
         const authDateSec = Math.floor(Date.now() / 1000);
         const valid = buildInitData(Number(OWNER_CHAT_ID), authDateSec);
-        const before = tgCalls.length;
+        const sendMessageBefore = tgCalls.filter((c) => c.method === "sendMessage").length;
         const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
         const { status, json } = await postGenerate({ initData: valid, services: ["ticktick"], durationMs: SEVEN_DAYS_MS });
         check("[план 4] 200 ok", status === 200 && json.ok === true, JSON.stringify({ status, json }));
-        check("[план 7] ровно один новый tgCall (sendMessage)", tgCalls.length === before + 1, tgCalls.length - before);
-        const sent = tgCalls[tgCalls.length - 1];
+        check(
+          "[план 7] ровно один новый tgCall (sendMessage)",
+          tgCalls.filter((c) => c.method === "sendMessage").length === sendMessageBefore + 1,
+          tgCalls.filter((c) => c.method === "sendMessage").length - sendMessageBefore,
+        );
+        const sent = tgCalls.filter((c) => c.method === "sendMessage").at(-1);
         check("[план 7] это именно sendMessage с 🔑", sent.method === "sendMessage" && /🔑/.test(sent.body.text ?? ""), sent);
-        check("[план 7] сырой токен НЕ попадает в тело HTTP-ответа", JSON.stringify(json) === '{"ok":true}', JSON.stringify(json));
+        // ТЗ раздел 1 "Мини-апп": ответ backend'а несёт ссылку на self-destruct-заметку
+        // (страница показывает её напрямую), не сырой токен — ни в чате, ни в HTTP-ответе.
+        check("[план 2] сырой токен НЕ попадает в тело HTTP-ответа, только ok+noteLink", Object.keys(json).sort().join(",") === "noteLink,ok", JSON.stringify(json));
+        check(
+          "[план 2] noteLink — ссылка на self-destroyed-notes /#/n/<id>/<key>",
+          typeof json.noteLink === "string" && /^https:\/\/self-destroyed-notes-production\.up\.railway\.app\/#\/n\/[^/]+\/[^/]+$/.test(json.noteLink),
+          json.noteLink,
+        );
+        check("[план 1] сообщение в чате несёт ту же ссылку, что и HTTP-ответ", sent.body.text.includes(json.noteLink), { text: sent.body.text, noteLink: json.noteLink });
 
         const row = await pool.query(`SELECT scope, created_at, expires_at FROM tg_automation_windows ORDER BY created_at DESC LIMIT 1`);
         check("[план 4] окно в БД с scope='ticktick'", row.rows[0]?.scope === "ticktick", row.rows[0]);
