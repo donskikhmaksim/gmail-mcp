@@ -31,7 +31,8 @@ import {
   automationWindowStoreAdapter,
 } from "./server.js";
 import { handleWebhook, registerWebhook, runApprovalSweep, reportAutoExecutionResult, secretTokenMatches } from "./tg_approval.js";
-import { handleAutomationKeyMessage, handleAutomationKeyCallback } from "./automation_key.js";
+import { handleAutomationKeyMessage, handleAutomationKeyCallback, generateAndDeliverKey, servicesToMask } from "./automation_key.js";
+import { renderAutomationKeyMiniAppPage, verifyTelegramInitData } from "./automation_key_miniapp.js";
 import { tryAutoExecute } from "./consent.js";
 import { getAutoExecutor, type AutoExecutorCtx } from "./autoExecute.js";
 
@@ -389,6 +390,57 @@ export async function startHttpServer(config: Config): Promise<void> {
     // (wrong from.id, replay, unknown callback_data) is intentionally a no-op,
     // not an error Telegram should retry.
     res.status(200).end();
+  });
+
+  // ---- automation_key Mini App (docs/TZ_automation_key_miniapp.md) ----
+  // Второй, более удобный способ выбрать сервисы для automation_key поверх
+  // уже рабочей кнопочной версии (src/automation_key.ts) — не заменяет её.
+  // GET отдаёт статическую разметку БЕЗ авторизации (сама разметка не
+  // секрет, ТЗ раздел 1/8); POST — единственное место, где что-то реально
+  // происходит, и оно ОБЯЗАНО проверить initData на подлинность/свежесть/
+  // владельца (ТЗ раздел 4) прежде чем звать ту же generateAndDeliverKey,
+  // что и кнопочный `ak:gen` — сырой токен уходит только сообщением в чат с
+  // 10с-самоудалением, никогда в этом HTTP-ответе (ТЗ раздел 5).
+  app.get("/automation-key-app", (_req: Request, res: Response) => {
+    res.type("html").send(renderAutomationKeyMiniAppPage());
+  });
+
+  app.post("/automation-key-app/generate", async (req: Request, res: Response) => {
+    const initData = typeof req.body?.initData === "string" ? req.body.initData : "";
+    const verified = verifyTelegramInitData(tgApprovalConfig.botToken, initData);
+    if (!verified.ok) {
+      res.status(403).json({ error: "invalid_init_data" });
+      return;
+    }
+    // Тот же owner-only принцип, что и везде в automation_key.ts — только
+    // другой источник личности (подписанные Telegram-данные вместо
+    // callback_query.from.id).
+    if (verified.userId !== tgApprovalConfig.ownerChatId) {
+      res.status(403).json({ error: "forbidden" });
+      return;
+    }
+
+    const services = Array.isArray(req.body?.services) ? (req.body.services as unknown[]).filter((s) => typeof s === "string") : [];
+    const mask = servicesToMask(services as string[]);
+    let result: Awaited<ReturnType<typeof generateAndDeliverKey>>;
+    try {
+      result = await generateAndDeliverKey(
+        tgApprovalConfig,
+        automationKeyConfig,
+        automationWindowStoreAdapter,
+        tgApprovalConfig.ownerChatId,
+        mask,
+      );
+    } catch (err) {
+      console.error("automation-key-app/generate error:", err);
+      res.status(500).json({ error: "internal" });
+      return;
+    }
+    if (!result) {
+      res.status(400).json({ error: "empty_selection" });
+      return;
+    }
+    res.json({ ok: true });
   });
 
   initDownloads(config.onboarding.publicBaseUrl);

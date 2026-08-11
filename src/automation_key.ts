@@ -110,6 +110,17 @@ function serviceBit(name: string): number {
   return i < 0 ? 0 : 1 << i;
 }
 
+/** Список имён сервисов (например тел POST-запроса мини-аппа —
+ * `docs/TZ_automation_key_miniapp.md` раздел 3) → та же битовая маска, что
+ * кнопочная версия строит через последовательные `ak:toggle`. Неизвестные
+ * имена молча игнорируются (их бит просто не выставляется) — тот же fail-
+ * closed принцип: чужой/опечатанный service не расширяет scope. */
+export function servicesToMask(services: readonly string[]): number {
+  let mask = 0;
+  for (const s of services) mask |= serviceBit(s);
+  return mask;
+}
+
 /** csv отмеченных сервисов, или буквально "all", если отмечены все 6. */
 export function maskToScope(mask: number): string {
   if (mask === ALL_MASK) return "all";
@@ -124,16 +135,31 @@ function maskToHumanList(mask: number): string {
 
 // ───────────────────────── Клавиатура выбора ────────────────────────────────
 
-interface TgButton {
+interface TgCallbackButton {
   text: string;
   callback_data: string;
 }
 
-/** 3 ряда по 2 сервиса, затем «Все сразу», затем «Получить ключ». Маска
- * зашита в `callback_data` КАЖДОЙ кнопки — она отражает состояние выбора
- * ДО этого конкретного нажатия (обработчик считает XOR/новую маску сам и
- * перерисовывает клавиатуру заново с этой новой маской в каждой кнопке). */
-function buildSelectionKeyboard(mask: number): { inline_keyboard: TgButton[][] } {
+/** Открывает Telegram Mini App поверх чата (`docs/TZ_automation_key_miniapp.md`
+ * раздел 2) — второй, более удобный способ того же выбора сервисов; кнопочная
+ * версия рядом с ней не убирается. */
+interface TgWebAppButton {
+  text: string;
+  web_app: { url: string };
+}
+
+type TgButton = TgCallbackButton | TgWebAppButton;
+
+/** 3 ряда по 2 сервиса, затем «Все сразу», затем «Получить ключ», и (если
+ * известен публичный адрес сервиса) ряд с кнопкой мини-аппа. Маска зашита в
+ * `callback_data` КАЖДОЙ кнопки — она отражает состояние выбора ДО этого
+ * конкретного нажатия (обработчик считает XOR/новую маску сам и
+ * перерисовывает клавиатуру заново с этой новой маской в каждой кнопке).
+ * `publicBaseUrl` — `cfg.publicBaseUrl` (TgApprovalConfig, тот же
+ * PUBLIC_BASE_URL/RAILWAY_PUBLIC_DOMAIN, что и у остального сервиса, ничего
+ * не хардкодится); пусто/undefined — кнопка мини-аппа просто не рисуется
+ * (например локальный запуск без публичного домена). */
+function buildSelectionKeyboard(mask: number, publicBaseUrl?: string): { inline_keyboard: TgButton[][] } {
   const rows: TgButton[][] = [];
   for (let i = 0; i < AUTOMATION_SERVICES.length; i += 2) {
     const row: TgButton[] = [];
@@ -147,6 +173,9 @@ function buildSelectionKeyboard(mask: number): { inline_keyboard: TgButton[][] }
   const allChecked = mask === ALL_MASK;
   rows.push([{ text: `${allChecked ? "✓" : "✗"} Все сразу`, callback_data: `ak:all:${mask}` }]);
   rows.push([{ text: "Получить ключ", callback_data: `ak:gen:${mask}` }]);
+  if (publicBaseUrl) {
+    rows.push([{ text: "Открыть как мини-апп", web_app: { url: `${publicBaseUrl}/automation-key-app` } }]);
+  }
   return { inline_keyboard: rows };
 }
 
@@ -191,6 +220,54 @@ function scheduleMessageDelete(cfg: TgApprovalConfig, chatId: string, messageId:
       console.error(`automation_key: не удалось удалить сообщение с ключом (chat=${chatId}, msg=${messageId}):`, err),
     );
   }, delayMs).unref();
+}
+
+/**
+ * Единая точка "создать окно + отправить ключ владельцу" — переиспользуется
+ * И кнопочным `ak:gen` (ниже), И backend-роутом Mini App
+ * (`docs/TZ_automation_key_miniapp.md` раздел 5, `POST /automation-key-app/
+ * generate` в `http.ts`). Один путь генерации/доставки, а не два параллельных
+ * с разным поведением (например разным временем самоудаления) — сырой токен
+ * ВСЕГДА уходит только обычным сообщением в чат с 10с-самоудалением, никогда
+ * в HTTP-ответе. `mask === 0` — ничего не создаёт, возвращает `null` (тот же
+ * fail-closed принцип на пустой выбор, что и у кнопочной версии).
+ */
+export async function generateAndDeliverKey(
+  cfg: TgApprovalConfig,
+  akCfg: AutomationKeyConfig,
+  store: AutomationWindowStore,
+  chatId: string,
+  mask: number,
+  now: () => number = Date.now,
+): Promise<{ windowId: string; scope: string } | null> {
+  if (mask === 0) return null;
+
+  const scope = maskToScope(mask);
+  const rawToken = generateRawToken();
+  const windowId = generateWindowId();
+  const nowMs = now();
+  await store.createWindow({
+    windowId,
+    tokenHash: sha256Hex(rawToken),
+    scope,
+    createdAt: nowMs,
+    expiresAt: nowMs + akCfg.ttlMs,
+    createdByChat: chatId,
+  });
+
+  const sent = await tgCall(cfg, "sendMessage", {
+    chat_id: chatId,
+    text:
+      `🔑 ${rawToken}\n\n` +
+      `Действует на: ${maskToHumanList(mask)}\n` +
+      `До: ${formatLaTime(nowMs + akCfg.ttlMs)}\n\n` +
+      `Сообщение самоудалится через 10 секунд.`,
+  });
+  const sentMessageId = (sent.result as { message_id?: number } | undefined)?.message_id;
+  if (sent.ok && sentMessageId != null) {
+    scheduleMessageDelete(cfg, chatId, sentMessageId);
+  }
+  return { windowId, scope };
 }
 
 // ───────────────────────── Список / текст ───────────────────────────────────
@@ -247,7 +324,7 @@ export async function handleAutomationKeyMessage(
     await tgCall(cfg, "sendMessage", {
       chat_id: chatId,
       text: SELECTION_PROMPT,
-      reply_markup: buildSelectionKeyboard(0),
+      reply_markup: buildSelectionKeyboard(0, cfg.publicBaseUrl),
     });
     return true;
   }
@@ -320,7 +397,7 @@ export async function handleAutomationKeyCallback(
       await tgCall(cfg, "editMessageReplyMarkup", {
         chat_id: chatId,
         message_id: cq.messageId,
-        reply_markup: buildSelectionKeyboard(newMask),
+        reply_markup: buildSelectionKeyboard(newMask, cfg.publicBaseUrl),
       }).catch(() => {});
     }
     await tgCall(cfg, "answerCallbackQuery", { callback_query_id: cq.id }).catch(() => {});
@@ -335,7 +412,7 @@ export async function handleAutomationKeyCallback(
       await tgCall(cfg, "editMessageReplyMarkup", {
         chat_id: chatId,
         message_id: cq.messageId,
-        reply_markup: buildSelectionKeyboard(newMask),
+        reply_markup: buildSelectionKeyboard(newMask, cfg.publicBaseUrl),
       }).catch(() => {});
     }
     await tgCall(cfg, "answerCallbackQuery", { callback_query_id: cq.id }).catch(() => {});
@@ -354,19 +431,6 @@ export async function handleAutomationKeyCallback(
       return true; // ничего не создано в БД (ТЗ п.5 / п.8 тестового плана)
     }
 
-    const scope = maskToScope(mask);
-    const rawToken = generateRawToken();
-    const windowId = generateWindowId();
-    const nowMs = now();
-    await store.createWindow({
-      windowId,
-      tokenHash: sha256Hex(rawToken),
-      scope,
-      createdAt: nowMs,
-      expiresAt: nowMs + akCfg.ttlMs,
-      createdByChat: chatId,
-    });
-
     if (cq.messageId != null) {
       await tgCall(cfg, "editMessageReplyMarkup", {
         chat_id: chatId,
@@ -376,18 +440,7 @@ export async function handleAutomationKeyCallback(
     }
     await tgCall(cfg, "answerCallbackQuery", { callback_query_id: cq.id, text: "Ключ сгенерирован" }).catch(() => {});
 
-    const sent = await tgCall(cfg, "sendMessage", {
-      chat_id: chatId,
-      text:
-        `🔑 ${rawToken}\n\n` +
-        `Действует на: ${maskToHumanList(mask)}\n` +
-        `До: ${formatLaTime(nowMs + akCfg.ttlMs)}\n\n` +
-        `Сообщение самоудалится через 10 секунд.`,
-    });
-    const sentMessageId = (sent.result as { message_id?: number } | undefined)?.message_id;
-    if (sent.ok && sentMessageId != null) {
-      scheduleMessageDelete(cfg, chatId, sentMessageId);
-    }
+    await generateAndDeliverKey(cfg, akCfg, store, chatId, mask, now);
     return true;
   }
 
