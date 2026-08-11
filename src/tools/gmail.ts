@@ -1830,6 +1830,14 @@ export interface GmailSnoozeContext {
    */
   tg?: TgApprovalGate;
   /**
+   * Automation_key DI (docs/TZ_automation_key_consent_gate.md), passed through
+   * to every gated tool's `requireConsent({ checkAutomationKey })`. undefined
+   * ⇒ the automation branch in `requireConsent` never runs — byte-for-byte as
+   * before this field existed (same invariant as `tg` above). Production
+   * passes `makeCheckAutomationKey()` from server.ts.
+   */
+  checkAutomationKey?: (key: string) => Promise<{ ok: boolean; channel?: string }>;
+  /**
    * Подменяемый транспорт для исходящих запросов к Google (`safeGoogleFetch`).
    * ПРОД НИКОГДА ЭТО НЕ ПЕРЕДАЁТ — поле существует только чтобы офлайн-тесты
    * могли подставить фейковый fetch/резолвер вместо настоящей сети (как
@@ -3544,11 +3552,19 @@ export function registerGmailTools(
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z
+          .string()
+          .optional()
+          .describe(
+            "For headless automation only — a valid automation_key skips the human confirmation step " +
+              "entirely. Humans and interactive assistants must NEVER guess or fabricate a value here; " +
+              "leave it unset.",
+          ),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, messages, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = snoozeCtx;
+    guard(async ({ account, messages, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Отправка недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -3568,6 +3584,8 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: () => {
           if (!messages || !messages.length) {
             throw new Error("Нужен непустой `messages`, чтобы построить план отправки.");
@@ -3642,11 +3660,19 @@ export function registerGmailTools(
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z
+          .string()
+          .optional()
+          .describe(
+            "For headless automation only — a valid automation_key skips the human confirmation step " +
+              "entirely. Humans and interactive assistants must NEVER guess or fabricate a value here; " +
+              "leave it unset.",
+          ),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, replies, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = snoozeCtx;
+    guard(async ({ account, replies, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Ответ недоступен: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -3666,6 +3692,8 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         // Plan phase ONLY reads the originals (messages.get) to resolve the
         // real recipient and build the preview — no drafts.create here (that
         // was the incident-2 precursor: a draft is a mutation too). The exact
@@ -3774,11 +3802,19 @@ export function registerGmailTools(
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z
+          .string()
+          .optional()
+          .describe(
+            "For headless automation only — a valid automation_key skips the human confirmation step " +
+              "entirely. Humans and interactive assistants must NEVER guess or fabricate a value here; " +
+              "leave it unset.",
+          ),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = snoozeCtx;
+    guard(async ({ account, items, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Пересылка недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -3798,6 +3834,8 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         // Plan phase only reads the original (cheap metadata read) to build the
         // preview and an identity fingerprint (From/Subject) — attachment bytes
         // are NOT touched here, only at execute (avoids downloading/holding
@@ -3885,11 +3923,19 @@ export function registerGmailTools(
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z
+          .string()
+          .optional()
+          .describe(
+            "For headless automation only — a valid automation_key skips the human confirmation step " +
+              "entirely. Humans and interactive assistants must NEVER guess or fabricate a value here; " +
+              "leave it unset.",
+          ),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, drafts, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = snoozeCtx;
+    guard(async ({ account, drafts, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Создание черновика недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -3909,6 +3955,8 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: () => {
           if (!drafts || !drafts.length) {
             throw new Error("Нужен непустой `drafts`, чтобы построить план создания черновика.");
@@ -3968,11 +4016,19 @@ export function registerGmailTools(
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z
+          .string()
+          .optional()
+          .describe(
+            "For headless automation only — a valid automation_key skips the human confirmation step " +
+              "entirely. Humans and interactive assistants must NEVER guess or fabricate a value here; " +
+              "leave it unset.",
+          ),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, messageIds, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = snoozeCtx;
+    guard(async ({ account, messageIds, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Архивирование недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -3990,6 +4046,8 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: () => buildIdBatchPlan(g, accountName, messageIds, "Архивирование писем", "archive"),
         rehash: (addressing) => rehashIdBatch(g, addressing as IdBatchPayload),
       });
@@ -4028,11 +4086,19 @@ export function registerGmailTools(
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z
+          .string()
+          .optional()
+          .describe(
+            "For headless automation only — a valid automation_key skips the human confirmation step " +
+              "entirely. Humans and interactive assistants must NEVER guess or fabricate a value here; " +
+              "leave it unset.",
+          ),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, messageIds, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = snoozeCtx;
+    guard(async ({ account, messageIds, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Удаление в Корзину недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -4050,6 +4116,8 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: () => buildIdBatchPlan(g, accountName, messageIds, "Удаление писем в Корзину", "trash"),
         rehash: (addressing) => rehashIdBatch(g, addressing as IdBatchPayload),
       });
@@ -4095,11 +4163,19 @@ export function registerGmailTools(
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z
+          .string()
+          .optional()
+          .describe(
+            "For headless automation only — a valid automation_key skips the human confirmation step " +
+              "entirely. Humans and interactive assistants must NEVER guess or fabricate a value here; " +
+              "leave it unset.",
+          ),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = snoozeCtx;
+    guard(async ({ account, items, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Изменение меток недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -4117,6 +4193,8 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план изменения меток.");
@@ -4201,11 +4279,19 @@ export function registerGmailTools(
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z
+          .string()
+          .optional()
+          .describe(
+            "For headless automation only — a valid automation_key skips the human confirmation step " +
+              "entirely. Humans and interactive assistants must NEVER guess or fabricate a value here; " +
+              "leave it unset.",
+          ),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = snoozeCtx;
+    guard(async ({ account, items, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Отложенный возврат в inbox недоступен: не настроено хранилище согласия (DATABASE_URL). Без него " +
@@ -4223,6 +4309,8 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план отложенного возврата в inbox.");
@@ -4308,11 +4396,19 @@ export function registerGmailTools(
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z
+          .string()
+          .optional()
+          .describe(
+            "For headless automation only — a valid automation_key skips the human confirmation step " +
+              "entirely. Humans and interactive assistants must NEVER guess or fabricate a value here; " +
+              "leave it unset.",
+          ),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, messages, manifest_id, user_reply }) => {
-      const { store, userToken, consentStore, consentCfg, tg } = snoozeCtx;
+    guard(async ({ account, messages, manifest_id, user_reply, automation_key }) => {
+      const { store, userToken, consentStore, consentCfg, tg, checkAutomationKey } = snoozeCtx;
       if (!store) {
         return fail(
           "Отложенная отправка недоступна: на сервере не настроен DATABASE_URL (Railway Postgres). Без него " +
@@ -4346,6 +4442,8 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: () => {
           if (!messages || !messages.length) {
             throw new Error("Нужен непустой `messages`, чтобы построить план отложенной отправки.");
@@ -4466,11 +4564,19 @@ export function registerGmailTools(
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z
+          .string()
+          .optional()
+          .describe(
+            "For headless automation only — a valid automation_key skips the human confirmation step " +
+              "entirely. Humans and interactive assistants must NEVER guess or fabricate a value here; " +
+              "leave it unset.",
+          ),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, ids, manifest_id, user_reply }) => {
-      const { store, consentStore, consentCfg, tg } = snoozeCtx;
+    guard(async ({ account, ids, manifest_id, user_reply, automation_key }) => {
+      const { store, consentStore, consentCfg, tg, checkAutomationKey } = snoozeCtx;
       if (!store) {
         return fail("DATABASE_URL is not configured, so there is nothing scheduled to cancel.");
       }
@@ -4490,6 +4596,8 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         // Plan reads the LIVE queue: the preview names who each message was
         // going to, its subject and when it would have gone out — so the
         // person confirming sees what they are about to lose, not bare ids.
@@ -4760,11 +4868,19 @@ export function registerGmailTools(
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z
+          .string()
+          .optional()
+          .describe(
+            "For headless automation only — a valid automation_key skips the human confirmation step " +
+              "entirely. Humans and interactive assistants must NEVER guess or fabricate a value here; " +
+              "leave it unset.",
+          ),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = snoozeCtx;
+    guard(async ({ account, items, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Сохранение в Drive недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -4782,6 +4898,8 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         // Plan reads the MIME tree (format=full) to locate the attachment's
         // real filename/size for identity — it does NOT download the
         // attachment's bytes (those live behind a separate attachments.get
@@ -4899,11 +5017,19 @@ export function registerGmailTools(
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z
+          .string()
+          .optional()
+          .describe(
+            "For headless automation only — a valid automation_key skips the human confirmation step " +
+              "entirely. Humans and interactive assistants must NEVER guess or fabricate a value here; " +
+              "leave it unset.",
+          ),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, labels, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = snoozeCtx;
+    guard(async ({ account, labels, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Создание метки недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -4921,6 +5047,8 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: () => {
           if (!labels || !labels.length) {
             throw new Error("Нужен непустой `labels`, чтобы построить план создания меток.");
@@ -4979,11 +5107,19 @@ export function registerGmailTools(
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z
+          .string()
+          .optional()
+          .describe(
+            "For headless automation only — a valid automation_key skips the human confirmation step " +
+              "entirely. Humans and interactive assistants must NEVER guess or fabricate a value here; " +
+              "leave it unset.",
+          ),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = snoozeCtx;
+    guard(async ({ account, items, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Изменение метки недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -5001,6 +5137,8 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         // Plan reads the CURRENT name of every label — the identity-guard
         // pair (id + name) identity-postverify.md §4 requires: a caller
         // passing only an id gets the current name filled in by the server,
@@ -5082,11 +5220,19 @@ export function registerGmailTools(
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z
+          .string()
+          .optional()
+          .describe(
+            "For headless automation only — a valid automation_key skips the human confirmation step " +
+              "entirely. Humans and interactive assistants must NEVER guess or fabricate a value here; " +
+              "leave it unset.",
+          ),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, labelIds, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = snoozeCtx;
+    guard(async ({ account, labelIds, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Удаление метки недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -5104,6 +5250,8 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         // Plan reads each label's current name AND a best-effort message
         // count (identity-postverify.md §5.2 pre-snapshot requirement for
         // this irreversible op) — a failed count never blocks the plan, it
@@ -5200,11 +5348,19 @@ export function registerGmailTools(
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z
+          .string()
+          .optional()
+          .describe(
+            "For headless automation only — a valid automation_key skips the human confirmation step " +
+              "entirely. Humans and interactive assistants must NEVER guess or fabricate a value here; " +
+              "leave it unset.",
+          ),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, threadId, folderId, folderName, format, scope, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = snoozeCtx;
+    guard(async ({ account, threadId, folderId, folderName, format, scope, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Экспорт треда недоступен: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -5230,6 +5386,8 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!threadId) {
             throw new Error("Нужен непустой `threadId`, чтобы построить план экспорта.");
@@ -5316,6 +5474,14 @@ export function registerGmailTools(
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z
+          .string()
+          .optional()
+          .describe(
+            "For headless automation only — a valid automation_key skips the human confirmation step " +
+              "entirely. Humans and interactive assistants must NEVER guess or fabricate a value here; " +
+              "leave it unset.",
+          ),
       },
       // НЕ readOnlyHint и НЕ «безобидное» действие: инструмент выдаёт
       // неаутентифицированный, неотзываемый доступ тому, кому попадёт ссылка —
@@ -5324,7 +5490,7 @@ export function registerGmailTools(
       // (ссылка уходит во внешний мир).
       annotations: { destructiveHint: true, openWorldHint: true },
     },
-    guard(async ({ account, items, ttlMinutes, manifest_id, user_reply }) => {
+    guard(async ({ account, items, ttlMinutes, manifest_id, user_reply, automation_key }) => {
       if (!downloadsAvailable()) {
         return fail(
           "Download links are unavailable: this server does not know its own public URL. " +
@@ -5332,7 +5498,7 @@ export function registerGmailTools(
             "gmail_get_attachment still works for small attachments.",
         );
       }
-      const { consentStore, consentCfg, tg } = snoozeCtx;
+      const { consentStore, consentCfg, tg, checkAutomationKey } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Выдача ссылок недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -5351,6 +5517,8 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         // План перечитывает MIME-дерево каждого письма (format=full) и берёт
         // ЖИВЫЕ имя/тип/размер вложения — байты не качаются, ссылка не
         // выдаётся, пока человек не подтвердит.
@@ -5452,11 +5620,19 @@ export function registerGmailTools(
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z
+          .string()
+          .optional()
+          .describe(
+            "For headless automation only — a valid automation_key skips the human confirmation step " +
+              "entirely. Humans and interactive assistants must NEVER guess or fabricate a value here; " +
+              "leave it unset.",
+          ),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, files, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = snoozeCtx;
+    guard(async ({ account, files, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = snoozeCtx;
       if (!consentStore) {
         return fail(
           "Загрузочная сессия недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -5474,6 +5650,8 @@ export function registerGmailTools(
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: () => {
           if (!files || !files.length) {
             throw new Error("Нужен непустой `files`, чтобы построить план открытия загрузочных сессий.");
