@@ -181,7 +181,7 @@ interface TgCallResult {
  * needed HERE specifically: unlike attachment URLs (user/model-supplied),
  * `api.telegram.org` is a fixed, hardcoded host, never derived from tool input.
  */
-async function tgCall(cfg: TgApprovalConfig, method: string, body: unknown): Promise<TgCallResult> {
+export async function tgCall(cfg: TgApprovalConfig, method: string, body: unknown): Promise<TgCallResult> {
   const res = await undiciFetch(apiUrl(cfg, method), {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -507,7 +507,11 @@ export async function registerWebhook(cfg: TgApprovalConfig): Promise<void> {
     const res = await tgCall(cfg, "setWebhook", {
       url,
       secret_token: cfg.webhookSecret,
-      allowed_updates: ["callback_query"],
+      // "message" добавлен ради ЕДИНСТВЕННОЙ команды `/automation_key`
+      // (automation_key.ts, ТЗ_automation_key_hub.md) — прочий текст от
+      // владельца боту просто не нужен и automation_key.ts сам игнорирует
+      // любой текст, не начинающийся с `/automation_key`.
+      allowed_updates: ["callback_query", "message"],
     });
     if (!res.ok) {
       console.error(`TG approval: setWebhook FAILED (${res.description ?? "unknown error"}) -- url=${url}`);

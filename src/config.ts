@@ -483,6 +483,22 @@ export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
   };
 }
 
+/**
+ * automation_key hub config (`src/automation_key.ts`, docs/TZ_automation_key_hub.md).
+ * Deliberately standalone from `TgApprovalConfig` — reuses that config's
+ * `botToken`/`ownerChatId`/`publicBaseUrl` (same bot, same owner chat) at the
+ * call site instead of duplicating them here; this only carries the ONE knob
+ * that's genuinely specific to automation-key windows.
+ */
+export interface AutomationKeyConfig {
+  /** Window TTL in ms. Env AUTOMATION_KEY_TTL_MS, default 24h. */
+  ttlMs: number;
+}
+
+export function loadAutomationKeyConfig(): AutomationKeyConfig {
+  return { ttlMs: positiveIntEnv("AUTOMATION_KEY_TTL_MS", 24 * 60 * 60 * 1000) };
+}
+
 export function loadConfig(): Config {
   const transport =
     (process.env.MCP_TRANSPORT as "http" | "stdio" | undefined) ??

@@ -1,11 +1,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { User } from "./config.js";
-import { loadConsentGateConfig, loadTgApprovalConfig } from "./config.js";
+import { loadConsentGateConfig, loadTgApprovalConfig, loadAutomationKeyConfig } from "./config.js";
 import { buildUserClients, registerAccountTools } from "./accounts.js";
 import { registerGmailTools } from "./tools/gmail.js";
 import type { ConsentStore, ConsentConfig, TgApprovalGate } from "./consent.js";
 import type { TgApprovalStore } from "./tg_approval.js";
 import { createTgApprovalGate } from "./tg_approval.js";
+import type { AutomationWindowStore } from "./automation_key.js";
 import {
   storeReady,
   addSnooze,
@@ -27,6 +28,10 @@ import {
   consumeTgDecisionAnyServer,
   claimExpiredPendingApprovals,
   claimStaleDecidedApprovals,
+  createAutomationWindow,
+  listActiveAutomationWindows,
+  getAutomationWindow,
+  revokeAutomationWindow,
 } from "./store.js";
 
 /** Adapts store.ts's module functions to the shape gmail.ts's tools expect.
@@ -132,6 +137,23 @@ export const tgApprovalStoreAdapter: TgApprovalStore = {
  * disabled — regardless of whether Postgres is configured at all.
  */
 export const tgApprovalGate: TgApprovalGate = createTgApprovalGate(tgApprovalConfig, tgApprovalStoreAdapter);
+
+/**
+ * automation_key hub (docs/TZ_automation_key_hub.md). Reuses `tgApprovalConfig`
+ * for bot/owner/webhook identity (same bot, same owner chat) — only the TTL
+ * knob is genuinely specific to this feature (`loadAutomationKeyConfig`).
+ */
+export const automationKeyConfig = loadAutomationKeyConfig();
+
+/** store.ts's tg_automation_windows functions, typed against
+ * automation_key.ts's `AutomationWindowStore` here — signature-for-signature
+ * by construction, same discipline as `tgApprovalStoreAdapter` above. */
+export const automationWindowStoreAdapter: AutomationWindowStore = {
+  createWindow: createAutomationWindow,
+  listActiveWindows: listActiveAutomationWindows,
+  getWindow: getAutomationWindow,
+  revokeWindow: revokeAutomationWindow,
+};
 
 export function buildMcpServer(user: User): McpServer {
   const clients = buildUserClients(user);

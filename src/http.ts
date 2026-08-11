@@ -21,8 +21,17 @@ import { renderDashboard } from "./dashboard.js";
 import { logDashboardLocation } from "./logRedaction.js";
 import { initDownloads, resolveDownloadLink } from "./downloads.js";
 import { buildUserClients } from "./accounts.js";
-import { tgApprovalConfig, tgApprovalStoreAdapter, consentStoreAdapter, consentServerConfig, pgStoreAdapter } from "./server.js";
+import {
+  tgApprovalConfig,
+  tgApprovalStoreAdapter,
+  consentStoreAdapter,
+  consentServerConfig,
+  pgStoreAdapter,
+  automationKeyConfig,
+  automationWindowStoreAdapter,
+} from "./server.js";
 import { handleWebhook, registerWebhook, runApprovalSweep, reportAutoExecutionResult, secretTokenMatches } from "./tg_approval.js";
+import { handleAutomationKeyMessage, handleAutomationKeyCallback } from "./automation_key.js";
 import { tryAutoExecute } from "./consent.js";
 import { getAutoExecutor, type AutoExecutorCtx } from "./autoExecute.js";
 
@@ -326,20 +335,53 @@ export async function startHttpServer(config: Config): Promise<void> {
       return;
     }
     try {
-      // 4-й аргумент — хук немедленного исполнения (Максим, 2026-08-06:
-      // «исполнять прямо в обработчике нажатия, не дожидаясь опроса»).
-      // Намеренно СИНХРОННЫЙ по отношению к этому обработчику: он лишь
-      // ЗАПУСКАЕТ фоновую работу и тут же возвращает управление, поэтому ни
-      // снятие кнопок, ни `answerCallbackQuery`, ни ответ 200 её не ждут —
-      // Telegram получает подтверждение доставки сразу, как и раньше.
-      await handleWebhook(tgApprovalConfig, tgApprovalStoreAdapter, req.body, (row) => {
-        // Чужой сервер (общий бот на 6 MCP-серверов) — не наш манифест, его
-        // исполнит поллер того сервера. См. `executeApprovedNow`.
-        if (row.server !== consentServerConfig.server) return;
-        void executeApprovedNow(config, row.manifestId).catch((err) =>
-          console.error(`TG auto-execute: немедленное исполнение ${row.manifestId} упало:`, err),
-        );
-      });
+      // automation_key hub (docs/TZ_automation_key_hub.md) — обрабатывается
+      // ПЕРВЫМ и СВОИМИ, ОТДЕЛЬНЫМИ обработчиками:
+      //  • текстовые `/automation_key*` — до этого момента вебхук видел
+      //    только `callback_query` (allowed_updates), теперь ещё и `message`
+      //    (см. `registerWebhook`'s комментарий в tg_approval.ts);
+      //  • нажатия кнопок с `callback_data`, начинающимся на `ak:` — заведомо
+      //    НЕ пересекаются с обычным гейтом подтверждения (тот матчит только
+      //    ОДНОБУКВЕННЫЙ префикс `a:`/`r:` — `handleAutomationKeyCallback`
+      //    возвращает `false` и ничего не делает для любых других данных, так
+      //    что `handleWebhook` ниже по-прежнему получает шанс их обработать).
+      const msg = req.body?.message;
+      const text = typeof msg?.text === "string" ? msg.text : "";
+      const isAutomationKeyMessage = !!msg && /^\/automation_key\b/.test(text.trim());
+      const cqData = req.body?.callback_query?.data;
+      const isAutomationKeyCallback = typeof cqData === "string" && cqData.startsWith("ak:");
+
+      if (isAutomationKeyMessage) {
+        await handleAutomationKeyMessage(tgApprovalConfig, automationWindowStoreAdapter, {
+          chatId: msg.chat?.id,
+          fromId: msg.from?.id,
+          text,
+        });
+      } else if (isAutomationKeyCallback) {
+        const cq = req.body.callback_query;
+        await handleAutomationKeyCallback(tgApprovalConfig, automationKeyConfig, automationWindowStoreAdapter, {
+          id: cq.id,
+          fromId: cq.from?.id,
+          data: cq.data,
+          chatId: cq.message?.chat?.id,
+          messageId: cq.message?.message_id,
+        });
+      } else {
+        // 4-й аргумент — хук немедленного исполнения (Максим, 2026-08-06:
+        // «исполнять прямо в обработчике нажатия, не дожидаясь опроса»).
+        // Намеренно СИНХРОННЫЙ по отношению к этому обработчику: он лишь
+        // ЗАПУСКАЕТ фоновую работу и тут же возвращает управление, поэтому ни
+        // снятие кнопок, ни `answerCallbackQuery`, ни ответ 200 её не ждут —
+        // Telegram получает подтверждение доставки сразу, как и раньше.
+        await handleWebhook(tgApprovalConfig, tgApprovalStoreAdapter, req.body, (row) => {
+          // Чужой сервер (общий бот на 6 MCP-серверов) — не наш манифест, его
+          // исполнит поллер того сервера. См. `executeApprovedNow`.
+          if (row.server !== consentServerConfig.server) return;
+          void executeApprovedNow(config, row.manifestId).catch((err) =>
+            console.error(`TG auto-execute: немедленное исполнение ${row.manifestId} упало:`, err),
+          );
+        });
+      }
     } catch (err) {
       console.error("TG approval webhook error:", err);
     }

@@ -6,7 +6,16 @@ let pool: pg.Pool | null = null;
 let encKey = "";
 
 export function initStore(databaseUrl: string, tokenEncKey: string): void {
-  pool = new pg.Pool({ connectionString: databaseUrl, ssl: { rejectUnauthorized: false } });
+  // Production/Railway Postgres URLs never carry `sslmode=disable` — this
+  // stays `{ rejectUnauthorized: false }` (unchanged default) for every real
+  // deployment. The opt-out exists ONLY so a local, non-TLS Postgres (used by
+  // this repo's own offline migration test, `scripts/test-automation-key.mjs`
+  // §8) can connect without a self-signed-cert setup dance — `pg`'s explicit
+  // `ssl` option always overrides any `sslmode` in the connection string, so
+  // without this branch a local test DB errors "server does not support SSL
+  // connections" before a single query runs.
+  const noSsl = /[?&]sslmode=disable\b/.test(databaseUrl);
+  pool = new pg.Pool({ connectionString: databaseUrl, ssl: noSsl ? false : { rejectUnauthorized: false } });
   encKey = tokenEncKey;
 }
 
@@ -259,6 +268,59 @@ export async function ensureSchema(): Promise<void> {
   `);
   await p.query(
     `CREATE INDEX IF NOT EXISTS tg_approvals_cleanup_idx ON tg_approvals (server, status, expires_at)`,
+  );
+
+  // ---- automation_key hub (docs/TZ_automation_key_hub.md). Generation lives
+  // ONLY in gmail-mcp (see automation_key.ts) — every other MCP server (incl.
+  // ticktick-mcp) only READS this table to check whether a presented key
+  // covers it. `scope` is the canonical column going forward: csv of
+  // {gmail,calendar,drive,sheets,docs,ticktick} or literally "all". `token_hash`
+  // is sha256(hex) of the raw token — the raw token itself is never stored.
+  //
+  // This table may ALREADY EXIST on the shared production Postgres, created by
+  // ticktick-mcp's earlier single-server automation_key feature, with a
+  // `server TEXT NOT NULL` column and NO `scope` column at all — hence CREATE
+  // TABLE IF NOT EXISTS below intentionally does NOT declare a `server`
+  // column (that shape is only for a truly fresh database); the migration
+  // right after backfills `scope` from `server` ONLY when that legacy column
+  // is actually present (checked via information_schema — referencing a
+  // column that doesn't exist would be a hard SQL error, not a graceful
+  // no-op). `server` itself is never dropped/touched either way (ТЗ: "столбец
+  // server не трогать/не удалять"). Both gmail-mcp and ticktick-mcp apply this
+  // same idempotent migration independently at startup — neither may assume
+  // the other one already ran it first.
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS tg_automation_windows (
+      window_id       TEXT PRIMARY KEY,
+      token_hash      TEXT NOT NULL,
+      scope           TEXT,
+      label           TEXT,
+      created_at      BIGINT NOT NULL,
+      expires_at      BIGINT NOT NULL,
+      revoked_at      BIGINT,
+      created_by_chat TEXT NOT NULL
+    )
+  `);
+  await p.query(`ALTER TABLE tg_automation_windows ADD COLUMN IF NOT EXISTS scope TEXT`);
+  const legacyServerCol = await p.query(
+    `SELECT 1 FROM information_schema.columns WHERE table_name = 'tg_automation_windows' AND column_name = 'server'`,
+  );
+  if (legacyServerCol.rows.length) {
+    await p.query(`UPDATE tg_automation_windows SET scope = server WHERE scope IS NULL`);
+    // Легаси-схема ticktick-mcp declared `server TEXT NOT NULL`. gmail-mcp
+    // (the sole writer going forward, automation_key.ts) never populates
+    // `server` at all — it's a multi-service key, there is no one "server" to
+    // name. Left NOT NULL as-is, every INSERT from here on would violate that
+    // constraint on the shared production table. `DROP NOT NULL` doesn't
+    // touch the column's DATA or drop the column itself (ТЗ: "server не
+    // трогать/не удалять" is about the column/its values, not this
+    // constraint) — old rows keep their `server` value, only future rows are
+    // now allowed to leave it NULL. Idempotent: re-running DROP NOT NULL on
+    // an already-nullable column is a no-op, not an error.
+    await p.query(`ALTER TABLE tg_automation_windows ALTER COLUMN server DROP NOT NULL`);
+  }
+  await p.query(
+    `CREATE INDEX IF NOT EXISTS tg_automation_windows_scope_idx ON tg_automation_windows (revoked_at, expires_at)`,
   );
 }
 
@@ -1502,6 +1564,102 @@ export async function getApprovedUnexecuted(
     chatId: r.chat_id,
     messageId: r.message_id === null ? null : Number(r.message_id),
   };
+}
+
+// ---- automation_key hub (docs/TZ_automation_key_hub.md) --------------------
+//
+// Implements `AutomationWindowStore` from `src/automation_key.ts` SIGNATURE-
+// FOR-SIGNATURE (checked via `: AutomationWindowStore` in server.ts, same
+// discipline as `tgApprovalStoreAdapter` above). This table has NO `server`
+// scoping at all — unlike consent_manifests/tg_approvals, every row here is
+// visible/writable only from gmail-mcp (the sole generator); the reading side
+// (ticktick-mcp etc.) only ever SELECTs by scope, never through this adapter.
+
+export interface AutomationWindowRow {
+  windowId: string;
+  tokenHash: string;
+  scope: string;
+  label: string | null;
+  createdAt: number;
+  expiresAt: number;
+  revokedAt: number | null;
+  createdByChat: string;
+}
+
+function rowToAutomationWindow(row: {
+  window_id: string;
+  token_hash: string;
+  scope: string | null;
+  label: string | null;
+  created_at: string | number;
+  expires_at: string | number;
+  revoked_at: string | number | null;
+  created_by_chat: string;
+}): AutomationWindowRow {
+  return {
+    windowId: row.window_id,
+    tokenHash: row.token_hash,
+    scope: row.scope ?? "",
+    label: row.label,
+    createdAt: Number(row.created_at),
+    expiresAt: Number(row.expires_at),
+    revokedAt: row.revoked_at === null ? null : Number(row.revoked_at),
+    createdByChat: row.created_by_chat,
+  };
+}
+
+/** Inserts a fresh window row. `windowId` is minted by the caller
+ * (automation_key.ts — random, unguessable, e.g. `randomBytes(6).toString("hex")`). */
+export async function createAutomationWindow(input: {
+  windowId: string;
+  tokenHash: string;
+  scope: string;
+  label?: string | null;
+  createdAt: number;
+  expiresAt: number;
+  createdByChat: string;
+}): Promise<void> {
+  const p = getPool();
+  await p.query(
+    `INSERT INTO tg_automation_windows
+       (window_id, token_hash, scope, label, created_at, expires_at, created_by_chat)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [input.windowId, input.tokenHash, input.scope, input.label ?? null, input.createdAt, input.expiresAt, input.createdByChat],
+  );
+}
+
+/** Active windows only (not revoked, not expired), newest first — powers
+ * `/automation_key list`. */
+export async function listActiveAutomationWindows(nowMs: number): Promise<AutomationWindowRow[]> {
+  const p = getPool();
+  const res = await p.query(
+    `SELECT * FROM tg_automation_windows WHERE revoked_at IS NULL AND expires_at > $1 ORDER BY created_at DESC`,
+    [nowMs],
+  );
+  return res.rows.map(rowToAutomationWindow);
+}
+
+/** One window by id, regardless of active/revoked/expired — used to confirm
+ * what a revoke actually hit. */
+export async function getAutomationWindow(windowId: string): Promise<AutomationWindowRow | null> {
+  const p = getPool();
+  const res = await p.query(`SELECT * FROM tg_automation_windows WHERE window_id = $1`, [windowId]);
+  if (!res.rows.length) return null;
+  return rowToAutomationWindow(res.rows[0]);
+}
+
+/** Revokes one window (idempotent — a no-op, false-returning UPDATE if it was
+ * already revoked). Never deletes the row: `listActiveAutomationWindows`
+ * already excludes it (filters `revoked_at IS NULL`) so it drops out of
+ * `/automation_key list` immediately; the row itself just stays around for
+ * `getAutomationWindow` to report back what a revoke actually hit. */
+export async function revokeAutomationWindow(windowId: string, nowMs: number): Promise<boolean> {
+  const p = getPool();
+  const res = await p.query(
+    `UPDATE tg_automation_windows SET revoked_at = $2 WHERE window_id = $1 AND revoked_at IS NULL`,
+    [windowId, nowMs],
+  );
+  return (res.rowCount ?? 0) > 0;
 }
 
 export { randomUUID };
