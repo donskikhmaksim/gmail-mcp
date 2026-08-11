@@ -28,6 +28,7 @@
  */
 import { createHmac } from "node:crypto";
 import { verifyTelegramInitData, renderAutomationKeyMiniAppPage } from "../dist/automation_key_miniapp.js";
+import { isValidDurationMs } from "../dist/automation_key.js";
 
 let failures = 0;
 const check = (label, cond, extra = "") => {
@@ -111,6 +112,18 @@ console.log("\n[A] verifyTelegramInitData — подпись/свежесть/в
   const intruderResult = verifyTelegramInitData(BOT_TOKEN, intruderInitData, now);
   check("[план 2] подпись интрудера валидна (сама по себе)", intruderResult.ok === true, intruderResult);
   check("[план 2] но userId — НЕ владелец", intruderResult.ok && intruderResult.userId !== OWNER_CHAT_ID, intruderResult);
+}
+
+// ═══ [A-bis] isValidDurationMs — unit (docs/TZ_automation_key_duration_labels.md раздел 1) ═══
+console.log("\n[A-bis] isValidDurationMs — прямой unit-тест (в обход JSON-сериализации, которая NaN/Infinity превращает в null)");
+{
+  check("положительное конечное число — валидно", isValidDurationMs(3 * 60 * 60 * 1000) === true);
+  check("0 — НЕ валидно", isValidDurationMs(0) === false);
+  check("отрицательное — НЕ валидно", isValidDurationMs(-1) === false);
+  check("NaN — НЕ валидно", isValidDurationMs(NaN) === false);
+  check("Infinity — НЕ валидно", isValidDurationMs(Infinity) === false);
+  check("строка — НЕ валидно", isValidDurationMs("3600000") === false);
+  check("null сам по себе НЕ проходит isValidDurationMs (вызывающий код проверяет null отдельно)", isValidDurationMs(null) === false);
 }
 
 // ═══ [B] реальный HTTP-роут ═══
@@ -225,16 +238,54 @@ console.log('\n[6] POST от владельца с ПУСТЫМ выбором �
   const authDateSec = Math.floor(Date.now() / 1000);
   const valid = buildInitData(Number(OWNER_CHAT_ID), authDateSec);
   const before = tgCalls.length;
-  const { status, json } = await postGenerate({ initData: valid, services: [] });
+  // durationMs валиден (3ч) — проверяем именно empty_selection, не путаем с валидацией срока.
+  const { status, json } = await postGenerate({ initData: valid, services: [], durationMs: 3 * 60 * 60 * 1000 });
   check("400", status === 400, status);
   check("error: empty_selection", json.error === "empty_selection", json);
   check("ничего не отправлено", tgCalls.length === before, tgCalls.length - before);
 
   // Тот же случай, но поле services вообще отсутствует в теле — тоже fail-closed.
   const before2 = tgCalls.length;
-  const { status: status2 } = await postGenerate({ initData: valid });
+  const { status: status2 } = await postGenerate({ initData: valid, durationMs: 3 * 60 * 60 * 1000 });
   check("services отсутствует в теле → тоже 400", status2 === 400, status2);
   check("ничего не отправлено (2)", tgCalls.length === before2, tgCalls.length - before2);
+}
+
+// ═══ Раздел 1 ТЗ-аддендума (docs/TZ_automation_key_duration_labels.md): backend-валидация durationMs ═══
+console.log("\n[7] POST с некорректным durationMs (0/отрицательное/строка/отсутствует) → 400 invalid_duration, ничего не отправлено; durationMs=null валиден сам по себе");
+{
+  const authDateSec = Math.floor(Date.now() / 1000);
+  const valid = buildInitData(Number(OWNER_CHAT_ID), authDateSec);
+
+  // NaN/Infinity намеренно не тестируются здесь: JSON.stringify сериализует
+  // оба в `null` (JSON не умеет их выражать), так что по HTTP они бы всё
+  // равно пришли как `null` (валидное "бессрочно"), а не как экзотический
+  // невалидный `number` — isValidDurationMs() сам по себе (unit) уже
+  // проверяет их отдельно через прямой вызов, не через сериализацию.
+  for (const [label, rawDuration] of [
+    ["0", 0],
+    ["отрицательное", -1000],
+    ["строка", "3h"],
+  ]) {
+    const before = tgCalls.length;
+    const { status, json } = await postGenerate({ initData: valid, services: ["gmail"], durationMs: rawDuration });
+    check(`[план — валидация durationMs] durationMs=${label} → 400 invalid_duration`, status === 400 && json.error === "invalid_duration", { status, json });
+    check(`ничего не отправлено (durationMs=${label})`, tgCalls.length === before, tgCalls.length - before);
+  }
+
+  // Поле durationMs вообще отсутствует в теле — тоже отклоняется, не тихий дефолт.
+  const beforeMissing = tgCalls.length;
+  const { status: statusMissing, json: jsonMissing } = await postGenerate({ initData: valid, services: ["gmail"] });
+  check("durationMs отсутствует в теле → 400 invalid_duration (backend НЕ подставляет тихий дефолт)", statusMissing === 400 && jsonMissing.error === "invalid_duration", { statusMissing, jsonMissing });
+  check("ничего не отправлено (durationMs отсутствует)", tgCalls.length === beforeMissing, tgCalls.length - beforeMissing);
+
+  // durationMs=null (бессрочно) — валиден САМ ПО СЕБЕ: с пустым services запрос
+  // доходит до empty_selection, а НЕ invalid_duration — доказывает, что null
+  // прошёл валидацию длительности.
+  const beforeNull = tgCalls.length;
+  const { status: statusNull, json: jsonNull } = await postGenerate({ initData: valid, services: [], durationMs: null });
+  check("[план 1] durationMs=null проходит валидацию (падает на empty_selection, не invalid_duration)", statusNull === 400 && jsonNull.error === "empty_selection", { statusNull, jsonNull });
+  check("ничего не отправлено (durationMs=null, пустой выбор)", tgCalls.length === beforeNull, tgCalls.length - beforeNull);
 }
 
 // ═══ [4]/[5]/[7] — реальная запись окна + доставка ключа (нужен Postgres) ═══
@@ -253,33 +304,66 @@ console.log("\n[4]/[5]/[7] валидный запрос владельца → 
       initStore(dbUrl, "0".repeat(64));
       await ensureSchema();
 
-      // ── [4] один отмеченный сервис → scope = это имя ──
+      // ── [4] один отмеченный сервис, конкретный срок (7 дней) → scope = это имя, expires_at = created_at + 7д ──
       {
         const authDateSec = Math.floor(Date.now() / 1000);
         const valid = buildInitData(Number(OWNER_CHAT_ID), authDateSec);
         const before = tgCalls.length;
-        const { status, json } = await postGenerate({ initData: valid, services: ["ticktick"] });
+        const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+        const { status, json } = await postGenerate({ initData: valid, services: ["ticktick"], durationMs: SEVEN_DAYS_MS });
         check("[план 4] 200 ok", status === 200 && json.ok === true, JSON.stringify({ status, json }));
         check("[план 7] ровно один новый tgCall (sendMessage)", tgCalls.length === before + 1, tgCalls.length - before);
         const sent = tgCalls[tgCalls.length - 1];
         check("[план 7] это именно sendMessage с 🔑", sent.method === "sendMessage" && /🔑/.test(sent.body.text ?? ""), sent);
         check("[план 7] сырой токен НЕ попадает в тело HTTP-ответа", JSON.stringify(json) === '{"ok":true}', JSON.stringify(json));
 
-        const row = await pool.query(`SELECT scope FROM tg_automation_windows ORDER BY created_at DESC LIMIT 1`);
+        const row = await pool.query(`SELECT scope, created_at, expires_at FROM tg_automation_windows ORDER BY created_at DESC LIMIT 1`);
         check("[план 4] окно в БД с scope='ticktick'", row.rows[0]?.scope === "ticktick", row.rows[0]);
+        check(
+          "[план 2 ТЗ-аддендума] expires_at = created_at + 7 дней (в мс)",
+          Number(row.rows[0]?.expires_at) === Number(row.rows[0]?.created_at) + SEVEN_DAYS_MS,
+          row.rows[0],
+        );
       }
 
-      // ── [5] «Все сразу» (все 6 сервисов отмечены) → scope = 'all' ──
+      // ── [5] «Все сразу» (все 6 сервисов отмечены), durationMs=null → scope = 'all', expires_at IS NULL (тестовый план п.1) ──
       {
         const authDateSec = Math.floor(Date.now() / 1000);
         const valid = buildInitData(Number(OWNER_CHAT_ID), authDateSec);
         const { status, json } = await postGenerate({
           initData: valid,
           services: ["gmail", "calendar", "drive", "sheets", "docs", "ticktick"],
+          durationMs: null,
         });
         check("[план 5] 200 ok", status === 200 && json.ok === true, JSON.stringify({ status, json }));
-        const row = await pool.query(`SELECT scope FROM tg_automation_windows ORDER BY created_at DESC LIMIT 1`);
+        const row = await pool.query(`SELECT scope, expires_at FROM tg_automation_windows ORDER BY created_at DESC LIMIT 1`);
         check("[план 5] scope === 'all'", row.rows[0]?.scope === "all", row.rows[0]);
+        check("[план 1] durationMs=null → expires_at IS NULL в БД", row.rows[0]?.expires_at === null, row.rows[0]);
+      }
+
+      // ── Раздел 2 ТЗ-аддендума: label — пустая строка → NULL, заполненная → сохраняется (тестовый план п.4) ──
+      {
+        const authDateSec = Math.floor(Date.now() / 1000);
+        const valid = buildInitData(Number(OWNER_CHAT_ID), authDateSec);
+
+        // Пустая строка (и строка из одних пробелов) → NULL.
+        await postGenerate({ initData: valid, services: ["gmail"], durationMs: 3_600_000, label: "" });
+        const emptyLabelRow = await pool.query(`SELECT label FROM tg_automation_windows ORDER BY created_at DESC LIMIT 1`);
+        check("[план 4] пустая строка label → NULL в БД", emptyLabelRow.rows[0]?.label === null, emptyLabelRow.rows[0]);
+
+        await postGenerate({ initData: valid, services: ["gmail"], durationMs: 3_600_000, label: "   " });
+        const blankLabelRow = await pool.query(`SELECT label FROM tg_automation_windows ORDER BY created_at DESC LIMIT 1`);
+        check("[план 4] label из одних пробелов → NULL в БД (trim)", blankLabelRow.rows[0]?.label === null, blankLabelRow.rows[0]);
+
+        // label отсутствует в теле вовсе → тоже NULL (как раньше, поле необязательное).
+        await postGenerate({ initData: valid, services: ["gmail"], durationMs: 3_600_000 });
+        const missingLabelRow = await pool.query(`SELECT label FROM tg_automation_windows ORDER BY created_at DESC LIMIT 1`);
+        check("[план 4] label отсутствует в теле → NULL в БД", missingLabelRow.rows[0]?.label === null, missingLabelRow.rows[0]);
+
+        // Заполненная строка — сохраняется как есть (после trim).
+        await postGenerate({ initData: valid, services: ["gmail"], durationMs: 3_600_000, label: "  рабочий ноутбук  " });
+        const filledLabelRow = await pool.query(`SELECT label FROM tg_automation_windows ORDER BY created_at DESC LIMIT 1`);
+        check("[план 4] заполненный label сохраняется (обрезанный по краям)", filledLabelRow.rows[0]?.label === "рабочий ноутбук", filledLabelRow.rows[0]);
       }
 
       // ── [7] deleteMessage планируется, но не сразу (тот же механизм, что кнопочная версия — уже покрыт test-automation-key.mjs #7 напрямую на generateAndDeliverKey; здесь достаточно факта, что сырой токен ушёл СООБЩЕНИЕМ, проверено выше) ──

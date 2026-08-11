@@ -20,6 +20,8 @@ import {
   handleAutomationKeyCallback,
   maskToScope,
   AUTOMATION_SERVICES,
+  DURATION_PRESETS,
+  DEFAULT_DURATION_INDEX,
 } from "../src/automation_key.ts";
 
 const BOT_TOKEN = "TESTTOKEN";
@@ -75,15 +77,24 @@ function mockDefaults(h) {
 }
 
 // ── in-memory AutomationWindowStore — тот же контракт, что store.ts ────────
+// `expiresAt: null` = бессрочно (docs/TZ_automation_key_duration_labels.md
+// раздел 1) — `listActiveWindows`/`listAllWindows` обязаны считать такое
+// окно ДЕЙСТВУЮЩИМ, не истёкшим (тестовый план п.3).
 function makeStore() {
   const windows = new Map();
   return {
     windows,
     async createWindow(input) {
-      windows.set(input.windowId, { ...input, revokedAt: null });
+      windows.set(input.windowId, { ...input, label: input.label ?? null, revokedAt: null });
     },
     async listActiveWindows(nowMs) {
-      return [...windows.values()].filter((w) => w.revokedAt === null && w.expiresAt > nowMs);
+      return [...windows.values()].filter(
+        (w) => w.revokedAt === null && (w.expiresAt === null || w.expiresAt > nowMs),
+      );
+    },
+    async listAllWindows(limit) {
+      const all = [...windows.values()].sort((a, b) => b.createdAt - a.createdAt);
+      return { windows: all.slice(0, limit), total: all.length };
     },
     async getWindow(windowId) {
       return windows.get(windowId) ?? null;
@@ -124,9 +135,11 @@ const check = (label, cond, extra = "") => {
 
 const nowFixed = () => 1_700_000_000_000;
 
-/** Проходит полный флоу: /automation_key → toggle одного сервиса → «Получить
- * ключ». Возвращает { store, windows: [...] } для проверок. */
-async function generateWithMask(services) {
+/** Проходит полный флоу: /automation_key → toggle сервисов → «Получить
+ * ключ» (открывает второй экран, `ak:dur:<mask>`) → выбор срока
+ * (`ak:gen:<mask>:<durationIndex>`, дефолт — индекс 3 часа). Возвращает
+ * { store, windows: [...] } для проверок. */
+async function generateWithMask(services, durationIndex = DEFAULT_DURATION_INDEX) {
   const h = resetTelegramMocks();
   mockDefaults(h);
   const store = makeStore();
@@ -150,11 +163,22 @@ async function generateWithMask(services) {
     mask = newMask;
   }
 
+  // «Получить ключ» — ВТОРОЙ (обязательный) экран выбора срока, не генерация.
+  const durHandled = await handleAutomationKeyCallback(
+    cfg,
+    akCfg(),
+    store,
+    { id: "cbq-dur", fromId: Number(OWNER_CHAT_ID), data: `ak:dur:${mask}`, chatId: Number(OWNER_CHAT_ID), messageId: 42 },
+    nowFixed,
+  );
+  check("ak:dur (второй экран) обработан модулем", durHandled === true);
+  check("НИЧЕГО не создано после ak:dur (второй экран сам не генерирует)", store.windows.size === 0, store.windows.size);
+
   const genHandled = await handleAutomationKeyCallback(
     cfg,
     akCfg(),
     store,
-    { id: "cbq-gen", fromId: Number(OWNER_CHAT_ID), data: `ak:gen:${mask}`, chatId: Number(OWNER_CHAT_ID), messageId: 42 },
+    { id: "cbq-gen", fromId: Number(OWNER_CHAT_ID), data: `ak:gen:${mask}:${durationIndex}`, chatId: Number(OWNER_CHAT_ID), messageId: 42 },
     nowFixed,
   );
   check("ak:gen обработан модулем", genHandled === true);
@@ -163,7 +187,7 @@ async function generateWithMask(services) {
 }
 
 // ═══ [1] Генерация с ОДНИМ отмеченным сервисом → scope = это имя ═══
-console.log("\n[1] генерация с одним отмеченным сервисом (ticktick) → scope='ticktick'");
+console.log("\n[1] генерация с одним отмеченным сервисом (ticktick), дефолтный срок → scope='ticktick', expiresAt = +3ч");
 {
   const { store } = await generateWithMask(["ticktick"]);
   const windows = [...store.windows.values()];
@@ -171,6 +195,12 @@ console.log("\n[1] генерация с одним отмеченным сер�
   check("scope === 'ticktick'", windows[0]?.scope === "ticktick", windows[0]?.scope);
   check("scope НЕ 'all' (только этот один сервис)", windows[0]?.scope !== "all");
   check("tokenHash — это sha256 hex (64 hex-символа), не сырой токен", /^[0-9a-f]{64}$/.test(windows[0]?.tokenHash ?? ""), windows[0]?.tokenHash);
+  check(
+    "[план 1/2] дефолт — 3 часа: expiresAt = createdAt + 3ч",
+    windows[0]?.expiresAt === windows[0]?.createdAt + DURATION_PRESETS[DEFAULT_DURATION_INDEX].ms,
+    windows[0],
+  );
+  check("label = null (бот не передаёт название — ТЗ раздел 2)", windows[0]?.label === null, windows[0]?.label);
   const sentToken = tgCalls.find((c) => c.method === "sendMessage" && /🔑/.test(c.body.text));
   check("отдельное сообщение с сырым токеном отправлено", !!sentToken);
   check("текст сообщения упоминает ticktick", /ticktick/.test(sentToken?.body.text ?? ""));
@@ -194,9 +224,16 @@ console.log('\n[2] генерация с «Все сразу» → scope="all"')
   const ALL_MASK = (1 << AUTOMATION_SERVICES.length) - 1;
   check("maskToScope(ALL_MASK) === 'all'", maskToScope(ALL_MASK) === "all");
 
+  const durHandled = await handleAutomationKeyCallback(
+    cfg, akCfg(), store,
+    { id: "cbq-dur-all", fromId: Number(OWNER_CHAT_ID), data: `ak:dur:${ALL_MASK}`, chatId: Number(OWNER_CHAT_ID), messageId: 7 },
+    nowFixed,
+  );
+  check("ak:dur (второй экран) обработан", durHandled === true);
+
   const genHandled = await handleAutomationKeyCallback(
     cfg, akCfg(), store,
-    { id: "cbq-gen-all", fromId: Number(OWNER_CHAT_ID), data: `ak:gen:${ALL_MASK}`, chatId: Number(OWNER_CHAT_ID), messageId: 7 },
+    { id: "cbq-gen-all", fromId: Number(OWNER_CHAT_ID), data: `ak:gen:${ALL_MASK}:${DEFAULT_DURATION_INDEX}`, chatId: Number(OWNER_CHAT_ID), messageId: 7 },
     nowFixed,
   );
   check("ak:gen обработан", genHandled === true);
@@ -206,16 +243,29 @@ console.log('\n[2] генерация с «Все сразу» → scope="all"')
 }
 
 // ═══ [3] Пустой выбор + «Получить ключ» → ничего не создано, есть ответ об ошибке ═══
-console.log('\n[3] пустой выбор (mask=0) + «Получить ключ» → БД пуста, есть текст ошибки');
+console.log('\n[3] пустой выбор (mask=0) → ошибка НА ОБОИХ шагах (ak:dur и ak:gen), ничего не создано');
 {
   const h = resetTelegramMocks();
   mockDefaults(h);
   const store = makeStore();
   const cfg = tgCfg();
 
+  // «Получить ключ» с пустым выбором — ошибка уже на открытии второго экрана.
+  const durHandled = await handleAutomationKeyCallback(
+    cfg, akCfg(), store,
+    { id: "cbq-dur-empty", fromId: Number(OWNER_CHAT_ID), data: "ak:dur:0", chatId: Number(OWNER_CHAT_ID), messageId: 9 },
+    nowFixed,
+  );
+  check("ak:dur(mask=0) всё равно обработан модулем (true)", durHandled === true);
+  check("НИЧЕГО не создано после ak:dur", store.windows.size === 0, store.windows.size);
+  const durErr = tgCalls.find((c) => c.method === "answerCallbackQuery" && c.body.callback_query_id === "cbq-dur-empty");
+  check("answerCallbackQuery на ak:dur вызван", !!durErr);
+  check("show_alert=true на ak:dur", durErr?.body.show_alert === true);
+
+  // Защита в глубину: даже прямой (гипотетический) ak:gen:0:<idx> тоже не создаёт окно.
   const handled = await handleAutomationKeyCallback(
     cfg, akCfg(), store,
-    { id: "cbq-gen-empty", fromId: Number(OWNER_CHAT_ID), data: "ak:gen:0", chatId: Number(OWNER_CHAT_ID), messageId: 9 },
+    { id: "cbq-gen-empty", fromId: Number(OWNER_CHAT_ID), data: `ak:gen:0:${DEFAULT_DURATION_INDEX}`, chatId: Number(OWNER_CHAT_ID), messageId: 9 },
     nowFixed,
   );
   check("ak:gen(mask=0) всё равно обработан модулем (true)", handled === true);
@@ -227,8 +277,71 @@ console.log('\n[3] пустой выбор (mask=0) + «Получить клю�
   check("НИ ОДНОГО sendMessage с 🔑 не отправлено", !tgCalls.some((c) => c.method === "sendMessage"));
 }
 
-// ═══ [4] /automation_key list показывает только активные окна ═══
-console.log("\n[4] /automation_key list — только активные (не отозванные/не истёкшие)");
+// ═══ [3-bis] Второй экран — обязательный шаг (тестовый план п.5) ═══
+console.log("\n[3-bis] «Получить ключ» открывает второй экран (не генерирует); битый/отсутствующий индекс срока — тоже не генерирует");
+{
+  const h = resetTelegramMocks();
+  mockDefaults(h);
+  const store = makeStore();
+  const cfg = tgCfg();
+
+  // Первый экран: «Получить ключ» — callback_data должен указывать на ak:dur, не ak:gen.
+  await handleAutomationKeyMessage(
+    cfg, store,
+    { chatId: Number(OWNER_CHAT_ID), fromId: Number(OWNER_CHAT_ID), text: "/automation_key" },
+    nowFixed,
+  );
+  const promptMsg = tgCalls.find((c) => c.method === "sendMessage");
+  const genBtn = (promptMsg?.body.reply_markup?.inline_keyboard ?? []).flat().find((b) => b.text === "Получить ключ");
+  check("[план 5] кнопка «Получить ключ» ведёт на ak:dur (второй экран), не сразу генерирует", /^ak:dur:/.test(genBtn?.callback_data ?? ""), genBtn);
+
+  // Второй экран открыт (ak:dur:1) — редактирует то же сообщение на выбор срока.
+  const durHandled = await handleAutomationKeyCallback(
+    cfg, akCfg(), store,
+    { id: "cbq-dur-bis", fromId: Number(OWNER_CHAT_ID), data: "ak:dur:1", chatId: Number(OWNER_CHAT_ID), messageId: 42 },
+    nowFixed,
+  );
+  check("ak:dur обработан", durHandled === true);
+  const editCall = tgCalls.find((c) => c.method === "editMessageText" && c.body.message_id === 42);
+  check("сообщение отредактировано на экран выбора срока", !!editCall);
+  const durButtons = (editCall?.body.reply_markup?.inline_keyboard ?? []).flat();
+  check("[план 6] на втором экране ровно 6 кнопок-пресетов", durButtons.length === 6, durButtons.length);
+  check("все кнопки второго экрана кодируют mask=1 в callback_data", durButtons.every((b) => b.callback_data.startsWith("ak:gen:1:")));
+  check("НИЧЕГО не создано только от открытия второго экрана", store.windows.size === 0, store.windows.size);
+
+  // Битый индекс (например от старой клавиатуры до деплоя) — fail-closed, не генерирует.
+  const badHandled = await handleAutomationKeyCallback(
+    cfg, akCfg(), store,
+    { id: "cbq-gen-bad-idx", fromId: Number(OWNER_CHAT_ID), data: "ak:gen:1:99", chatId: Number(OWNER_CHAT_ID), messageId: 42 },
+    nowFixed,
+  );
+  check("ak:gen с некорректным idx обработан модулем (true)", badHandled === true);
+  check("НИЧЕГО не создано с некорректным idx", store.windows.size === 0, store.windows.size);
+  const badAnswer = tgCalls.find((c) => c.method === "answerCallbackQuery" && c.body.callback_query_id === "cbq-gen-bad-idx");
+  check("show_alert=true на некорректный idx", badAnswer?.body.show_alert === true, badAnswer);
+}
+
+// ═══ [3-ter] Каждый из 6 пресетов срока даёт правильный expiresAt/NULL (тестовый план п.6) ═══
+console.log("\n[3-ter] 6 пресетов срока (1ч/3ч/24ч/7д/30д/бессрочно) → корректный expiresAt/NULL");
+for (let idx = 0; idx < DURATION_PRESETS.length; idx++) {
+  const preset = DURATION_PRESETS[idx];
+  console.log(`  — идёт: idx=${idx} (${preset.label})`);
+  const { store } = await generateWithMask(["gmail"], idx);
+  const windows = [...store.windows.values()];
+  check(`  окно создано (idx=${idx})`, windows.length === 1, windows.length);
+  if (preset.ms === null) {
+    check(`  [план 6] idx=${idx} 'Бессрочно' → expiresAt === null`, windows[0]?.expiresAt === null, windows[0]?.expiresAt);
+  } else {
+    check(
+      `  [план 6] idx=${idx} '${preset.label}' → expiresAt = createdAt + ${preset.ms}мс`,
+      windows[0]?.expiresAt === windows[0]?.createdAt + preset.ms,
+      windows[0],
+    );
+  }
+}
+
+// ═══ [4] /automation_key list — ВСЕ окна (активные/истёкшие/отозванные/бессрочные) со статусом, label, scope ═══
+console.log("\n[4] /automation_key list — показывает ВСЕ окна с правильным статусом, label, scope (тестовый план п.7)");
 {
   const h = resetTelegramMocks();
   mockDefaults(h);
@@ -236,8 +349,9 @@ console.log("\n[4] /automation_key list — только активные (не 
   const cfg = tgCfg();
   const now0 = nowFixed();
 
-  await store.createWindow({ windowId: "active1", tokenHash: "h1", scope: "gmail", createdAt: now0, expiresAt: now0 + 100_000, createdByChat: OWNER_CHAT_ID });
+  await store.createWindow({ windowId: "active1", tokenHash: "h1", scope: "gmail", label: "рабочий ноутбук", createdAt: now0, expiresAt: now0 + 100_000, createdByChat: OWNER_CHAT_ID });
   await store.createWindow({ windowId: "active2", tokenHash: "h2", scope: "all", createdAt: now0, expiresAt: now0 + 100_000, createdByChat: OWNER_CHAT_ID });
+  await store.createWindow({ windowId: "infinite1", tokenHash: "h5", scope: "docs", createdAt: now0, expiresAt: null, createdByChat: OWNER_CHAT_ID });
   await store.createWindow({ windowId: "expired1", tokenHash: "h3", scope: "drive", createdAt: now0 - 200_000, expiresAt: now0 - 1_000, createdByChat: OWNER_CHAT_ID });
   await store.createWindow({ windowId: "revoked1", tokenHash: "h4", scope: "sheets", createdAt: now0, expiresAt: now0 + 100_000, createdByChat: OWNER_CHAT_ID });
   await store.revokeWindow("revoked1", now0);
@@ -252,12 +366,88 @@ console.log("\n[4] /automation_key list — только активные (не 
   check("sendMessage со списком отправлен", !!listMsg);
   const text = listMsg?.body.text ?? "";
   check("active1 присутствует в списке", text.includes("active1"));
+  check("active1 показывает своё название", text.includes("рабочий ноутбук"));
   check("active2 присутствует в списке", text.includes("active2"));
-  check("expired1 ОТСУТСТВУЕТ (истёк)", !text.includes("expired1"));
-  check("revoked1 ОТСУТСТВУЕТ (отозван)", !text.includes("revoked1"));
+  check("[план 7] infinite1 присутствует (бессрочное — НЕ истёкшее)", text.includes("infinite1"));
+  check("infinite1 помечено значком ♾", /infinite1[^\n]*♾/.test(text), text);
+  check("[план 7] expired1 присутствует (истёкшие теперь тоже показываются)", text.includes("expired1"));
+  check("expired1 помечено значком ⌛", /expired1[^\n]*⌛/.test(text), text);
+  check("[план 7] revoked1 присутствует (отозванные теперь тоже показываются)", text.includes("revoked1"));
+  check("revoked1 помечено значком 🚫", /revoked1[^\n]*🚫/.test(text), text);
+  check("active1/active2 помечены значком ✅", /active1[^\n]*✅/.test(text) && /active2[^\n]*✅/.test(text), text);
+  check("scope 'all' показан человекочитаемо как «все»", /active2[^\n]*все/.test(text), text);
+
   const buttons = (listMsg?.body.reply_markup?.inline_keyboard ?? []).flat();
-  check("кнопка «Отозвать» есть у каждого активного окна (2 кнопки)", buttons.length === 2, buttons.length);
+  check("[план 7] кнопка «Отозвать» есть ТОЛЬКО у активных строк (active1, active2, infinite1 — 3 кнопки)", buttons.length === 3, buttons.length);
   check("callback_data кнопок кодирует window_id", buttons.every((b) => /^ak:revoke:/.test(b.callback_data)));
+  check("нет кнопки «Отозвать» для expired1/revoked1", !buttons.some((b) => /expired1|revoked1/.test(b.callback_data)));
+}
+
+// ═══ [4-bis] Список усекается на 30 с явной строкой об усечении (тестовый план п.8) ═══
+console.log("\n[4-bis] список усекается на 30 самых свежих, с явной строкой «показаны последние 30 из M»");
+{
+  const h = resetTelegramMocks();
+  mockDefaults(h);
+  const store = makeStore();
+  const cfg = tgCfg();
+  const now0 = nowFixed();
+  const TOTAL = 35;
+  for (let i = 0; i < TOTAL; i++) {
+    await store.createWindow({
+      windowId: `win${i}`,
+      tokenHash: `h${i}`,
+      scope: "gmail",
+      createdAt: now0 + i, // растущий createdAt — свежее = больше индекс
+      expiresAt: now0 + 100_000,
+      createdByChat: OWNER_CHAT_ID,
+    });
+  }
+
+  await handleAutomationKeyMessage(
+    cfg, store,
+    { chatId: Number(OWNER_CHAT_ID), fromId: Number(OWNER_CHAT_ID), text: "/automation_key list" },
+    nowFixed,
+  );
+  const listMsg = tgCalls.find((c) => c.method === "sendMessage");
+  const text = listMsg?.body.text ?? "";
+  const shownCount = (text.match(/win\d+/g) ?? []).length;
+  check("[план 8] показано ровно 30 строк, не 35", shownCount === 30, shownCount);
+  check("[план 8] явная строка об усечении присутствует", /последние 30 из 35/.test(text), text);
+  check("[план 8] показаны САМЫЕ СВЕЖИЕ (win34 — последний созданный)", text.includes("win34"));
+  check("[план 8] самое старое (win0) НЕ показано (усечено)", !text.includes("win0 "), text);
+
+  // Ниже лимита — строки об усечении быть не должно (не пугаем "показаны N из N").
+  const h2 = resetTelegramMocks();
+  mockDefaults(h2);
+  const store2 = makeStore();
+  for (let i = 0; i < 5; i++) {
+    await store2.createWindow({ windowId: `small${i}`, tokenHash: `s${i}`, scope: "gmail", createdAt: now0 + i, expiresAt: now0 + 100_000, createdByChat: OWNER_CHAT_ID });
+  }
+  await handleAutomationKeyMessage(
+    cfg, store2,
+    { chatId: Number(OWNER_CHAT_ID), fromId: Number(OWNER_CHAT_ID), text: "/automation_key list" },
+    nowFixed,
+  );
+  const listMsg2 = tgCalls.find((c) => c.method === "sendMessage");
+  check("[план 8] без превышения лимита строки об усечении НЕТ", !/показаны последние/.test(listMsg2?.body.text ?? ""), listMsg2?.body.text);
+}
+
+// ═══ [4-ter] listActiveWindows считает expiresAt=NULL действующим окном (тестовый план п.3) ═══
+console.log("\n[4-ter] listActiveWindows: expiresAt=NULL — действующее (бессрочное) окно, не истёкшее");
+{
+  const store = makeStore();
+  const now0 = nowFixed();
+  await store.createWindow({ windowId: "forever", tokenHash: "hF", scope: "ticktick", createdAt: now0, expiresAt: null, createdByChat: OWNER_CHAT_ID });
+  await store.createWindow({ windowId: "timed", tokenHash: "hT", scope: "ticktick", createdAt: now0, expiresAt: now0 + 1000, createdByChat: OWNER_CHAT_ID });
+
+  const activeAtNow = await store.listActiveWindows(now0);
+  check("[план 3] бессрочное окно входит в активные СЕЙЧАС", activeAtNow.some((w) => w.windowId === "forever"));
+
+  // Даже сильно "в будущем" — бессрочное окно всё ещё активно (в отличие от timed).
+  const farFuture = now0 + 100 * 365 * 24 * 60 * 60 * 1000;
+  const activeFarFuture = await store.listActiveWindows(farFuture);
+  check("[план 3] бессрочное окно активно даже далеко в будущем", activeFarFuture.some((w) => w.windowId === "forever"));
+  check("срочное окно к этому моменту уже НЕ активно", !activeFarFuture.some((w) => w.windowId === "timed"));
 }
 
 // ═══ [5] revoke <id> гасит конкретное окно, остальные продолжают жить ═══
@@ -359,7 +549,7 @@ console.log("\n[7] сообщение с токеном самоудаляетс
 
   await handleAutomationKeyCallback(
     cfg, akCfg(), store,
-    { id: "cbq-gen-del", fromId: Number(OWNER_CHAT_ID), data: "ak:gen:1", chatId: Number(OWNER_CHAT_ID), messageId: 3 },
+    { id: "cbq-gen-del", fromId: Number(OWNER_CHAT_ID), data: `ak:gen:1:${DEFAULT_DURATION_INDEX}`, chatId: Number(OWNER_CHAT_ID), messageId: 3 },
     nowFixed,
   );
   const sentToken = tgCalls.find((c) => c.method === "sendMessage" && /🔑/.test(c.body.text));
@@ -416,11 +606,17 @@ console.log("\n[8] миграция схемы (ensureSchema) — идемпот
       await ensureSchema(); // второй прогон — идемпотентно, не должен упасть/задвоить
 
       const cols = await pool.query(
-        `SELECT column_name FROM information_schema.columns WHERE table_name = 'tg_automation_windows'`,
+        `SELECT column_name, is_nullable FROM information_schema.columns WHERE table_name = 'tg_automation_windows'`,
       );
       const colNames = cols.rows.map((r) => r.column_name);
       check("колонка scope добавлена", colNames.includes("scope"), colNames);
       check("колонка server НЕ удалена", colNames.includes("server"), colNames);
+      const expiresAtCol = cols.rows.find((r) => r.column_name === "expires_at");
+      check(
+        "[docs/TZ_automation_key_duration_labels.md раздел 1] expires_at теперь nullable",
+        expiresAtCol?.is_nullable === "YES",
+        expiresAtCol,
+      );
 
       const legacyRow = await pool.query(`SELECT scope, server FROM tg_automation_windows WHERE window_id = 'legacy1'`);
       check("старая строка читается после миграции", legacyRow.rows.length === 1);
@@ -452,6 +648,21 @@ console.log("\n[8] миграция схемы (ensureSchema) — идемпот
       );
       check("server у новой строки — NULL (никогда не заполнялся новым писателем)", legacyWriteRow.rows[0]?.server === null);
 
+      // expires_at = NULL (бессрочно) должно писаться штатно после миграции —
+      // до `ALTER COLUMN expires_at DROP NOT NULL` это падало бы на NOT NULL.
+      await pool.query(
+        `INSERT INTO tg_automation_windows (window_id, token_hash, scope, created_at, expires_at, created_by_chat)
+         VALUES ('legacy-infinite', 'hashinf', 'gmail', 1700000000000, NULL, '555')`,
+      );
+      const legacyInfiniteRow = await pool.query(
+        `SELECT expires_at FROM tg_automation_windows WHERE window_id = 'legacy-infinite'`,
+      );
+      check(
+        "[план 1] INSERT с expires_at=NULL работает на легаси-таблице после миграции",
+        legacyInfiniteRow.rows.length === 1 && legacyInfiniteRow.rows[0]?.expires_at === null,
+        legacyInfiniteRow.rows[0],
+      );
+
       // ── Случай Б: таблицы вообще не было (свежий gmail-mcp, ещё никто не
       // создавал tg_automation_windows) — CREATE TABLE IF NOT EXISTS должен
       // взять канонический вид ИЗ ТЗ (со scope, БЕЗ server), и запись нового
@@ -461,7 +672,7 @@ console.log("\n[8] миграция схемы (ensureSchema) — идемпот
       await ensureSchema(); // идемпотентность и на свежей таблице тоже
 
       const freshCols = await pool.query(
-        `SELECT column_name FROM information_schema.columns WHERE table_name = 'tg_automation_windows'`,
+        `SELECT column_name, is_nullable FROM information_schema.columns WHERE table_name = 'tg_automation_windows'`,
       );
       const freshColNames = freshCols.rows.map((r) => r.column_name);
       check("на свежей таблице scope есть", freshColNames.includes("scope"), freshColNames);
@@ -473,6 +684,19 @@ console.log("\n[8] миграция схемы (ensureSchema) — идемпот
       );
       const freshRow = await pool.query(`SELECT scope FROM tg_automation_windows WHERE window_id = 'fresh1'`);
       check("новая строка со scope пишется штатно на свежей таблице", freshRow.rows[0]?.scope === "gmail,calendar");
+
+      const freshExpiresAtCol = freshCols.rows.find((r) => r.column_name === "expires_at");
+      check("на свежей таблице expires_at тоже nullable", freshExpiresAtCol?.is_nullable === "YES", freshExpiresAtCol);
+      await pool.query(
+        `INSERT INTO tg_automation_windows (window_id, token_hash, scope, created_at, expires_at, created_by_chat)
+         VALUES ('fresh-infinite', 'hashfi', 'gmail', 1700000000000, NULL, '555')`,
+      );
+      const freshInfiniteRow = await pool.query(`SELECT expires_at FROM tg_automation_windows WHERE window_id = 'fresh-infinite'`);
+      check(
+        "[план 1] на свежей таблице expires_at=NULL тоже пишется штатно",
+        freshInfiniteRow.rows.length === 1 && freshInfiniteRow.rows[0]?.expires_at === null,
+        freshInfiniteRow.rows[0],
+      );
     } finally {
       await pool.query("DROP TABLE IF EXISTS tg_automation_windows").catch(() => {});
       await pool.end();
