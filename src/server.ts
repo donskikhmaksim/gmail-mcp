@@ -7,6 +7,7 @@ import type { ConsentStore, ConsentConfig, TgApprovalGate } from "./consent.js";
 import type { TgApprovalStore } from "./tg_approval.js";
 import { createTgApprovalGate } from "./tg_approval.js";
 import type { AutomationWindowStore } from "./automation_key.js";
+import { checkAutomationKeyFor } from "./automation_key.js";
 import {
   storeReady,
   addSnooze,
@@ -157,6 +158,26 @@ export const automationWindowStoreAdapter: AutomationWindowStore = {
   revokeWindow: revokeAutomationWindow,
 };
 
+/**
+ * `checkAutomationKey` DI for `requireConsent` (docs/
+ * TZ_automation_key_consent_gate.md). Bound to this service ("gmail") —
+ * reuses `automationWindowStoreAdapter`/`checkAutomationKeyFor`, no new SQL
+ * or DB connection. gmail-mcp has no static `AUTOMATION_KEY` env var, so the
+ * only channel is "window" (an active `tg_automation_windows` row whose scope
+ * covers "gmail").
+ *
+ * NOT computed at module scope (unlike `consentStoreAdapter` above, which is
+ * a plain object literal, not gated): `storeReady()` reads a mutable module
+ * global (`pool` in store.ts) that `initStore()` sets AFTER this module is
+ * imported but BEFORE `buildMcpServer()` is called — evaluating it here at
+ * import time would freeze the gate to `false` forever. `buildMcpServer`
+ * below re-checks `storeReady()` at call time instead, same discipline as
+ * `consentStore: storeReady() ? … : null` right next to it.
+ */
+export function makeCheckAutomationKey(): ((key: string) => Promise<{ ok: boolean; channel?: string }>) | undefined {
+  return storeReady() ? (key: string) => checkAutomationKeyFor("gmail", automationWindowStoreAdapter, key) : undefined;
+}
+
 export function buildMcpServer(user: User): McpServer {
   const clients = buildUserClients(user);
   const accountsHint = clients.multi
@@ -179,6 +200,7 @@ export function buildMcpServer(user: User): McpServer {
     consentCfg: consentServerConfig,
     auditStore: storeReady() ? auditStoreAdapter : null,
     tg: tgApprovalGate,
+    checkAutomationKey: makeCheckAutomationKey(),
   };
   registerAccountTools(server, clients);
   registerGmailTools(server, clients, snoozeCtx);

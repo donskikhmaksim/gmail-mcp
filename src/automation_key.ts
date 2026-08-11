@@ -16,7 +16,7 @@
  * бесплатно (ТЗ, раздел "gmail-mcp — интерактивный флоу", п.3).
  */
 
-import { randomBytes, createHash } from "node:crypto";
+import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
 import { fetch as undiciFetch } from "undici";
 import type { TgApprovalConfig, AutomationKeyConfig } from "./config.js";
 
@@ -342,6 +342,58 @@ export async function generateAndDeliverKey(
     scheduleMessageDelete(cfg, chatId, sentMessageId);
   }
   return { windowId, scope };
+}
+
+// ───────────────────── Проверка (consent-гейт, requireConsent) ─────────────
+// docs/TZ_automation_key_consent_gate.md — `checkAutomationKey` DI, которую
+// server.ts инжектирует в КАЖДЫЙ вызов `requireConsent`. gmail-mcp не держит
+// статического `AUTOMATION_KEY` (в отличие от того, что допускает ТЗ для
+// других 4 сервисов) — единственный канал здесь "window": активное окно в
+// `tg_automation_windows`, чей scope покрывает "gmail". Переиспользует УЖЕ
+// существующие `AutomationWindowStore.listActiveWindows` (та же функция, что
+// использует `/automation_key list`) — не заводит нового SQL/подключения.
+
+/** true, если `scope` окна покрывает конкретный сервис ("all" — все сразу,
+ * иначе csv из `AUTOMATION_SERVICES`, тот же формат, что пишет `maskToScope`). */
+export function scopeCoversService(scope: string, service: AutomationService): boolean {
+  if (scope === "all") return true;
+  return scope
+    .split(",")
+    .map((s) => s.trim())
+    .includes(service);
+}
+
+/** Константное по времени сравнение двух sha256-hex-строк ОДИНАКОВОЙ длины
+ * (обе — 64 hex-символа, `timingSafeEqual` иначе бросает на разной длине). */
+function hashesEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
+}
+
+/**
+ * `checkAutomationKey` для одного сервиса (здесь — "gmail"): сравнивает
+ * присланный сырой ключ с хэшем каждого АКТИВНОГО окна (`revoked_at IS NULL
+ * AND (expires_at IS NULL OR expires_at > now)` — уже гарантировано
+ * `listActiveWindows`), константным временем, и проверяет, что scope окна
+ * покрывает `service`. Первое совпадение — канал `"window"`. Ни одно — не
+ * ошибка, просто `{ ok: false }` (вызывающий `requireConsent` тихо падает на
+ * обычный человеческий путь).
+ */
+export async function checkAutomationKeyFor(
+  service: AutomationService,
+  store: AutomationWindowStore,
+  key: string,
+  now: () => number = Date.now,
+): Promise<{ ok: boolean; channel?: string }> {
+  if (!key) return { ok: false };
+  const keyHash = sha256Hex(key);
+  const windows = await store.listActiveWindows(now());
+  for (const w of windows) {
+    if (hashesEqual(w.tokenHash, keyHash) && scopeCoversService(w.scope, service)) {
+      return { ok: true, channel: "window" };
+    }
+  }
+  return { ok: false };
 }
 
 // ───────────────────────── Список / текст ───────────────────────────────────
