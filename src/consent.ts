@@ -23,9 +23,13 @@
  * это компромисс. Целевая миграция: как только claude.ai получит form-mode
  * elicitation — брать подтверждение оттуда вместо `user_reply`, без смены сигнатур.
  *
- * automation_key-ветка (легальный обход для headless-автоматов) СОЗНАТЕЛЬНО не
- * реализована в этой версии: пре-чек потребителей не нашёл автоматов, зовущих
- * инструменты отправки напрямую (YAGNI). Единственный вход доверия — `user_reply`.
+ * automation_key-ветка (легальный обход для headless-автоматов, docs/
+ * TZ_automation_key_consent_gate.md): валидный `automationKey` + подключённый
+ * DI `checkAutomationKey` строит план, проверяет batch-кап и binding (rehash)
+ * ТЕМ ЖЕ путём, что и обычное исполнение, и исполняет немедленно — без
+ * `manifest_id`/`user_reply`. Невалидный ключ или отсутствующий DI —
+ * ПОБАЙТОВЫЙ fallthrough на обычный человеческий путь ниже (не ошибка, не
+ * подсказка модели, что параметр вообще существует).
  */
 
 import { createHash, randomUUID } from "node:crypto";
@@ -250,6 +254,21 @@ export interface RequireConsentParams<T = unknown> {
    * задействуется.
    */
   tg?: TgApprovalGate;
+  /**
+   * Automation_key, присланный вызывающим (headless-автоматика). undefined/""
+   * — обычный человеческий путь, ничего не меняется (docs/
+   * TZ_automation_key_consent_gate.md раздел «Что менять — consent.ts»).
+   */
+  automationKey?: string;
+  /**
+   * DI: проверяет ключ на предмет "покрывает ли он МЕНЯ (этот сервис) прямо
+   * сейчас". Undefined ⇒ ветка automation_key целиком выключена — побайтовое
+   * поведение как раньше. Конкретная реализация (сравнение со статическим
+   * `AUTOMATION_KEY` + поиск в `tg_automation_windows`) живёт в
+   * `automation_key.ts`/`store.ts` каждого сервера — этот модуль её не
+   * импортирует (та же DI-дисциплина, что у `ConsentStore`/`TgApprovalGate`).
+   */
+  checkAutomationKey?: (key: string) => Promise<{ ok: boolean; channel?: string }>;
 }
 
 /** Размеченный union исхода. Отказы — здесь, НЕ через throw. */
@@ -530,7 +549,16 @@ export async function requireConsent<T = unknown>(
     header: string,
     body: string,
     checks: Record<string, string>,
-    opts?: { manifestId?: string; objectHash?: string; outcome?: "refused" | "invalidated"; reason?: string },
+    opts?: {
+      manifestId?: string;
+      objectHash?: string;
+      outcome?: "refused" | "invalidated";
+      reason?: string;
+      /** По умолчанию "human" (обычный путь). automation-ветка ниже передаёт
+       * "automation", чтобы отказ по batch-капу/binding честно отражал, кто
+       * его вызвал, а не подделывался под человеческий путь. */
+      actor?: string;
+    },
   ): Promise<ConsentDecision<T>> => {
     await store.appendConsentAudit({
       id: randomUUID(),
@@ -544,10 +572,66 @@ export async function requireConsent<T = unknown>(
       checks,
       outcome: opts?.outcome ?? "refused",
       refusalReason: opts?.reason ?? header,
-      actor: "human",
+      actor: opts?.actor ?? "human",
     });
     return { kind: "refused", result: renderRefusal(header, body) };
   };
+
+  // ───── AUTOMATION_KEY-ветка (headless-автоматика) ─────
+  // ДО проверки hasId!==hasReply (ниже) — этот путь не участвует в
+  // человеческой двухфазной паре id/reply вообще, у него нет манифеста.
+  // `checkAutomationKey` не задан (сервер его не подключил) ⇒ ветка целиком
+  // не существует, поведение ниже побайтово как до этой правки.
+  if (p.automationKey && p.checkAutomationKey) {
+    const keyCheck = await p.checkAutomationKey(p.automationKey);
+    if (keyCheck.ok) {
+      const channel = keyCheck.channel ?? "unknown";
+      const built = await plan();
+      if (built.batchSize != null && built.batchSize > cfg.sendBatchMax) {
+        return refuse(
+          "Слишком большой батч",
+          `В плане ${built.batchSize} элементов — больше предела ${cfg.sendBatchMax}. ` +
+            "Разбей на несколько вызовов: один манифест = один радиус согласия.",
+          { batchCap: "exceeded", automationKey: channel },
+          { actor: "automation" },
+        );
+      }
+      // Binding — тот же принцип, что и в фазе исполнения ниже (4): даже
+      // автоматике нельзя исполнить план, для которого мир уже уехал между
+      // построением плана и этой же секундой (редкая, но реальная гонка).
+      const currentHash = await rehash(built.payload);
+      if (currentHash !== built.objectHash) {
+        return refuse(
+          "Состояние изменилось после планирования",
+          "Объекты, к которым относился план, изменились (получатель/содержимое " +
+            "«уехали»). Ради безопасности исполнение отклонено — построй план заново.",
+          { binding: "mismatch", automationKey: channel },
+          { actor: "automation" },
+        );
+      }
+      const auditId = randomUUID();
+      await store.appendConsentAudit({
+        id: auditId,
+        ts: now(),
+        server: cfg.server,
+        tool,
+        accountLabel,
+        manifestId: null,
+        objectHash: built.objectHash,
+        userReply: "",
+        checks: { automationKey: channel, binding: "ok" },
+        outcome: "confirmed",
+        actor: "automation",
+      });
+      // manifestId пустой — манифест в mcp_manifests/consent_manifests не
+      // создавался вовсе: это прямой путь plan→execute-в-одном-вызове, а не
+      // plan→ожидание человека.
+      return { kind: "confirmed", manifestId: "", payload: built.payload as T, auditId };
+    }
+    // Невалидный/просроченный/не-по-scope ключ — тихий fallthrough на обычный
+    // человеческий путь ниже. НЕ ошибка, НЕ подсказка, что параметр вообще
+    // проверялся — иначе модель могла бы перебирать значения.
+  }
 
   // Ровно один из пары задан — вызывающий перепутал фазу.
   if (hasId !== hasReply) {
