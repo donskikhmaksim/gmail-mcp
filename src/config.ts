@@ -602,6 +602,35 @@ export function loadExternalCatalogUrls(): ExternalCatalogUrls {
 }
 
 /**
+ * Базовые URL-ы соседей веб-хаба подтверждений (docs/TZ_consent_web_hub.md,
+ * часть 2) — те же четыре TS-сервиса, что в `ExternalCatalogUrls` выше,
+ * ПЛЮС `ticktick` (2026-08-12, задача владельца поверх исходного ТЗ, где
+ * ticktick был сознательно исключён — «в этом заходе не трогаем»; теперь
+ * ticktick-mcp реализовал ТОТ ЖЕ HTTP-контракт `/pending-consents` +
+ * `/pending-consents/decide`, см. его `ticktick_mcp/src/server.py`).
+ *
+ * НАМЕРЕННО отдельная функция/интерфейс, а НЕ добавление `ticktick` прямо в
+ * `ExternalCatalogUrls`: та карта используется ЕЩЁ и для мини-аппа каталога
+ * методов `automation-key` (`renderAutomationKeyMiniAppPage` в http.ts),
+ * где ticktick сознательно остаётся bare-service-чекбоксом без методов (см.
+ * докстринг `ExternalCatalogUrls` выше — этот инвариант этой правкой не
+ * трогается). Консент-хаб — независимая фича со своим собственным списком
+ * соседей; расширять его отдельно безопаснее, чем менять состав карты,
+ * которая используется другим потребителем.
+ */
+export interface ConsentHubNeighborUrls extends ExternalCatalogUrls {
+  ticktick: string;
+}
+
+export function loadConsentHubNeighborUrls(): ConsentHubNeighborUrls {
+  const defaultFor = (service: string) => `https://${service}-mcp-production.up.railway.app`;
+  return {
+    ...loadExternalCatalogUrls(),
+    ticktick: process.env.TICKTICK_MCP_URL?.trim() || defaultFor("ticktick"),
+  };
+}
+
+/**
  * Общий секрет веб-хаба подтверждений (docs/TZ_consent_web_hub.md часть 2):
  * ОДНА И ТА ЖЕ строка на всех 5 сервисах, авторизует `GET /pending-consents` +
  * `POST /pending-consents/decide` (заголовок `X-Consent-Hub-Secret`) и путь

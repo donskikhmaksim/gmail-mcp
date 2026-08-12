@@ -58,7 +58,7 @@ import { renderAutomationKeyMiniAppPage, verifyTelegramInitData } from "./automa
 import { tryAutoExecute } from "./consent.js";
 import { getAutoExecutor, type AutoExecutorCtx } from "./autoExecute.js";
 import { buildGatedToolsCatalog } from "./gated_tools_catalog.js";
-import { loadExternalCatalogUrls, loadConsentHubSecret } from "./config.js";
+import { loadExternalCatalogUrls, loadConsentHubNeighborUrls, loadConsentHubSecret } from "./config.js";
 import { fetch as undiciFetch } from "undici";
 
 const JSONRPC_UNAUTHORIZED = {
@@ -302,6 +302,13 @@ async function executeApprovedNow(config: Config, manifestId: string): Promise<v
  * один раз на модуль, тем же приёмом, что и `tgApprovalConfig`/`automationKeyConfig`
  * в server.ts (чистое чтение env, без побочных эффектов/бросков). */
 const externalCatalogUrls = loadExternalCatalogUrls();
+
+/** Соседи консент-хаба — externalCatalogUrls (4 TS-сервиса) + ticktick
+ * (2026-08-12, docs/TZ_consent_web_hub.md часть 2, задача владельца поверх
+ * исходного ТЗ). НЕ используется мини-аппом каталога методов automation_key
+ * (тот по-прежнему читает `externalCatalogUrls` выше без ticktick) — см.
+ * докстринг `loadConsentHubNeighborUrls` в config.ts. */
+const consentHubNeighborUrls = loadConsentHubNeighborUrls();
 
 // ═══════════════════════ Веб-хаб подтверждений (docs/TZ_consent_web_hub.md, часть 2) ═══════════════════════
 
@@ -914,16 +921,16 @@ export async function startHttpServer(config: Config): Promise<void> {
     res.status(outcome.status).json(outcome.body);
   });
 
-  // 3. GET /consent-hub-api/pending — агрегатор: свои + 4 соседа параллельно,
-  //    недоступность одного НЕ роняет остальных (та же деградация, что у
-  //    каталога методов мини-аппа).
+  // 3. GET /consent-hub-api/pending — агрегатор: свои + соседи (4 TS-сервиса +
+  //    ticktick) параллельно, недоступность одного НЕ роняет остальных (та же
+  //    деградация, что у каталога методов мини-аппа).
   app.get("/consent-hub-api/pending", async (req: Request, res: Response) => {
     if (!consentHubGuard(req, res)) return;
     if (!consentHubSecret) return; // недостижимо (guard уже проверил), для TS
     const ownItems = storeReady()
       ? (await listPendingConsents(consentServerConfig.server, Date.now())).map(summarizePendingManifest)
       : [];
-    const neighbors = Object.entries(externalCatalogUrls) as [string, string][];
+    const neighbors = Object.entries(consentHubNeighborUrls) as [string, string][];
     const results = await Promise.all(
       neighbors.map(([service, url]) => fetchNeighborPending(service, url, consentHubSecret!)),
     );
@@ -963,7 +970,7 @@ export async function startHttpServer(config: Config): Promise<void> {
       res.status(outcome.status).json(outcome.body);
       return;
     }
-    const neighborUrl = (externalCatalogUrls as unknown as Record<string, string>)[service];
+    const neighborUrl = (consentHubNeighborUrls as unknown as Record<string, string>)[service];
     if (!neighborUrl) {
       res.status(400).json({ ok: false, error: "unknown_service" });
       return;

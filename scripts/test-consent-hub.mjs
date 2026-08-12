@@ -38,6 +38,7 @@ const CAL_PORT = 34933;
 const DRIVE_PORT = 34934; // намеренно НЕ поднимается — тест 11 (деградация)
 const SHEETS_PORT = 34935;
 const DOCS_PORT = 34936;
+const TICKTICK_PORT = 34937; // 2026-08-12: ticktick — 5-й сосед хаба (Python, docs/TZ_consent_web_hub.md)
 const BASE = `http://${HOST}:${PORT}`;
 
 process.env.CONSENT_HUB_SECRET = SECRET;
@@ -46,9 +47,13 @@ process.env.CALENDAR_MCP_URL = `http://${HOST}:${CAL_PORT}`;
 process.env.DRIVE_MCP_URL = `http://${HOST}:${DRIVE_PORT}`;
 process.env.SHEETS_MCP_URL = `http://${HOST}:${SHEETS_PORT}`;
 process.env.DOCS_MCP_URL = `http://${HOST}:${DOCS_PORT}`;
+// Без этого loadConsentHubNeighborUrls() дефолтнул бы на реальный прод-домен
+// ticktick-mcp — живой сетевой вызов в тесте, недетерминированно и мимо
+// смысла теста (мы проверяем СВОЙ агрегатор, не чужой прод).
+process.env.TICKTICK_MCP_URL = `http://${HOST}:${TICKTICK_PORT}`;
 
 // ── Фейковые "соседние" сервисы — минимальный http.Server, без express ──────
-const neighborCalls = { calendar: [], sheets: [], docs: [] };
+const neighborCalls = { calendar: [], sheets: [], docs: [], ticktick: [] };
 
 function startNeighbor(name, port, { items }) {
   const server = http.createServer((req, res) => {
@@ -87,6 +92,9 @@ const docsServer = await startNeighbor("docs", DOCS_PORT, {
   items: [{ manifestId: "docs-1", tool: "docs_replace_text", title: "Заменить текст", summary: "Q3 отчёт", preview: "...", createdAt: Date.now(), expiresAt: Date.now() + 3_600_000, accountLabel: "work" }],
 });
 // drive НЕ поднимается — DRIVE_MCP_URL указывает в никуда, соединение отвалится по connection-refused.
+const ticktickServer = await startNeighbor("ticktick", TICKTICK_PORT, {
+  items: [{ manifestId: "tt-1", tool: "delete_tasks", title: "Удалить 2 задачи", summary: "Уборка проекта «X»", preview: "...", createdAt: Date.now(), expiresAt: Date.now() + 3_600_000, accountLabel: "default" }],
+});
 
 // ── Postgres: своя тестовая БД (тот же приём, что automation-key тесты) ─────
 const dbUrl = dbUrlRaw.includes("sslmode=") ? dbUrlRaw : `${dbUrlRaw}${dbUrlRaw.includes("?") ? "&" : "?"}sslmode=disable`;
@@ -224,6 +232,7 @@ console.log("\n[11] /consent-hub-api/pending: drive недоступен → о�
   check("calendar пункт присутствует (сосед жив)", r.json.items.some((i) => i.service === "calendar" && i.manifestId === "cal-1"), r.json.items);
   check("docs пункт присутствует (сосед жив)", r.json.items.some((i) => i.service === "docs" && i.manifestId === "docs-1"), r.json.items);
   check("drive пункты отсутствуют в items", !r.json.items.some((i) => i.service === "drive"), r.json.items);
+  check("ticktick пункт присутствует (2026-08-12: 5-й сосед, Python-сервис)", r.json.items.some((i) => i.service === "ticktick" && i.manifestId === "tt-1"), r.json.items);
   check("сервер добавил X-Consent-Hub-Secret запросу к calendar", neighborCalls.calendar.some((c) => c.secret === SECRET), neighborCalls.calendar);
 
   // без секрета — тоже 404, как и локальный /pending-consents.
@@ -270,6 +279,7 @@ console.log("\n[12] GET /consent-hub/<secret>: 200 html, разметка нес
 calServer.close();
 sheetsServer.close();
 docsServer.close();
+ticktickServer.close();
 await pool.end();
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
