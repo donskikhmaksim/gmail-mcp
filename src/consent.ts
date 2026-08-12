@@ -190,8 +190,28 @@ export interface ConsentConfig {
   minConsentGapMs: number;
   /** Кап размера батча одного манифеста (env SEND_BATCH_MAX, дефолт 10). */
   sendBatchMax: number;
+  /**
+   * Часть 1 (docs/TZ_consent_web_hub.md): сколько МС ждать синхронно, ПОСЛЕ
+   * построения плана и ДО возврата превью, прежде чем человек мог успеть
+   * подтвердить/отклонить манифест через внеполосный канал (веб-хаб,
+   * Telegram) — если успел, тул возвращает готовый результат ОДНИМ вызовом
+   * вместо превью. Env `CONSENT_SYNC_WAIT_MS`, дефолт 25000. `0` (или
+   * `undefined`, для старых вызывающих) ⇒ фича выключена целиком: ни одной
+   * лишней задержки, ни одного лишнего запроса к стору — побайтовая
+   * совместимость с поведением до Части 1.
+   */
+  syncWaitMs?: number;
+  /** Интервал опроса стора внутри окна `syncWaitMs`, мс. Env
+   * `CONSENT_SYNC_POLL_MS`, дефолт 1000. Не используется, если `syncWaitMs`
+   * не задан/равен 0. */
+  syncPollMs?: number;
   /** Инъекция часов (для тестов). Дефолт Date.now. */
   now?: () => number;
+}
+
+/** `await sleep(ms)` — единственное, что делает опрос между итерациями. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
@@ -698,6 +718,73 @@ export async function requireConsent<T = unknown>(
       previewBody =
         `${built.preview}\n\n_⏳ Запрос на подтверждение отправлен в Telegram — подтвердите кнопкой в ` +
         `боте, затем ответьте «да» здесь._`;
+    }
+
+    // ───── Часть 1 (docs/TZ_consent_web_hub.md): гибридное синхронное ожидание.
+    // ДО возврата превью опрашиваем СОБСТВЕННЫЙ стор — не решил ли человек этот
+    // манифест УЖЕ, пока строился план (внеполосно: веб-хаб/Telegram — ЛЮБОЙ
+    // канал, который меняет строку в consent_manifests). `syncWaitMs` не задан
+    // или 0 ⇒ ветка НЕ ВЫПОЛНЯЕТСЯ вовсе — ни одной лишней задержки, ни одного
+    // лишнего запроса к БД, поведение побайтово как до Части 1.
+    const syncWaitMs = cfg.syncWaitMs ?? 0;
+    if (syncWaitMs > 0) {
+      const syncPollMs = cfg.syncPollMs ?? 1000;
+      const deadline = now() + syncWaitMs;
+      let row: ConsentManifestRow | null = null;
+      while (now() < deadline) {
+        await sleep(syncPollMs);
+        row = await store.getManifest(id, cfg.server);
+        if (!row || row.status !== "AWAITING_CONSENT") break;
+      }
+
+      if (row && row.status === "DONE") {
+        // Решено ВНЕ этого вызова (веб-хаб/Telegram) — binding обязателен и
+        // здесь (ТЗ тест 5): план мог устареть даже за секунды ожидания.
+        const currentHash = await rehash(row.payload);
+        if (currentHash !== row.objectHash) {
+          return refuse(
+            "Состояние изменилось после планирования",
+            "Объекты, к которым относился план, изменились (получатель/содержимое " +
+              "«уехали»). Ради безопасности исполнение отклонено — построй план заново.",
+            { sync: "binding_mismatch" },
+            { manifestId: id, objectHash: row.objectHash },
+          );
+        }
+        const auditId = randomUUID();
+        await store.appendConsentAudit({
+          id: auditId,
+          ts: now(),
+          server: cfg.server,
+          tool,
+          accountLabel,
+          manifestId: id,
+          objectHash: row.objectHash,
+          userReply: row.userReply ?? "",
+          checks: { sync: "confirmed_externally", binding: "ok" },
+          outcome: "confirmed",
+          actor: "human",
+        });
+        return { kind: "confirmed", manifestId: id, payload: row.payload as T, auditId };
+      }
+
+      if (row && row.status === "INVALIDATED") {
+        // Отклонено вне этого вызова — аудит-строку уже записал тот канал
+        // (веб-хаб `decide reject`/Telegram); здесь только честный ответ
+        // модели, без повторной записи в аудит.
+        return {
+          kind: "refused",
+          result: renderRefusal(
+            "Отклонено пользователем",
+            `Пользователь отклонил план через другой канал (веб/Telegram)${
+              row.userReply ? ` («${inlineReply(row.userReply)}»)` : ""
+            }. План отменён, ничего не отправлено.`,
+          ),
+        };
+      }
+      // Дедлайн истёк, манифест всё ещё AWAITING_CONSENT (или пропал в редкой
+      // гонке) — НЕ ошибка и НЕ таймаут наружу: падаем в обычное превью ниже,
+      // асинхронный путь (Telegram/веб/следующий вызов модели) продолжает
+      // работать как раньше.
     }
 
     return { kind: "planned", manifestId: id, preview: renderPlanned(previewBody, id, expiresAt) };

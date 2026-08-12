@@ -360,5 +360,134 @@ console.log("\n[15] интеграция: «not sure» → НЕ confirmed; «о�
   check("«ну не знаю» манифест ЖИВ (AWAITING)", p3.store.manifests.get(id3).status === "AWAITING_CONSENT");
 }
 
+// ── 16. Часть 1 (docs/TZ_consent_web_hub.md): гибридное синхронное ожидание ──
+console.log("\n[16] sync-wait: syncWaitMs=0 → поведение побайтово как раньше");
+{
+  clock.t = 1_700_000_000_000;
+  const store = makeStore();
+  const dec = await requireConsent({ tool: "gmail_send", accountLabel: "work", plan, rehash, store, cfg: { ...cfg, syncWaitMs: 0 } });
+  check("kind=planned, ни одной задержки/доп.чтения", dec.kind === "planned");
+  check("манифест создан ровно один раз", store.manifests.size === 1);
+}
+
+console.log("\n[16] sync-wait: syncWaitMs не задан (undefined) → тоже выключено");
+{
+  clock.t = 1_700_000_000_000;
+  const store = makeStore();
+  const dec = await requireConsent({ tool: "gmail_send", accountLabel: "work", plan, rehash, store, cfg });
+  check("kind=planned", dec.kind === "planned");
+}
+
+console.log("\n[16.2] sync-wait: подтверждено «человеком» в середине окна → confirmed с первого вызова, БЕЗ превью");
+{
+  clock.t = 1_700_000_000_000;
+  const store = makeStore();
+  const syncCfg = { ...cfg, syncWaitMs: 5_000, syncPollMs: 1_000 };
+  let polls = 0;
+  const realGetManifest = store.getManifest.bind(store);
+  store.getManifest = async (id, server) => {
+    polls++;
+    // На 2-й итерации опроса симулируем внешнее подтверждение (веб-хаб
+    // decide-confirm, вызванный НЕЗАВИСИМО, — здесь напрямую consumeManifest,
+    // как это в проде делает decideOwnConfirm/tryAutoExecute).
+    if (polls === 2) {
+      await store.consumeManifest(id, server, "[веб-хаб: подтверждено]");
+    }
+    return realGetManifest(id, server);
+  };
+  const dec = await requireConsent({ tool: "gmail_send", accountLabel: "work", plan, rehash, store, cfg: syncCfg });
+  check("kind=confirmed", dec.kind === "confirmed", JSON.stringify(dec).slice(0, 100));
+  check("payload из манифеста", dec.kind === "confirmed" && canonicalJson(dec.payload) === canonicalJson(PAYLOAD));
+  check("мутация реально произошла (манифест DONE)", [...store.manifests.values()][0].status === "DONE");
+  check("аудит confirmed записан", store.audits.some((a) => a.outcome === "confirmed" && a.checks.sync === "confirmed_externally"));
+  check("опрошено больше одного раза (не сразу таймаут)", polls >= 2, polls);
+}
+
+console.log("\n[16.3] sync-wait: отклонено в окне → refused, мутации нет");
+{
+  clock.t = 1_700_000_000_000;
+  const store = makeStore();
+  const syncCfg = { ...cfg, syncWaitMs: 5_000, syncPollMs: 1_000 };
+  let polls = 0;
+  const realGetManifest = store.getManifest.bind(store);
+  store.getManifest = async (id, server) => {
+    polls++;
+    if (polls === 2) await store.invalidateManifest(id, server, "нет, не то письмо");
+    return realGetManifest(id, server);
+  };
+  const dec = await requireConsent({ tool: "gmail_send", accountLabel: "work", plan, rehash, store, cfg: syncCfg });
+  check("kind=refused", dec.kind === "refused", JSON.stringify(dec).slice(0, 100));
+  check("манифест INVALIDATED, не DONE", [...store.manifests.values()][0].status === "INVALIDATED");
+}
+
+console.log("\n[16.4] sync-wait: никто ничего не сделал за окно → обычное planned; второй вызов id+reply по-прежнему работает");
+{
+  clock.t = 1_700_000_000_000;
+  const store = makeStore();
+  const syncCfg = { ...cfg, syncWaitMs: 2_500, syncPollMs: 1_000 };
+  // Мок-часы не текут сами по себе (`now` читает `clock.t`, реальный
+  // `sleep()` внутри опроса на них не влияет) — двигаем `clock.t` на
+  // `syncPollMs` при каждом опросе, как если бы время шло синхронно со сном,
+  // чтобы дедлайн окна реально наступил и цикл не завис.
+  const realGetManifest = store.getManifest.bind(store);
+  store.getManifest = async (id, server) => {
+    clock.t += syncCfg.syncPollMs;
+    return realGetManifest(id, server);
+  };
+  const dec = await requireConsent({ tool: "gmail_send", accountLabel: "work", plan, rehash, store, cfg: syncCfg });
+  check("kind=planned (таймаут окна)", dec.kind === "planned", JSON.stringify(dec).slice(0, 100));
+  check("манифест всё ещё AWAITING_CONSENT", [...store.manifests.values()][0].status === "AWAITING_CONSENT");
+  // Регресс: обычный второй вызов с manifest_id+user_reply исполняет как раньше.
+  store.getManifest = realGetManifest;
+  const id = dec.manifestId;
+  clock.t += cfg.minConsentGapMs + 1_000;
+  const dec2 = await requireConsent({ tool: "gmail_send", accountLabel: "work", manifestId: id, userReply: "да", plan, rehash, store, cfg: syncCfg });
+  check("второй вызов confirmed (регресс не сломан)", dec2.kind === "confirmed", dec2.kind);
+}
+
+console.log("\n[16.5] sync-wait + binding: currentHash≠objectHash на sync-пути → отказ, не тихое исполнение");
+{
+  clock.t = 1_700_000_000_000;
+  const store = makeStore();
+  const syncCfg = { ...cfg, syncWaitMs: 5_000, syncPollMs: 1_000 };
+  let polls = 0;
+  const realGetManifest = store.getManifest.bind(store);
+  store.getManifest = async (id, server) => {
+    polls++;
+    if (polls === 2) await store.consumeManifest(id, server, "[веб-хаб: подтверждено]");
+    return realGetManifest(id, server);
+  };
+  const changedRehash = () => sha256({ changed: true });
+  const dec = await requireConsent({ tool: "gmail_send", accountLabel: "work", plan, rehash: changedRehash, store, cfg: syncCfg });
+  check("kind=refused (состояние изменилось)", dec.kind === "refused" && dec.result.includes("изменилось"), JSON.stringify(dec).slice(0, 100));
+}
+
+console.log("\n[16.6] automation_key + sync одновременно: валидный ключ исполняет СРАЗУ, ни одной итерации опроса");
+{
+  clock.t = 1_700_000_000_000;
+  const store = makeStore();
+  const syncCfg = { ...cfg, syncWaitMs: 25_000, syncPollMs: 1_000 };
+  let getManifestCalls = 0;
+  const realGetManifest = store.getManifest.bind(store);
+  store.getManifest = async (...args) => {
+    getManifestCalls++;
+    return realGetManifest(...args);
+  };
+  const checkAutomationKey = async () => ({ ok: true, channel: "window" });
+  const dec = await requireConsent({
+    tool: "gmail_send",
+    accountLabel: "work",
+    plan,
+    rehash,
+    store,
+    cfg: syncCfg,
+    automationKey: "valid-key",
+    checkAutomationKey,
+  });
+  check("kind=confirmed немедленно (automation_key)", dec.kind === "confirmed", dec.kind);
+  check("manifestId пуст (automation_key-путь не создаёт манифест)", dec.kind === "confirmed" && dec.manifestId === "");
+  check("getManifest НИ РАЗУ не вызван (до опроса дело не дошло)", getManifestCalls === 0, getManifestCalls);
+}
+
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);

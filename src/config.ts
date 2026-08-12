@@ -343,11 +343,32 @@ export interface ConsentGateConfig {
    * (plan §0.2/[R:полнота-7]); over the cap, the tool refuses with "split it
    * up" instead of creating a manifest. Env SEND_BATCH_MAX, default 10. */
   sendBatchMax: number;
+  /**
+   * Часть 1 гибридного веб-хаба (docs/TZ_consent_web_hub.md): сколько мс
+   * `requireConsent` синхронно ждёт/опрашивает свой стор ПОСЛЕ построения
+   * плана, ДО возврата превью — если человек успел подтвердить/отклонить
+   * манифест внеполосно (веб-хаб/Telegram) в это окно, тул возвращает готовый
+   * результат ОДНИМ вызовом. Env `CONSENT_SYNC_WAIT_MS`, дефолт 25000 (25с —
+   * с запасом под типовой ~60с таймаут MCP-клиента). `0` ⇒ фича выключена
+   * целиком, побайтовая совместимость с поведением до Части 1.
+   */
+  syncWaitMs: number;
+  /** Интервал опроса внутри окна `syncWaitMs`, мс. Env `CONSENT_SYNC_POLL_MS`,
+   * дефолт 1000. */
+  syncPollMs: number;
 }
 
 function positiveIntEnv(name: string, fallback: number): number {
   const raw = Number(process.env[name]);
   return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
+/** Как `positiveIntEnv`, но допускает 0 (нужно `CONSENT_SYNC_WAIT_MS=0`, чтобы
+ * ЯВНО выключить синхронное ожидание — `positiveIntEnv` не годится: раз 0 не
+ * `> 0`, оно бы тихо откатилось на дефолт вместо того, чтобы выключить фичу). */
+function nonNegativeIntEnv(name: string, fallback: number): number {
+  const raw = Number(process.env[name]);
+  return Number.isFinite(raw) && raw >= 0 ? raw : fallback;
 }
 
 export function loadConsentGateConfig(): ConsentGateConfig {
@@ -356,6 +377,8 @@ export function loadConsentGateConfig(): ConsentGateConfig {
     consentTtlMs: positiveIntEnv("CONSENT_TTL_MS", 3_600_000),
     minConsentGapMs: positiveIntEnv("MIN_CONSENT_GAP_MS", 10_000),
     sendBatchMax: positiveIntEnv("SEND_BATCH_MAX", 10),
+    syncWaitMs: nonNegativeIntEnv("CONSENT_SYNC_WAIT_MS", 25_000),
+    syncPollMs: positiveIntEnv("CONSENT_SYNC_POLL_MS", 1_000),
   };
 }
 
@@ -576,6 +599,18 @@ export function loadExternalCatalogUrls(): ExternalCatalogUrls {
     sheets: process.env.SHEETS_MCP_URL?.trim() || defaultFor("sheets"),
     docs: process.env.DOCS_MCP_URL?.trim() || defaultFor("docs"),
   };
+}
+
+/**
+ * Общий секрет веб-хаба подтверждений (docs/TZ_consent_web_hub.md часть 2):
+ * ОДНА И ТА ЖЕ строка на всех 5 сервисах, авторизует `GET /pending-consents` +
+ * `POST /pending-consents/decide` (заголовок `X-Consent-Hub-Secret`) и путь
+ * страницы хаба `GET /consent-hub/<secret>` в gmail-mcp. Env
+ * `CONSENT_HUB_SECRET`. Не задан ⇒ `undefined` — оба роута отвечают 404
+ * (fail-closed по умолчанию, та же дисциплина, что у `DASHBOARD_SECRET`).
+ */
+export function loadConsentHubSecret(): string | undefined {
+  return process.env.CONSENT_HUB_SECRET?.trim() || undefined;
 }
 
 export function loadConfig(): Config {
