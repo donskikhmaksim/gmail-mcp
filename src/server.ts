@@ -34,6 +34,7 @@ import {
   listAllAutomationWindows,
   getAutomationWindow,
   revokeAutomationWindow,
+  updateAutomationWindowScope,
 } from "./store.js";
 
 /** Adapts store.ts's module functions to the shape gmail.ts's tools expect.
@@ -156,6 +157,7 @@ export const automationWindowStoreAdapter: AutomationWindowStore = {
   listAllWindows: listAllAutomationWindows,
   getWindow: getAutomationWindow,
   revokeWindow: revokeAutomationWindow,
+  updateScope: updateAutomationWindowScope,
 };
 
 /**

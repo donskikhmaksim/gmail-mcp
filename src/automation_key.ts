@@ -16,7 +16,7 @@
  * бесплатно (ТЗ, раздел "gmail-mcp — интерактивный флоу", п.3).
  */
 
-import { randomBytes, createHash, timingSafeEqual, pbkdf2Sync, createCipheriv } from "node:crypto";
+import { randomBytes, createHash, timingSafeEqual, pbkdf2Sync, createCipheriv, createDecipheriv } from "node:crypto";
 import { fetch as undiciFetch } from "undici";
 import type { TgApprovalConfig, AutomationKeyConfig } from "./config.js";
 
@@ -117,6 +117,32 @@ function encryptForNote(plaintext: string, keyB64Url: string): { v: 1; iv: strin
 }
 
 /**
+ * Обратная операция `encryptForNote()` — расшифровывает JSON-сериализованный
+ * payload той же формы (`{v,iv,data,salt,iter,pw}`) ключом `keyB64Url`.
+ * Используется ровно в одном месте: `reissueNoteForWindow` ниже, чтобы
+ * достать `rawToken` обратно из `AutomationWindowRow.tokenEncrypted` (столбец
+ * `token_encrypted`) ключом `AutomationKeyConfig.masterSecret`. Кидает
+ * исключение на битом payload/неверном ключе (auth tag не сойдётся) —
+ * вызывающий код (`reissueNoteForWindow`) ловит это сам и превращает в
+ * понятный отказ, не 500-ю ошибку наружу.
+ */
+function decryptStored(payloadJson: string, keyB64Url: string): string {
+  const payload = JSON.parse(payloadJson) as { iv: string; data: string; salt: string; iter: number };
+  const urlKey = Buffer.from(keyB64Url, "base64url");
+  if (urlKey.length !== NOTE_KEY_BYTES) throw new Error("invalid key length");
+
+  const salt = Buffer.from(payload.salt, "base64");
+  const key = pbkdf2Sync(urlKey, salt, payload.iter, NOTE_KEY_BYTES, "sha256");
+  const iv = Buffer.from(payload.iv, "base64");
+  const dataAndTag = Buffer.from(payload.data, "base64");
+  const tag = dataAndTag.subarray(dataAndTag.length - 16);
+  const encrypted = dataAndTag.subarray(0, dataAndTag.length - 16);
+  const decipher = createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
+}
+
+/**
  * Шифрует `plaintext` свежим одноразовым ключом, создаёт one-view-заметку на
  * self-destroyed-notes (публичный, без авторизации на создание — см. ТЗ) и
  * возвращает готовую ссылку `.../#/n/<id>/<key>`. Кидает исключение при
@@ -190,6 +216,19 @@ export interface AutomationWindowRow {
   expiresAt: number | null;
   revokedAt: number | null;
   createdByChat: string;
+  /**
+   * Сырой токен, зашифрованный `AutomationKeyConfig.masterSecret` (JSON
+   * `{v,iv,data,salt,iter,pw}`, та же форма, что уже уходит на
+   * self-destroyed-notes) — существует ТОЛЬКО чтобы `reissueNoteForWindow`
+   * могла перевыпустить self-destruct-заметку для уже созданного окна.
+   * `null`, если мастер-секрет не был задан в момент создания этого окна
+   * (переменная отсутствовала/невалидна на тот момент) — окна, выпущенные до
+   * появления этой возможности, тоже остаются с `null` здесь навсегда,
+   * задним числом ничего не мигрируется. Нигде, кроме `reissueNoteForWindow`,
+   * не читается — проверка предъявленного ключа (`checkAutomationKeyFor`)
+   * по-прежнему идёт исключительно через `tokenHash`.
+   */
+  tokenEncrypted: string | null;
 }
 
 export interface AutomationWindowStore {
@@ -201,6 +240,8 @@ export interface AutomationWindowStore {
     createdAt: number;
     expiresAt: number | null;
     createdByChat: string;
+    /** `undefined`/`null` — не пишем (мастер-секрет не задан, фича выключена). */
+    tokenEncrypted?: string | null;
   }): Promise<void>;
   listActiveWindows(nowMs: number): Promise<AutomationWindowRow[]>;
   /** ВСЕ когда-либо выданные окна (активные + истёкшие + отозванные), самые
@@ -210,6 +251,12 @@ export interface AutomationWindowStore {
   getWindow(windowId: string): Promise<AutomationWindowRow | null>;
   /** true = действительно отозвано сейчас; false = не найдено ИЛИ уже было отозвано. */
   revokeWindow(windowId: string, nowMs: number): Promise<boolean>;
+  /** Меняет scope существующего окна на месте (не трогает revoked_at/expires_at/
+   * token_hash/token_encrypted). Не проверяет само по себе, отозвано ли окно
+   * или истёк ли срок — вызывающий код (мини-апп-менеджер) показывает кнопку
+   * смены доступа только у активных окон, но это UI-решение, не гарантия
+   * стора. true = строка найдена и обновлена; false = windowId не существует. */
+  updateScope(windowId: string, scope: string): Promise<boolean>;
 }
 
 // ───────────────────────── Каноническая модель сервисов ────────────────────
@@ -400,9 +447,10 @@ function scheduleMessageDelete(cfg: TgApprovalConfig, chatId: string, messageId:
  * labels.md раздел 1); иначе окно живёт `durationMs` от текущего момента.
  * Оба вызывающих кода (кнопочный `ak:gen:<mask>:<idx>` и мини-апп) обязаны
  * передать его явно — здесь нет тихого дефолта на случай кривого ввода
- * (`akCfg` больше не подставляет `ttlMs` сама; параметр оставлен ради
- * стабильности сигнатуры/на случай будущих server-wide настроек, но сейчас
- * не используется).
+ * (`akCfg.ttlMs` больше не подставляется тихо). `akCfg.masterSecret` — если
+ * задан, `rawToken` дополнительно шифруется им и сохраняется в
+ * `token_encrypted` (см. doc-comment `AutomationWindowRow.tokenEncrypted`
+ * выше) — единственное новое использование `akCfg` здесь.
  *
  * `label` — необязательное название ключа (`null` = без названия). Раздел 2
  * ТЗ: в боте ВСЕГДА `null` (свободный текст туда сознательно не подключён в
@@ -432,7 +480,6 @@ export async function generateAndDeliverKey(
   label: string | null = null,
   now: () => number = Date.now,
 ): Promise<{ windowId: string; scope: string; noteLink: string | null } | null> {
-  void akCfg; // см. doc-comment выше — срок больше не берётся отсюда
   if (mask === 0) return null;
 
   const scope = maskToScope(mask);
@@ -440,6 +487,19 @@ export async function generateAndDeliverKey(
   const windowId = generateWindowId();
   const nowMs = now();
   const expiresAt = durationMs === null ? null : nowMs + durationMs;
+
+  // Шифрованное хранение (docs секции про token_encrypted выше в этом файле)
+  // — строго опциональная, fail-closed фича: без `akCfg.masterSecret`
+  // `tokenEncrypted` остаётся `null`, окно создаётся ровно как раньше.
+  let tokenEncrypted: string | null = null;
+  if (akCfg.masterSecret) {
+    try {
+      tokenEncrypted = JSON.stringify(encryptForNote(rawToken, akCfg.masterSecret));
+    } catch (err) {
+      console.error(`automation_key: не удалось зашифровать токен для хранения (окно #${windowId}), token_encrypted останется NULL:`, err);
+    }
+  }
+
   await store.createWindow({
     windowId,
     tokenHash: sha256Hex(rawToken),
@@ -448,6 +508,7 @@ export async function generateAndDeliverKey(
     createdAt: nowMs,
     expiresAt,
     createdByChat: chatId,
+    tokenEncrypted,
   });
 
   const untilLine = expiresAt === null ? "До: бессрочно" : `До: ${formatLaTime(expiresAt)}`;
@@ -476,6 +537,66 @@ export async function generateAndDeliverKey(
     scheduleMessageDelete(cfg, chatId, sentMessageId);
   }
   return { windowId, scope, noteLink };
+}
+
+// ───────────────────── Перевыпуск заметки для уже созданного окна ──────────
+// Возможность 2 задачи «менеджер ключей»: сырой токен нигде не хранится в
+// открытом виде — единственный способ выдать ЕЩЁ ОДНУ self-destruct-заметку
+// для уже созданного окна — расшифровать `token_encrypted` мастер-секретом
+// (см. `AutomationKeyConfig.masterSecret`, `AutomationWindowRow.tokenEncrypted`
+// выше) и собрать ту же инструктивную заметку заново. Не отправляет ничего в
+// чат сама (в отличие от `generateAndDeliverKey`) — только возвращает ссылку,
+// вызывающий код (`http.ts`'s `/automation-key-app/reissue-note`) отдаёт её
+// прямо на страницу мини-аппа, откуда она и была запрошена.
+
+export type ReissueFailureReason =
+  | "window_not_found"
+  | "window_revoked"
+  | "window_expired"
+  | "no_stored_token"
+  | "master_secret_not_configured"
+  | "decrypt_failed"
+  | "note_service_unavailable";
+
+export async function reissueNoteForWindow(
+  akCfg: AutomationKeyConfig,
+  store: AutomationWindowStore,
+  windowId: string,
+  now: () => number = Date.now,
+): Promise<{ ok: true; noteLink: string } | { ok: false; reason: ReissueFailureReason }> {
+  const w = await store.getWindow(windowId);
+  if (!w) return { ok: false, reason: "window_not_found" };
+  if (w.revokedAt !== null) return { ok: false, reason: "window_revoked" };
+  const nowMs = now();
+  if (w.expiresAt !== null && w.expiresAt <= nowMs) return { ok: false, reason: "window_expired" };
+  if (!akCfg.masterSecret) return { ok: false, reason: "master_secret_not_configured" };
+  // Проверяем масштаб фичи ПОСЛЕ мастер-секрета намеренно: "фича вообще не
+  // включена" — более честная причина отказа, чем "у этого конкретного окна
+  // нет сохранённого токена", даже если оба условия истинны одновременно.
+  if (!w.tokenEncrypted) return { ok: false, reason: "no_stored_token" };
+
+  let rawToken: string;
+  try {
+    rawToken = decryptStored(w.tokenEncrypted, akCfg.masterSecret);
+  } catch (err) {
+    console.error(`automation_key: не удалось расшифровать token_encrypted при перевыпуске (окно #${windowId}):`, err);
+    return { ok: false, reason: "decrypt_failed" };
+  }
+
+  // `mask` нужен только чтобы собрать ТОТ ЖЕ человекочитаемый список сервисов
+  // в тексте заметки (`buildNoteInstructions`), что и при первой выдаче —
+  // `w.scope` уже канонический ("all" или csv из AUTOMATION_SERVICES), так что
+  // просто разбираем его обратно в маску тем же кодом, что принимает мини-апп.
+  const mask = w.scope === "all" ? ALL_MASK : servicesToMask(w.scope.split(","));
+  const untilLine = w.expiresAt === null ? "До: бессрочно" : `До: ${formatLaTime(w.expiresAt)}`;
+
+  try {
+    const noteLink = await createSecretNoteLink(buildNoteInstructions(rawToken, mask, untilLine));
+    return { ok: true, noteLink };
+  } catch (err) {
+    console.error(`automation_key: не удалось создать self-destruct-заметку при перевыпуске (окно #${windowId}):`, err);
+    return { ok: false, reason: "note_service_unavailable" };
+  }
 }
 
 // ───────────────────── Проверка (consent-гейт, requireConsent) ─────────────
@@ -534,17 +655,24 @@ export async function checkAutomationKeyFor(
 // Менеджер (docs/TZ_automation_key_duration_labels.md раздел 3) — показывает
 // ВСЕ когда-либо выданные окна, не только активные, со статусом у каждого.
 
-const LIST_LIMIT = 30;
+/** Экспортирована — `http.ts`'s `/automation-key-app/list` (менеджер в
+ * мини-аппе) показывает те же «последние N», что и текстовый `/automation_key
+ * list` в боте, один лимит на обе поверхности. */
+export const LIST_LIMIT = 30;
 
-type WindowStatus = "active" | "expired" | "revoked";
+export type WindowStatus = "active" | "expired" | "revoked";
 
-function windowStatus(w: AutomationWindowRow, nowMs: number): WindowStatus {
+/** Экспортирована для мини-апп-менеджера (`http.ts`'s `/automation-key-app/list`
+ * — та же логика вычисления статуса, что и текстовый `/automation_key list`
+ * в боте, один источник правды на оба поверхности). */
+export function windowStatus(w: AutomationWindowRow, nowMs: number): WindowStatus {
   if (w.revokedAt !== null) return "revoked";
   if (w.expiresAt !== null && w.expiresAt <= nowMs) return "expired";
   return "active";
 }
 
-function humanScope(scope: string): string {
+/** Экспортирована по той же причине, что и `windowStatus` выше. */
+export function humanScope(scope: string): string {
   return scope === "all" ? "все" : scope;
 }
 

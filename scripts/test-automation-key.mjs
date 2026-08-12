@@ -166,6 +166,12 @@ function makeStore() {
       w.revokedAt = nowMs;
       return true;
     },
+    async updateScope(windowId, scope) {
+      const w = windows.get(windowId);
+      if (!w) return false;
+      w.scope = scope;
+      return true;
+    },
   };
 }
 

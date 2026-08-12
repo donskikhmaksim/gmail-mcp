@@ -132,6 +132,12 @@ export function renderAutomationKeyMiniAppPage(): string {
     (svc) =>
       `<label class="row"><input type="checkbox" class="svc" value="${svc}"> ${escapeHtml(SERVICE_LABELS[svc] ?? svc)}</label>`,
   ).join("\n      ");
+  // Тот же список сервисов доступен клиентскому JS как массив/словарь — не
+  // задваивает разметку чекбоксов сервером, модалка «Изменить доступ» (второй
+  // таб) строит СВОИ чекбоксы динамически этим же списком (переиспользует
+  // разметку/стили `.row`/`.svc`, не копирует HTML вручную).
+  const servicesJson = JSON.stringify(AUTOMATION_SERVICES);
+  const serviceLabelsJson = JSON.stringify(SERVICE_LABELS);
 
   return `<!doctype html>
 <html>
@@ -172,6 +178,17 @@ export function renderAutomationKeyMiniAppPage(): string {
     color: var(--tg-theme-button-text-color, #ffffff);
   }
   button:disabled { opacity: .5; }
+  button.secondary {
+    background: var(--tg-theme-secondary-bg-color, #f2f2f2);
+    color: var(--tg-theme-text-color, #000000);
+  }
+  button.small {
+    width: auto;
+    padding: 6px 10px;
+    font-size: 13px;
+    font-weight: 500;
+  }
+  button.danger { background: #d33; color: #fff; }
   #status { margin-top: 12px; font-size: 14px; color: var(--tg-theme-hint-color, #999); min-height: 1.2em; }
   .field-label { font-size: 13px; color: var(--tg-theme-hint-color, #999); margin: 0 0 6px; }
   .dur-row { display: flex; gap: 8px; margin-bottom: 8px; }
@@ -195,10 +212,64 @@ export function renderAutomationKeyMiniAppPage(): string {
     font-size: 15px;
     margin-bottom: 8px;
   }
+  .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+  .tab-btn {
+    flex: 1;
+    padding: 10px;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 600;
+    background: var(--tg-theme-secondary-bg-color, #f2f2f2);
+    color: var(--tg-theme-text-color, #000000);
+    opacity: .6;
+  }
+  .tab-btn.active {
+    background: var(--tg-theme-button-color, #2481cc);
+    color: var(--tg-theme-button-text-color, #ffffff);
+    opacity: 1;
+  }
+  .win-card {
+    padding: 12px;
+    margin-bottom: 10px;
+    border-radius: 10px;
+    background: var(--tg-theme-secondary-bg-color, #f2f2f2);
+  }
+  .win-title { font-size: 14px; font-weight: 600; margin-bottom: 4px; word-break: break-all; }
+  .win-meta { font-size: 13px; color: var(--tg-theme-hint-color, #999); margin-bottom: 8px; }
+  .win-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .win-actions button { width: auto; flex: 0 0 auto; }
+  .win-note-link { display: block; margin-top: 8px; word-break: break-all; font-size: 13px; color: var(--tg-theme-link-color, #2481cc); }
+  .empty-hint { font-size: 14px; color: var(--tg-theme-hint-color, #999); text-align: center; padding: 24px 0; }
+  .modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,.5);
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    z-index: 10;
+  }
+  .modal-content {
+    width: 100%;
+    max-width: 480px;
+    max-height: 85vh;
+    overflow-y: auto;
+    box-sizing: border-box;
+    padding: 16px;
+    border-radius: 16px 16px 0 0;
+    background: var(--tg-theme-bg-color, #ffffff);
+    color: var(--tg-theme-text-color, #000000);
+  }
 </style>
 </head>
 <body>
   <h1>automation_key</h1>
+  <div class="tabs">
+    <button class="tab-btn active" id="tabBtnGenerate">Выпустить</button>
+    <button class="tab-btn" id="tabBtnManage">Мои ключи</button>
+  </div>
+
+  <div id="tabGenerate">
   <div id="services">
       ${checkboxes}
   </div>
@@ -221,12 +292,42 @@ export function renderAutomationKeyMiniAppPage(): string {
   <div class="sep"></div>
   <button id="go" disabled>Получить ключ</button>
   <div id="status"></div>
+  </div>
+
+  <div id="tabManage" style="display:none">
+    <div id="manageStatus" class="field-label"></div>
+    <div id="windowList"></div>
+  </div>
+
+  <div id="editModal" class="modal" style="display:none">
+    <div class="modal-content">
+      <p class="field-label">Изменить доступ — <span id="editWindowLabel"></span></p>
+      <div id="editServices"></div>
+      <label class="row"><input type="checkbox" id="editAll"> Все сразу</label>
+      <div class="sep"></div>
+      <button id="editSave">Сохранить</button>
+      <button id="editCancel" class="secondary" style="margin-top:8px">Отмена</button>
+      <div id="editStatus" class="field-label"></div>
+    </div>
+  </div>
 
 <script>
 (function () {
   var tg = window.Telegram && window.Telegram.WebApp;
   if (tg) { tg.ready(); tg.expand(); }
 
+  var ALL_SERVICES = ${servicesJson};
+  var SERVICE_LABELS = ${serviceLabelsJson};
+
+  function initData() { return tg ? tg.initData : ""; }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  // ───────────────────────── Таб «Выпустить» (как раньше) ──────────────────
   var svcBoxes = Array.prototype.slice.call(document.querySelectorAll(".svc"));
   var allBox = document.getElementById("all");
   var goBtn = document.getElementById("go");
@@ -342,6 +443,271 @@ export function renderAutomationKeyMiniAppPage(): string {
   });
 
   refresh();
+
+  // ───────────────────────── Таб «Мои ключи» (менеджер) ─────────────────────
+  var tabBtnGenerate = document.getElementById("tabBtnGenerate");
+  var tabBtnManage = document.getElementById("tabBtnManage");
+  var tabGenerate = document.getElementById("tabGenerate");
+  var tabManage = document.getElementById("tabManage");
+  var manageStatusEl = document.getElementById("manageStatus");
+  var windowListEl = document.getElementById("windowList");
+  var manageLoadedOnce = false;
+
+  function showTab(name) {
+    var showGenerate = name === "generate";
+    tabGenerate.style.display = showGenerate ? "" : "none";
+    tabManage.style.display = showGenerate ? "none" : "";
+    tabBtnGenerate.className = "tab-btn" + (showGenerate ? " active" : "");
+    tabBtnManage.className = "tab-btn" + (showGenerate ? "" : " active");
+    if (!showGenerate) loadWindowList();
+  }
+  tabBtnGenerate.addEventListener("click", function () { showTab("generate"); });
+  tabBtnManage.addEventListener("click", function () { showTab("manage"); });
+
+  var STATUS_BADGE = {
+    active: "✅ активен",
+    expired: "⌛ истёк",
+    revoked: "🚫 отозван",
+  };
+
+  function formatWhen(ms) {
+    if (ms === null || ms === undefined) return "";
+    try {
+      return new Date(ms).toLocaleString("ru-RU", { timeZone: "America/Los_Angeles", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+    } catch (e) {
+      return new Date(ms).toISOString();
+    }
+  }
+
+  function windowCard(w) {
+    var card = document.createElement("div");
+    card.className = "win-card";
+
+    var title = document.createElement("div");
+    title.className = "win-title";
+    title.textContent = "#" + w.windowId + (w.label ? " · " + w.label : "");
+    card.appendChild(title);
+
+    var meta = document.createElement("div");
+    meta.className = "win-meta";
+    var statusText = STATUS_BADGE[w.status] || w.status;
+    var durationText = w.status === "revoked"
+      ? "отозван " + formatWhen(w.revokedAt)
+      : w.expiresAt === null
+        ? "♾ бессрочно"
+        : w.status === "expired"
+          ? "истёк " + formatWhen(w.expiresAt)
+          : "до " + formatWhen(w.expiresAt);
+    meta.textContent = w.scopeHuman + " · " + statusText + " · " + durationText;
+    card.appendChild(meta);
+
+    if (w.status === "active") {
+      var actions = document.createElement("div");
+      actions.className = "win-actions";
+
+      var revokeBtn = document.createElement("button");
+      revokeBtn.className = "small danger";
+      revokeBtn.textContent = "Отозвать";
+      revokeBtn.addEventListener("click", function () { revokeWindow(w.windowId, card); });
+      actions.appendChild(revokeBtn);
+
+      var editBtn = document.createElement("button");
+      editBtn.className = "small secondary";
+      editBtn.textContent = "Изменить доступ";
+      editBtn.addEventListener("click", function () { openEditModal(w); });
+      actions.appendChild(editBtn);
+
+      if (w.hasStoredToken) {
+        var reissueBtn = document.createElement("button");
+        reissueBtn.className = "small secondary";
+        reissueBtn.textContent = "Ещё раз показать";
+        reissueBtn.addEventListener("click", function () { reissueNote(w.windowId, card); });
+        actions.appendChild(reissueBtn);
+      }
+
+      card.appendChild(actions);
+    }
+
+    var noteArea = document.createElement("div");
+    noteArea.className = "win-note-area";
+    card.appendChild(noteArea);
+
+    return card;
+  }
+
+  function loadWindowList() {
+    manageStatusEl.textContent = "Загружаю...";
+    windowListEl.innerHTML = "";
+    fetch("/automation-key-app/list", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ initData: initData() }),
+    })
+      .then(function (res) {
+        if (!res.ok) return res.json().catch(function () { return {}; }).then(function (body) {
+          throw new Error(body && body.error ? body.error : ("HTTP " + res.status));
+        });
+        return res.json();
+      })
+      .then(function (data) {
+        manageLoadedOnce = true;
+        var windows = (data && data.windows) || [];
+        if (windows.length === 0) {
+          manageStatusEl.textContent = "";
+          var empty = document.createElement("div");
+          empty.className = "empty-hint";
+          empty.textContent = "Ключей ещё не выдавалось.";
+          windowListEl.appendChild(empty);
+          return;
+        }
+        manageStatusEl.textContent = data.total > windows.length
+          ? "Показаны последние " + windows.length + " из " + data.total
+          : "";
+        windows.forEach(function (w) { windowListEl.appendChild(windowCard(w)); });
+      })
+      .catch(function (err) {
+        manageStatusEl.textContent = "Ошибка: " + err.message;
+      });
+  }
+
+  function revokeWindow(windowId, card) {
+    if (!window.confirm("Отозвать окно #" + windowId + "?")) return;
+    fetch("/automation-key-app/revoke", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ initData: initData(), windowId: windowId }),
+    })
+      .then(function (res) { return res.json().then(function (body) { return { status: res.status, body: body }; }); })
+      .then(function (r) {
+        if (r.status !== 200 || !r.body.ok) throw new Error((r.body && r.body.error) || ("HTTP " + r.status));
+        loadWindowList();
+      })
+      .catch(function (err) {
+        var note = card.querySelector(".win-note-area");
+        note.textContent = "Ошибка отзыва: " + err.message;
+      });
+  }
+
+  var REISSUE_ERROR_TEXT = {
+    window_not_found: "окно не найдено",
+    window_revoked: "окно уже отозвано",
+    window_expired: "окно уже истекло",
+    no_stored_token: "для этого окна нет сохранённого ключа (выпущено до включения этой возможности или без настроенного мастер-секрета)",
+    master_secret_not_configured: "перевыпуск выключен — не задан AUTOMATION_KEY_MASTER_SECRET",
+    decrypt_failed: "не удалось расшифровать сохранённый ключ",
+    note_service_unavailable: "сервис self-destroyed-notes сейчас недоступен, попробуй ещё раз позже",
+  };
+
+  function reissueNote(windowId, card) {
+    var note = card.querySelector(".win-note-area");
+    note.textContent = "Готовлю ссылку...";
+    fetch("/automation-key-app/reissue-note", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ initData: initData(), windowId: windowId }),
+    })
+      .then(function (res) { return res.json().then(function (body) { return { status: res.status, body: body }; }); })
+      .then(function (r) {
+        if (r.status !== 200 || !r.body.ok) {
+          var reason = (r.body && r.body.error) || "";
+          throw new Error(REISSUE_ERROR_TEXT[reason] || reason || ("HTTP " + r.status));
+        }
+        note.innerHTML = "";
+        var p = document.createElement("div");
+        p.textContent = "Готово — одноразовая ссылка (действует час до первого клика):";
+        note.appendChild(p);
+        var link = document.createElement("a");
+        link.href = r.body.noteLink;
+        link.textContent = r.body.noteLink;
+        link.target = "_blank";
+        link.rel = "noopener";
+        link.className = "win-note-link";
+        note.appendChild(link);
+      })
+      .catch(function (err) {
+        note.textContent = "Ошибка: " + err.message;
+      });
+  }
+
+  // ── Модалка «Изменить доступ» ──
+  var editModal = document.getElementById("editModal");
+  var editServicesEl = document.getElementById("editServices");
+  var editAllBox = document.getElementById("editAll");
+  var editWindowLabel = document.getElementById("editWindowLabel");
+  var editSaveBtn = document.getElementById("editSave");
+  var editCancelBtn = document.getElementById("editCancel");
+  var editStatusEl = document.getElementById("editStatus");
+  var editWindowId = null;
+
+  function currentScopeServices(scope) {
+    if (scope === "all") return ALL_SERVICES.slice();
+    return scope.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+  }
+
+  function openEditModal(w) {
+    editWindowId = w.windowId;
+    editWindowLabel.textContent = "#" + w.windowId + (w.label ? " · " + w.label : "");
+    editStatusEl.textContent = "";
+    editServicesEl.innerHTML = "";
+    var checked = currentScopeServices(w.scope);
+    ALL_SERVICES.forEach(function (svc) {
+      var row = document.createElement("label");
+      row.className = "row";
+      var box = document.createElement("input");
+      box.type = "checkbox";
+      box.className = "edit-svc";
+      box.value = svc;
+      box.checked = checked.indexOf(svc) !== -1;
+      box.addEventListener("change", refreshEditAll);
+      row.appendChild(box);
+      row.appendChild(document.createTextNode(" " + (SERVICE_LABELS[svc] || svc)));
+      editServicesEl.appendChild(row);
+    });
+    refreshEditAll();
+    editModal.style.display = "flex";
+  }
+
+  function editSvcBoxes() { return Array.prototype.slice.call(document.querySelectorAll(".edit-svc")); }
+
+  function refreshEditAll() {
+    editAllBox.checked = editSvcBoxes().every(function (b) { return b.checked; });
+  }
+
+  editAllBox.addEventListener("change", function () {
+    editSvcBoxes().forEach(function (b) { b.checked = editAllBox.checked; });
+  });
+
+  editCancelBtn.addEventListener("click", function () {
+    editModal.style.display = "none";
+    editWindowId = null;
+  });
+
+  editSaveBtn.addEventListener("click", function () {
+    var services = editSvcBoxes().filter(function (b) { return b.checked; }).map(function (b) { return b.value; });
+    if (services.length === 0) {
+      editStatusEl.textContent = "Отметь хотя бы один сервис.";
+      return;
+    }
+    editSaveBtn.disabled = true;
+    editStatusEl.textContent = "Сохраняю...";
+    fetch("/automation-key-app/update-scope", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ initData: initData(), windowId: editWindowId, services: services }),
+    })
+      .then(function (res) { return res.json().then(function (body) { return { status: res.status, body: body }; }); })
+      .then(function (r) {
+        editSaveBtn.disabled = false;
+        if (r.status !== 200 || !r.body.ok) throw new Error((r.body && r.body.error) || ("HTTP " + r.status));
+        editModal.style.display = "none";
+        editWindowId = null;
+        loadWindowList();
+      })
+      .catch(function (err) {
+        editSaveBtn.disabled = false;
+        editStatusEl.textContent = "Ошибка: " + err.message;
+      });
+  });
 })();
 </script>
 </body>

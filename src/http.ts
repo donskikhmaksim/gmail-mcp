@@ -43,7 +43,12 @@ import {
   handleAutomationKeyCallback,
   generateAndDeliverKey,
   servicesToMask,
+  maskToScope,
   isValidDurationMs,
+  windowStatus,
+  humanScope,
+  reissueNoteForWindow,
+  LIST_LIMIT as AUTOMATION_KEY_LIST_LIMIT,
 } from "./automation_key.js";
 import { renderAutomationKeyMiniAppPage, verifyTelegramInitData } from "./automation_key_miniapp.js";
 import { tryAutoExecute } from "./consent.js";
@@ -483,6 +488,135 @@ export async function startHttpServer(config: Config): Promise<void> {
     // осознанное решение — см. финальный отчёт задачи, ТЗ раздел "Где
     // показывается" явно разрешает дублирование).
     res.json({ ok: true, noteLink: result.noteLink });
+  });
+
+  // ---- Менеджер ключей в мини-аппе (второй таб «Мои ключи») ----
+  // Три новых owner-only роута, ВСЕ проверяют initData тем же способом, что
+  // и /generate выше (не новый механизм авторизации). Общий хелпер вместо
+  // копипасты этой проверки в каждом роуте по отдельности.
+  function requireOwnerInitData(req: Request, res: Response): string | null {
+    const initData = typeof req.body?.initData === "string" ? req.body.initData : "";
+    const verified = verifyTelegramInitData(tgApprovalConfig.botToken, initData);
+    if (!verified.ok) {
+      res.status(403).json({ error: "invalid_init_data" });
+      return null;
+    }
+    if (verified.userId !== tgApprovalConfig.ownerChatId) {
+      res.status(403).json({ error: "forbidden" });
+      return null;
+    }
+    return verified.userId;
+  }
+
+  // Список ВСЕХ когда-либо выданных окон (docs п.1 задачи «менеджер ключей»)
+  // — та же выборка/лимит/логика статуса, что и текстовый `/automation_key
+  // list` в боте (`windowStatus`/`humanScope`, переиспользованы из
+  // automation_key.ts, не задублированы). `hasStoredToken` — единственный
+  // сигнал фронтенду, показывать ли кнопку «Ещё раз показать» у конкретного
+  // окна (истинно только если мастер-секрет БЫЛ задан на момент создания
+  // ИМЕННО этого окна — окна старше этой возможности его не имеют).
+  app.post("/automation-key-app/list", async (req: Request, res: Response) => {
+    if (!requireOwnerInitData(req, res)) return;
+    try {
+      const nowMs = Date.now();
+      const { windows, total } = await automationWindowStoreAdapter.listAllWindows(AUTOMATION_KEY_LIST_LIMIT);
+      res.json({
+        ok: true,
+        total,
+        windows: windows.map((w) => ({
+          windowId: w.windowId,
+          label: w.label,
+          scope: w.scope,
+          scopeHuman: humanScope(w.scope),
+          status: windowStatus(w, nowMs),
+          createdAt: w.createdAt,
+          expiresAt: w.expiresAt,
+          revokedAt: w.revokedAt,
+          hasStoredToken: w.tokenEncrypted !== null,
+        })),
+      });
+    } catch (err) {
+      console.error("automation-key-app/list error:", err);
+      res.status(500).json({ error: "internal" });
+    }
+  });
+
+  app.post("/automation-key-app/revoke", async (req: Request, res: Response) => {
+    if (!requireOwnerInitData(req, res)) return;
+    const windowId = typeof req.body?.windowId === "string" ? req.body.windowId : "";
+    if (!windowId) {
+      res.status(400).json({ error: "missing_window_id" });
+      return;
+    }
+    try {
+      const revoked = await automationWindowStoreAdapter.revokeWindow(windowId, Date.now());
+      res.json({ ok: true, revoked });
+    } catch (err) {
+      console.error("automation-key-app/revoke error:", err);
+      res.status(500).json({ error: "internal" });
+    }
+  });
+
+  // Перевыпуск self-destruct-заметки для уже созданного окна (возможность 2
+  // задачи «менеджер ключей») — расшифровывает `token_encrypted` мастер-
+  // секретом и собирает ту же инструктивную заметку заново
+  // (`reissueNoteForWindow`, automation_key.ts). Отказ — понятный 400 с
+  // машиночитаемым `error` (окно не найдено/отозвано/истекло/нет сохранённого
+  // токена/мастер-секрет не настроен/сбой self-destroyed-notes), НИКОГДА 500
+  // на предсказуемых причинах отказа — 500 остаётся только на неожиданное
+  // исключение.
+  app.post("/automation-key-app/reissue-note", async (req: Request, res: Response) => {
+    if (!requireOwnerInitData(req, res)) return;
+    const windowId = typeof req.body?.windowId === "string" ? req.body.windowId : "";
+    if (!windowId) {
+      res.status(400).json({ error: "missing_window_id" });
+      return;
+    }
+    try {
+      const result = await reissueNoteForWindow(automationKeyConfig, automationWindowStoreAdapter, windowId);
+      if (!result.ok) {
+        res.status(400).json({ error: result.reason });
+        return;
+      }
+      res.json({ ok: true, noteLink: result.noteLink });
+    } catch (err) {
+      console.error("automation-key-app/reissue-note error:", err);
+      res.status(500).json({ error: "internal" });
+    }
+  });
+
+  // Смена scope уже выпущенного окна (возможность 3 задачи «менеджер
+  // ключей») — тот же чекбокс-компонент, что и экран генерации, шлёт то же
+  // тело `{services: [...]}`, backend строит `scope` тем же
+  // `servicesToMask`/`maskToScope`, что и /generate (одна валидация на оба
+  // роута, не два расходящихся формата). Пустой выбор отклоняется тем же
+  // fail-closed принципом, что и генерация — нельзя случайно обнулить scope
+  // окна до "ничего не покрывает".
+  app.post("/automation-key-app/update-scope", async (req: Request, res: Response) => {
+    if (!requireOwnerInitData(req, res)) return;
+    const windowId = typeof req.body?.windowId === "string" ? req.body.windowId : "";
+    if (!windowId) {
+      res.status(400).json({ error: "missing_window_id" });
+      return;
+    }
+    const services = Array.isArray(req.body?.services) ? (req.body.services as unknown[]).filter((s) => typeof s === "string") : [];
+    const mask = servicesToMask(services as string[]);
+    if (mask === 0) {
+      res.status(400).json({ error: "empty_selection" });
+      return;
+    }
+    const scope = maskToScope(mask);
+    try {
+      const updated = await automationWindowStoreAdapter.updateScope(windowId, scope);
+      if (!updated) {
+        res.status(404).json({ error: "window_not_found" });
+        return;
+      }
+      res.json({ ok: true, scope });
+    } catch (err) {
+      console.error("automation-key-app/update-scope error:", err);
+      res.status(500).json({ error: "internal" });
+    }
   });
 
   initDownloads(config.onboarding.publicBaseUrl);

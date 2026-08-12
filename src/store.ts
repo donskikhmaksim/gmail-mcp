@@ -331,6 +331,13 @@ export async function ensureSchema(): Promise<void> {
   await p.query(
     `CREATE INDEX IF NOT EXISTS tg_automation_windows_scope_idx ON tg_automation_windows (revoked_at, expires_at)`,
   );
+  // Опциональное шифрованное хранение сырого токена (docs про
+  // AutomationKeyConfig.masterSecret/AutomationWindowRow.tokenEncrypted в
+  // automation_key.ts) — JSON-сериализованный payload той же формы, что уже
+  // уходит на self-destroyed-notes (`{v,iv,data,salt,iter,pw}`), NULL когда
+  // мастер-секрет не был задан на момент создания окна. Идемпотентно, тем же
+  // приёмом (`ADD COLUMN IF NOT EXISTS`), что и `scope` выше.
+  await p.query(`ALTER TABLE tg_automation_windows ADD COLUMN IF NOT EXISTS token_encrypted TEXT`);
 }
 
 // ---- Download links ----
@@ -1594,6 +1601,10 @@ export interface AutomationWindowRow {
   expiresAt: number | null;
   revokedAt: number | null;
   createdByChat: string;
+  /** JSON-сериализованный шифрованный `rawToken` (automation_key.ts's
+   * `AutomationWindowRow.tokenEncrypted` doc-comment) — `null` когда
+   * мастер-секрет не был задан на момент создания этого окна. */
+  tokenEncrypted: string | null;
 }
 
 function rowToAutomationWindow(row: {
@@ -1605,6 +1616,7 @@ function rowToAutomationWindow(row: {
   expires_at: string | number | null;
   revoked_at: string | number | null;
   created_by_chat: string;
+  token_encrypted?: string | null;
 }): AutomationWindowRow {
   return {
     windowId: row.window_id,
@@ -1615,12 +1627,14 @@ function rowToAutomationWindow(row: {
     expiresAt: row.expires_at === null ? null : Number(row.expires_at),
     revokedAt: row.revoked_at === null ? null : Number(row.revoked_at),
     createdByChat: row.created_by_chat,
+    tokenEncrypted: row.token_encrypted ?? null,
   };
 }
 
 /** Inserts a fresh window row. `windowId` is minted by the caller
  * (automation_key.ts — random, unguessable, e.g. `randomBytes(6).toString("hex")`).
- * `expiresAt: null` = бессрочно. */
+ * `expiresAt: null` = бессрочно. `tokenEncrypted` — `undefined`/`null` пишет
+ * NULL (мастер-секрет не задан, фича выключена — см. automation_key.ts). */
 export async function createAutomationWindow(input: {
   windowId: string;
   tokenHash: string;
@@ -1629,13 +1643,23 @@ export async function createAutomationWindow(input: {
   createdAt: number;
   expiresAt: number | null;
   createdByChat: string;
+  tokenEncrypted?: string | null;
 }): Promise<void> {
   const p = getPool();
   await p.query(
     `INSERT INTO tg_automation_windows
-       (window_id, token_hash, scope, label, created_at, expires_at, created_by_chat)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [input.windowId, input.tokenHash, input.scope, input.label ?? null, input.createdAt, input.expiresAt, input.createdByChat],
+       (window_id, token_hash, scope, label, created_at, expires_at, created_by_chat, token_encrypted)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [
+      input.windowId,
+      input.tokenHash,
+      input.scope,
+      input.label ?? null,
+      input.createdAt,
+      input.expiresAt,
+      input.createdByChat,
+      input.tokenEncrypted ?? null,
+    ],
   );
 }
 
@@ -1688,6 +1712,17 @@ export async function revokeAutomationWindow(windowId: string, nowMs: number): P
     `UPDATE tg_automation_windows SET revoked_at = $2 WHERE window_id = $1 AND revoked_at IS NULL`,
     [windowId, nowMs],
   );
+  return (res.rowCount ?? 0) > 0;
+}
+
+/** Меняет только `scope` (менеджер-мини-апп — «Изменить доступ»). Не трогает
+ * `token_hash`/`token_encrypted`/`revoked_at`/`expires_at` — тот же токен,
+ * тот же срок, только другой набор покрываемых сервисов. true = строка
+ * найдена и обновлена; false = windowId не существует (никогда не значит
+ * "уже был такой scope" — обновление безусловное, WHERE только по id). */
+export async function updateAutomationWindowScope(windowId: string, scope: string): Promise<boolean> {
+  const p = getPool();
+  const res = await p.query(`UPDATE tg_automation_windows SET scope = $2 WHERE window_id = $1`, [windowId, scope]);
   return (res.rowCount ?? 0) > 0;
 }
 

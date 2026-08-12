@@ -493,10 +493,58 @@ export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
 export interface AutomationKeyConfig {
   /** Window TTL in ms. Env AUTOMATION_KEY_TTL_MS, default 24h. */
   ttlMs: number;
+  /**
+   * Опциональный server-side мастер-секрет (32 байта, base64url или обычный
+   * base64 — Node's `Buffer.from(x, "base64url")` декодирует оба алфавита
+   * одинаково снисходительно) для шифрованного хранения `rawToken` окна
+   * (`token_encrypted` в `tg_automation_windows`) — единственное, что делает
+   * возможным «выдать ещё одну self-destruct-заметку» для уже выпущенного
+   * ключа (владелец явно принял компромисс: утечка одной только БД больше не
+   * даёт 0 рабочих ключей, нужен ЕЩЁ и этот секрет из переменных окружения
+   * Railway, который в БД никогда не попадает).
+   *
+   * Env AUTOMATION_KEY_MASTER_SECRET. `null` = фича молча выключена
+   * (fail-closed по умолчанию: переменная не задана ИЛИ задана, но не
+   * декодируется в ровно 32 байта — оба случая одинаково безопасны, отличие
+   * только в громкости предупреждения в лог) — `token_encrypted` тогда просто
+   * не пишется, генерация/проверка/отзыв/смена scope окна продолжают
+   * работать как раньше, ничего не падает.
+   *
+   * Сгенерировать: `openssl rand -base64 32`.
+   */
+  masterSecret: string | null;
+}
+
+/** Валидная длина — ровно 32 байта (AES-256-GCM key). Пустая/отсутствующая
+ * переменная — тихо `null` (фича не запрашивалась); НЕПУСТАЯ, но кривая
+ * (не декодируется или неверная длина) — громкое предупреждение в лог,
+ * потому что это, скорее всего, опечатка при заведении переменной в Railway,
+ * а не намеренное отключение фичи. Оба случая одинаково фейлят-closed. */
+function loadAutomationKeyMasterSecret(): string | null {
+  const raw = process.env.AUTOMATION_KEY_MASTER_SECRET?.trim();
+  if (!raw) return null;
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(raw, "base64url");
+  } catch {
+    console.error("AUTOMATION_KEY_MASTER_SECRET: не удалось декодировать как base64 — шифрованное хранение ключа выключено.");
+    return null;
+  }
+  if (bytes.length !== 32) {
+    console.error(
+      `AUTOMATION_KEY_MASTER_SECRET: ожидалось 32 байта, получено ${bytes.length} — шифрованное хранение ключа выключено. ` +
+        `Сгенерировать заново: openssl rand -base64 32`,
+    );
+    return null;
+  }
+  return raw;
 }
 
 export function loadAutomationKeyConfig(): AutomationKeyConfig {
-  return { ttlMs: positiveIntEnv("AUTOMATION_KEY_TTL_MS", 24 * 60 * 60 * 1000) };
+  return {
+    ttlMs: positiveIntEnv("AUTOMATION_KEY_TTL_MS", 24 * 60 * 60 * 1000),
+    masterSecret: loadAutomationKeyMasterSecret(),
+  };
 }
 
 export function loadConfig(): Config {
