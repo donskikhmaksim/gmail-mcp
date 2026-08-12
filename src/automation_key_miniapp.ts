@@ -16,6 +16,7 @@
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { AUTOMATION_SERVICES } from "./automation_key.js";
+import type { ExternalCatalogUrls } from "./config.js";
 
 // ───────────────────────── initData verification ───────────────────────────
 
@@ -117,6 +118,15 @@ function escapeHtml(s: string): string {
 }
 
 /**
+ * Сервисы БЕЗ автосправочника методов (docs/TZ_automation_key_method_catalog.md
+ * раздел "Явно НЕ входит") — у ticktick-mcp нет `/automation-key-catalog` и
+ * не будет в этом заходе (отдельная Python-архитектура). Клиентский JS
+ * никогда не пытается его зафетчить, а рисует явную пометку вместо дерева
+ * методов.
+ */
+const NO_CATALOG_SERVICES: readonly string[] = ["ticktick"];
+
+/**
  * Единственная страница мини-аппа. Инлайн HTML/CSS/JS в коде роута (как и
  * `/dashboard/:secret` — см. `src/dashboard.ts` — держит одну статическую
  * страницу прямо в TS-модуле, без отдельного билд-шага под фронтенд).
@@ -126,18 +136,43 @@ function escapeHtml(s: string): string {
  * `Telegram.WebApp.colorScheme` как fallback для полей, которых нет в
  * `--tg-theme-*` (ТЗ раздел 1) — минимально, но не белый текст на белом фоне
  * в тёмной теме.
+ *
+ * `catalogUrls` — базовые URL-ы четырёх соседних сервисов (calendar/drive/
+ * sheets/docs), чьи `/automation-key-catalog` клиентский JS зафетчит
+ * параллельно со своим собственным (docs/TZ_automation_key_method_catalog.md
+ * раздел "Мини-апп — дерево «сервис → методы»"). Передаётся HTTP-роутом
+ * (`http.ts`) из env (`loadExternalCatalogUrls`) — сама функция рендера
+ * остаётся чистой (без чтения `process.env` внутри), как и раньше.
  */
-export function renderAutomationKeyMiniAppPage(): string {
+export function renderAutomationKeyMiniAppPage(catalogUrls: ExternalCatalogUrls): string {
   const checkboxes = AUTOMATION_SERVICES.map(
     (svc) =>
-      `<label class="row"><input type="checkbox" class="svc" value="${svc}"> ${escapeHtml(SERVICE_LABELS[svc] ?? svc)}</label>`,
+      `<div class="svc-block">\n` +
+      `      <label class="row"><input type="checkbox" class="svc" value="${svc}"> ${escapeHtml(SERVICE_LABELS[svc] ?? svc)}</label>\n` +
+      `      <div class="methods-wrap" id="methods-${svc}"></div>\n` +
+      `    </div>`,
   ).join("\n      ");
   // Тот же список сервисов доступен клиентскому JS как массив/словарь — не
   // задваивает разметку чекбоксов сервером, модалка «Изменить доступ» (второй
   // таб) строит СВОИ чекбоксы динамически этим же списком (переиспользует
-  // разметку/стили `.row`/`.svc`, не копирует HTML вручную).
+  // разметку/стили `.row`/`.svc`, не копирует HTML вручную). Дерево методов
+  // (docs/TZ_automation_key_method_catalog.md) — ОДИН и тот же переиспользуемый
+  // JS-компонент (`ServiceScopeTree` ниже в `<script>`) в ОБОИХ местах: здесь
+  // (таб «Выпустить», прикрепляется к уже отрендеренным `.svc`-чекбоксам выше)
+  // и в модалке «Изменить доступ» (таб «Мои ключи», чекбоксы строятся с нуля
+  // тем же компонентом).
   const servicesJson = JSON.stringify(AUTOMATION_SERVICES);
   const serviceLabelsJson = JSON.stringify(SERVICE_LABELS);
+  const noCatalogServicesJson = JSON.stringify(NO_CATALOG_SERVICES);
+  // Собственный каталог этого сервера — same-origin относительный путь (не
+  // течёт наружу протокол/хост); четыре соседних — абсолютные URL-ы из env.
+  const catalogUrlsJson = JSON.stringify({
+    gmail: "/automation-key-catalog",
+    calendar: `${catalogUrls.calendar}/automation-key-catalog`,
+    drive: `${catalogUrls.drive}/automation-key-catalog`,
+    sheets: `${catalogUrls.sheets}/automation-key-catalog`,
+    docs: `${catalogUrls.docs}/automation-key-catalog`,
+  });
 
   return `<!doctype html>
 <html>
@@ -166,6 +201,23 @@ export function renderAutomationKeyMiniAppPage(): string {
     background: var(--tg-theme-secondary-bg-color, #f2f2f2);
   }
   .row input { width: 18px; height: 18px; }
+  .svc-block { margin-bottom: 2px; }
+  .methods-wrap { margin: 0 0 6px 22px; }
+  .method-row {
+    padding: 6px 10px;
+    margin-bottom: 4px;
+    border-radius: 8px;
+    font-size: 13px;
+    background: var(--tg-theme-bg-color, #ffffff);
+    border: 1px solid var(--tg-theme-hint-color, #999);
+    border-opacity: .2;
+  }
+  .method-row input { width: 16px; height: 16px; }
+  .method-hint {
+    font-size: 12px;
+    color: var(--tg-theme-hint-color, #999);
+    padding: 2px 4px 8px;
+  }
   .sep { height: 1px; background: var(--tg-theme-hint-color, #999); opacity: .3; margin: 12px 0; }
   button {
     width: 100%;
@@ -318,6 +370,8 @@ export function renderAutomationKeyMiniAppPage(): string {
 
   var ALL_SERVICES = ${servicesJson};
   var SERVICE_LABELS = ${serviceLabelsJson};
+  var NO_CATALOG_SERVICES = ${noCatalogServicesJson};
+  var CATALOG_URLS = ${catalogUrlsJson};
 
   function initData() { return tg ? tg.initData : ""; }
 
@@ -327,8 +381,216 @@ export function renderAutomationKeyMiniAppPage(): string {
     });
   }
 
-  // ───────────────────────── Таб «Выпустить» (как раньше) ──────────────────
-  var svcBoxes = Array.prototype.slice.call(document.querySelectorAll(".svc"));
+  function hasCatalogFor(svc) {
+    return NO_CATALOG_SERVICES.indexOf(svc) === -1;
+  }
+
+  // ── Автосправочник методов (docs/TZ_automation_key_method_catalog.md) ──
+  // Фетчится ОДИН РАЗ за загрузку страницы, для собственного сервиса
+  // (same-origin '/automation-key-catalog') и для 4 соседних (calendar/
+  // drive/sheets/docs — абсолютные URL-ы из CATALOG_URLS, заданы сервером
+  // из env). ticktick сюда никогда не идёт (нет роута вовсе, ТЗ раздел
+  // "Явно НЕ входит"). CATALOGS[svc] === null означает "недоступен/нет
+  // каталога" — единственный сигнал деградации до чекбокса "весь сервис",
+  // и для ticktick, и для сбоя сети у любого из четырёх соседей.
+  var CATALOGS = {};
+  var catalogsReady = Promise.all(
+    ALL_SERVICES.map(function (svc) {
+      if (!hasCatalogFor(svc)) { CATALOGS[svc] = null; return Promise.resolve(); }
+      var url = CATALOG_URLS[svc];
+      return fetch(url)
+        .then(function (res) { if (!res.ok) throw new Error("HTTP " + res.status); return res.json(); })
+        .then(function (data) { CATALOGS[svc] = Array.isArray(data && data.tools) ? data.tools : null; })
+        .catch(function () { CATALOGS[svc] = null; }); // деградация — только чекбокс всего сервиса (ТЗ раздел 6, п.2)
+    }),
+  );
+
+  // ───────────────────────── Дерево «сервис → методы» ────────────────────
+  // Переиспользуемый компонент (docs/TZ_automation_key_method_catalog.md,
+  // раздел "Мини-апп — дерево «сервис → методы»"): ОДНА и та же логика
+  // прикрепления/чтения/применения состояния используется И на табе
+  // «Выпустить» (attachToExisting — чекбоксы сервисов уже в статической
+  // разметке), И в модалке «Изменить доступ» (buildFresh — чекбоксы
+  // создаются с нуля). DOM создаётся по-разному (там разный контекст
+  // разметки), но СЕМАНТИКА выбора — общая, в этом объекте.
+  var ServiceScopeTree = {
+    /** Строит nested-список методов внутри methodsWrapEl для одного
+     * сервиса; вешает обработчики, синхронизирующие serviceBoxEl с детьми
+     * в обе стороны. Возвращает {serviceBox, methodBoxes}. */
+    attachService: function (svc, serviceBoxEl, methodsWrapEl, onChange) {
+      methodsWrapEl.innerHTML = "";
+      var tools = CATALOGS[svc];
+      var methodBoxes = [];
+
+      function syncServiceFromMethods() {
+        if (!methodBoxes.length) return;
+        serviceBoxEl.checked = methodBoxes.every(function (b) { return b.checked; });
+      }
+
+      if (tools === null || tools === undefined) {
+        var hint = document.createElement("div");
+        hint.className = "method-hint";
+        hint.textContent = hasCatalogFor(svc)
+          ? "Методы недоступны (справочник сейчас не отвечает) — выдам доступ на весь сервис."
+          : "У этого сервиса нет справочника методов — доступ только на весь сервис целиком.";
+        methodsWrapEl.appendChild(hint);
+      } else if (tools.length === 0) {
+        var hint2 = document.createElement("div");
+        hint2.className = "method-hint";
+        hint2.textContent = "У этого сервиса пока нет гейтированных методов.";
+        methodsWrapEl.appendChild(hint2);
+      } else {
+        tools.forEach(function (t) {
+          var mRow = document.createElement("label");
+          mRow.className = "row method-row";
+          var mBox = document.createElement("input");
+          mBox.type = "checkbox";
+          mBox.className = "method";
+          mBox.value = t.name;
+          if (t.description) mBox.title = t.description;
+          mRow.appendChild(mBox);
+          mRow.appendChild(document.createTextNode(" " + t.name));
+          methodsWrapEl.appendChild(mRow);
+          methodBoxes.push(mBox);
+          mBox.addEventListener("change", function () {
+            syncServiceFromMethods();
+            onChange();
+          });
+        });
+      }
+
+      serviceBoxEl.addEventListener("change", function () {
+        // Чекбокс сервиса = «выбрать все его методы» (если каталог есть).
+        methodBoxes.forEach(function (b) { b.checked = serviceBoxEl.checked; });
+        onChange();
+      });
+
+      return { serviceBox: serviceBoxEl, methodBoxes: methodBoxes };
+    },
+
+    /** Строит ВЕСЬ tree (все 6 сервисов, каждый — свежий serviceBox + nested
+     * methods) внутри containerEl с нуля — используется модалкой «Изменить
+     * доступ», где разметки ещё нет. */
+    buildFresh: function (containerEl, onChange) {
+      containerEl.innerHTML = "";
+      var entries = {};
+      ALL_SERVICES.forEach(function (svc) {
+        var wrap = document.createElement("div");
+        wrap.className = "svc-block";
+        var row = document.createElement("label");
+        row.className = "row";
+        var box = document.createElement("input");
+        box.type = "checkbox";
+        box.className = "svc edit-svc";
+        box.value = svc;
+        row.appendChild(box);
+        row.appendChild(document.createTextNode(" " + (SERVICE_LABELS[svc] || svc)));
+        wrap.appendChild(row);
+        var methodsWrap = document.createElement("div");
+        methodsWrap.className = "methods-wrap";
+        wrap.appendChild(methodsWrap);
+        containerEl.appendChild(wrap);
+        entries[svc] = ServiceScopeTree.attachService(svc, box, methodsWrap, onChange);
+      });
+      return entries;
+    },
+
+    /** Собирает scope-токены из текущего состояния DOM (ТЗ раздел 6, п.3):
+     * весь сервис отмечен ИЛИ все его методы отмечены → bare '<service>';
+     * часть методов → '<service>:<tool>' на каждый; ничего не отмечено у
+     * сервиса → сервис в токены не попадает вовсе. */
+    getTokens: function (entries) {
+      var tokens = [];
+      ALL_SERVICES.forEach(function (svc) {
+        var e = entries[svc];
+        if (!e) return;
+        if (!e.methodBoxes.length) {
+          if (e.serviceBox.checked) tokens.push(svc);
+          return;
+        }
+        var checked = e.methodBoxes.filter(function (b) { return b.checked; });
+        if (checked.length === 0) return;
+        if (checked.length === e.methodBoxes.length) {
+          tokens.push(svc);
+        } else {
+          checked.forEach(function (b) { tokens.push(svc + ":" + b.value); });
+        }
+      });
+      return tokens;
+    },
+
+    /** true, если ХОТЯ БЫ один сервис/метод отмечен где-либо в дереве. */
+    anySelected: function (entries) {
+      return ServiceScopeTree.getTokens(entries).length > 0;
+    },
+
+    /** Отмечает/снимает ВСЁ дерево целиком (кнопка «Все сразу»). */
+    setAll: function (entries, checked) {
+      ALL_SERVICES.forEach(function (svc) {
+        var e = entries[svc];
+        if (!e) return;
+        e.serviceBox.checked = checked;
+        e.methodBoxes.forEach(function (b) { b.checked = checked; });
+      });
+    },
+
+    /** true, если КАЖДЫЙ сервис в дереве полностью отмечен (для синхронизации
+     * верхнего чекбокса «Все сразу»/«editAll» с состоянием дерева). */
+    isAllSelected: function (entries) {
+      return ALL_SERVICES.every(function (svc) {
+        var e = entries[svc];
+        if (!e) return false;
+        if (!e.methodBoxes.length) return e.serviceBox.checked;
+        return e.methodBoxes.every(function (b) { return b.checked; });
+      });
+    },
+
+    /** Разбирает существующий canonical 'scope' ("all" | csv из bare-service
+     * и/или 'service:tool' токенов) в состояние DOM — используется модалкой
+     * «Изменить доступ» при открытии на уже выпущенном окне. */
+    applyScope: function (entries, scope) {
+      var perService = {}; // svc -> true | {tool: true, ...}
+      if (scope === "all") {
+        ALL_SERVICES.forEach(function (s) { perService[s] = true; });
+      } else {
+        scope.split(",").map(function (s) { return s.trim(); }).filter(Boolean).forEach(function (t) {
+          var idx = t.indexOf(":");
+          if (idx === -1) {
+            perService[t] = true;
+          } else {
+            var svc = t.slice(0, idx);
+            var tool = t.slice(idx + 1);
+            if (perService[svc] !== true) {
+              if (!perService[svc]) perService[svc] = {};
+              perService[svc][tool] = true;
+            }
+          }
+        });
+      }
+      ALL_SERVICES.forEach(function (svc) {
+        var e = entries[svc];
+        if (!e) return;
+        var sel = perService[svc];
+        if (sel === true) {
+          e.serviceBox.checked = true;
+          e.methodBoxes.forEach(function (b) { b.checked = true; });
+        } else if (sel && typeof sel === "object") {
+          e.methodBoxes.forEach(function (b) { b.checked = !!sel[b.value]; });
+          // Без каталога методов (methodBoxes пуст), но токены service:tool
+          // всё равно пришли (например, каталог соседа временно недоступен
+          // именно СЕЙЧАС, хотя при выдаче ключа был доступен) — честно
+          // показываем это как "весь сервис", а не молча теряем выбор.
+          if (!e.methodBoxes.length) e.serviceBox.checked = true;
+          else e.serviceBox.checked = e.methodBoxes.every(function (b) { return b.checked; });
+        } else {
+          e.serviceBox.checked = false;
+          e.methodBoxes.forEach(function (b) { b.checked = false; });
+        }
+      });
+    },
+  };
+
+  // ───────────────────────── Таб «Выпустить» ────────────────────────────
   var allBox = document.getElementById("all");
   var goBtn = document.getElementById("go");
   var statusEl = document.getElementById("status");
@@ -337,28 +599,40 @@ export function renderAutomationKeyMiniAppPage(): string {
   var infiniteBox = document.getElementById("infinite");
   var labelInput = document.getElementById("labelInput");
 
+  // Прикрепляем дерево методов к уже отрендеренным сервером '.svc'-чекбоксам
+  // (id="methods-<svc>" рядом с каждым — см. renderAutomationKeyMiniAppPage).
+  // Пока каталоги грузятся — методы просто ещё не показаны (голый чекбокс
+  // сервиса работает и без них, тот же деградационный принцип).
+  var genEntries = {};
+  ALL_SERVICES.forEach(function (svc) {
+    var box = document.querySelector('.svc[value="' + svc + '"]');
+    var wrap = document.getElementById("methods-" + svc);
+    if (box && wrap) genEntries[svc] = ServiceScopeTree.attachService(svc, box, wrap, refresh);
+  });
+  catalogsReady.then(function () {
+    // Каталоги догрузились — перестраиваем дерево генерации с реальными
+    // методами (пере-attach на те же DOM-узлы, состояние чекбоксов сервисов
+    // сохраняется — просто у них теперь появляются дети).
+    ALL_SERVICES.forEach(function (svc) {
+      var box = document.querySelector('.svc[value="' + svc + '"]');
+      var wrap = document.getElementById("methods-" + svc);
+      if (box && wrap) genEntries[svc] = ServiceScopeTree.attachService(svc, box, wrap, refresh);
+    });
+    refresh();
+  });
+
   // Единицы срока → миллисекунды (ТЗ раздел 1). "months" — условно 30 дней,
   // как и везде в этой экосистеме, где нет полноценного календаря месяцев.
   var UNIT_MS = { hours: 3600000, days: 86400000, weeks: 7 * 86400000, months: 30 * 86400000 };
 
-  function selected() {
-    return svcBoxes.filter(function (b) { return b.checked; }).map(function (b) { return b.value; });
-  }
-
   function refresh() {
-    goBtn.disabled = selected().length === 0;
+    goBtn.disabled = !ServiceScopeTree.anySelected(genEntries);
+    allBox.checked = ServiceScopeTree.isAllSelected(genEntries);
   }
 
   allBox.addEventListener("change", function () {
-    svcBoxes.forEach(function (b) { b.checked = allBox.checked; });
+    ServiceScopeTree.setAll(genEntries, allBox.checked);
     refresh();
-  });
-  svcBoxes.forEach(function (b) {
-    b.addEventListener("change", function () {
-      if (!b.checked) allBox.checked = false;
-      else if (svcBoxes.every(function (x) { return x.checked; })) allBox.checked = true;
-      refresh();
-    });
   });
 
   infiniteBox.addEventListener("change", function () {
@@ -379,8 +653,8 @@ export function renderAutomationKeyMiniAppPage(): string {
   }
 
   goBtn.addEventListener("click", function () {
-    var services = selected();
-    if (services.length === 0) return; // fail-closed на фронтенде тоже, но backend не полагается на это
+    var scopeTokens = ServiceScopeTree.getTokens(genEntries);
+    if (scopeTokens.length === 0) return; // fail-closed на фронтенде тоже, но backend не полагается на это
     var duration = computeDuration();
     if (!duration.ok) {
       statusEl.textContent = "Укажи положительный срок или отметь «Бессрочно».";
@@ -394,7 +668,7 @@ export function renderAutomationKeyMiniAppPage(): string {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         initData: tg ? tg.initData : "",
-        services: services,
+        scopeTokens: scopeTokens,
         durationMs: duration.durationMs,
         label: label === "" ? null : label,
       }),
@@ -639,42 +913,37 @@ export function renderAutomationKeyMiniAppPage(): string {
   var editStatusEl = document.getElementById("editStatus");
   var editWindowId = null;
 
-  function currentScopeServices(scope) {
-    if (scope === "all") return ALL_SERVICES.slice();
-    return scope.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+  var editEntries = {};
+
+  function refreshEditAll() {
+    editAllBox.checked = ServiceScopeTree.isAllSelected(editEntries);
   }
 
+  /** Строит дерево «сервис → методы» модалки — ТЕМ ЖЕ переиспользуемым
+   * компонентом ('ServiceScopeTree'), что и таб «Выпустить» выше, и
+   * применяет текущий 'scope' окна как начальное состояние (docs/
+   * TZ_automation_key_method_catalog.md: "смена scope там ТОЖЕ должна
+   * получить возможность выбора по методам"). Каталоги к этому моменту уже
+   * либо загружены, либо гарантированно провалились ('catalogsReady') — ждём
+   * его перед построением, чтобы не показать пустое дерево, которое через
+   * секунду перестроится под ногами у владельца.
+   */
   function openEditModal(w) {
     editWindowId = w.windowId;
     editWindowLabel.textContent = "#" + w.windowId + (w.label ? " · " + w.label : "");
     editStatusEl.textContent = "";
-    editServicesEl.innerHTML = "";
-    var checked = currentScopeServices(w.scope);
-    ALL_SERVICES.forEach(function (svc) {
-      var row = document.createElement("label");
-      row.className = "row";
-      var box = document.createElement("input");
-      box.type = "checkbox";
-      box.className = "edit-svc";
-      box.value = svc;
-      box.checked = checked.indexOf(svc) !== -1;
-      box.addEventListener("change", refreshEditAll);
-      row.appendChild(box);
-      row.appendChild(document.createTextNode(" " + (SERVICE_LABELS[svc] || svc)));
-      editServicesEl.appendChild(row);
-    });
-    refreshEditAll();
+    editServicesEl.innerHTML = '<div class="method-hint">Загружаю методы...</div>';
     editModal.style.display = "flex";
-  }
-
-  function editSvcBoxes() { return Array.prototype.slice.call(document.querySelectorAll(".edit-svc")); }
-
-  function refreshEditAll() {
-    editAllBox.checked = editSvcBoxes().every(function (b) { return b.checked; });
+    catalogsReady.then(function () {
+      if (editWindowId !== w.windowId) return; // модалку успели закрыть/открыть заново на другое окно
+      editEntries = ServiceScopeTree.buildFresh(editServicesEl, refreshEditAll);
+      ServiceScopeTree.applyScope(editEntries, w.scope);
+      refreshEditAll();
+    });
   }
 
   editAllBox.addEventListener("change", function () {
-    editSvcBoxes().forEach(function (b) { b.checked = editAllBox.checked; });
+    ServiceScopeTree.setAll(editEntries, editAllBox.checked);
   });
 
   editCancelBtn.addEventListener("click", function () {
@@ -683,9 +952,9 @@ export function renderAutomationKeyMiniAppPage(): string {
   });
 
   editSaveBtn.addEventListener("click", function () {
-    var services = editSvcBoxes().filter(function (b) { return b.checked; }).map(function (b) { return b.value; });
-    if (services.length === 0) {
-      editStatusEl.textContent = "Отметь хотя бы один сервис.";
+    var scopeTokens = ServiceScopeTree.getTokens(editEntries);
+    if (scopeTokens.length === 0) {
+      editStatusEl.textContent = "Отметь хотя бы один сервис или метод.";
       return;
     }
     editSaveBtn.disabled = true;
@@ -693,7 +962,7 @@ export function renderAutomationKeyMiniAppPage(): string {
     fetch("/automation-key-app/update-scope", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ initData: initData(), windowId: editWindowId, services: services }),
+      body: JSON.stringify({ initData: initData(), windowId: editWindowId, scopeTokens: scopeTokens }),
     })
       .then(function (res) { return res.json().then(function (body) { return { status: res.status, body: body }; }); })
       .then(function (r) {

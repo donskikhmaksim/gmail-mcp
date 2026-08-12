@@ -41,18 +41,21 @@ import {
 import {
   handleAutomationKeyMessage,
   handleAutomationKeyCallback,
-  generateAndDeliverKey,
-  servicesToMask,
-  maskToScope,
+  generateAndDeliverKeyForScope,
   isValidDurationMs,
   windowStatus,
   humanScope,
   reissueNoteForWindow,
+  normalizeScopeTokens,
+  SCOPE_TOKEN_RE,
+  MAX_SCOPE_TOKENS,
   LIST_LIMIT as AUTOMATION_KEY_LIST_LIMIT,
 } from "./automation_key.js";
 import { renderAutomationKeyMiniAppPage, verifyTelegramInitData } from "./automation_key_miniapp.js";
 import { tryAutoExecute } from "./consent.js";
 import { getAutoExecutor, type AutoExecutorCtx } from "./autoExecute.js";
+import { buildGatedToolsCatalog } from "./gated_tools_catalog.js";
+import { loadExternalCatalogUrls } from "./config.js";
 
 const JSONRPC_UNAUTHORIZED = {
   jsonrpc: "2.0" as const,
@@ -290,6 +293,12 @@ async function executeApprovedNow(config: Config, manifestId: string): Promise<v
   await executeApprovedCandidate(candidate, ctx);
 }
 
+/** Базовые URL-ы четырёх соседних сервисов, чей `/automation-key-catalog`
+ * фетчит мини-апп (docs/TZ_automation_key_method_catalog.md) — вычислено
+ * один раз на модуль, тем же приёмом, что и `tgApprovalConfig`/`automationKeyConfig`
+ * в server.ts (чистое чтение env, без побочных эффектов/бросков). */
+const externalCatalogUrls = loadExternalCatalogUrls();
+
 export async function startHttpServer(config: Config): Promise<void> {
   const app = express();
   // Railway (and most PaaS) terminate TLS behind a reverse proxy; trust its
@@ -410,18 +419,66 @@ export async function startHttpServer(config: Config): Promise<void> {
     res.status(200).end();
   });
 
-  // ---- automation_key Mini App (docs/TZ_automation_key_miniapp.md) ----
-  // Второй, более удобный способ выбрать сервисы для automation_key поверх
-  // уже рабочей кнопочной версии (src/automation_key.ts) — не заменяет её.
-  // GET отдаёт статическую разметку БЕЗ авторизации (сама разметка не
-  // секрет, ТЗ раздел 1/8); POST — единственное место, где что-то реально
-  // происходит, и оно ОБЯЗАНО проверить initData на подлинность/свежесть/
-  // владельца (ТЗ раздел 4) прежде чем звать ту же generateAndDeliverKey,
-  // что и кнопочный `ak:gen` — сырой токен уходит только сообщением в чат с
-  // 10с-самоудалением, никогда в этом HTTP-ответе (ТЗ раздел 5).
+  // ---- automation_key Mini App (docs/TZ_automation_key_miniapp.md,
+  // docs/TZ_automation_key_method_catalog.md) ----
+  // Второй, более удобный способ выбрать сервисы/методы для automation_key
+  // поверх уже рабочей кнопочной версии (src/automation_key.ts) — не
+  // заменяет её. GET отдаёт статическую разметку БЕЗ авторизации (сама
+  // разметка не секрет, ТЗ раздел 1/8); POST — единственное место, где
+  // что-то реально происходит, и оно ОБЯЗАНО проверить initData на
+  // подлинность/свежесть/владельца (ТЗ раздел 4) прежде чем звать ту же
+  // `generateAndDeliverKeyForScope`, что и кнопочный `ak:gen` (через
+  // `generateAndDeliverKey`'s mask→scope обёртку) — сырой токен уходит
+  // только сообщением в чат с 10с-самоудалением, никогда в этом HTTP-ответе
+  // (ТЗ раздел 5).
   app.get("/automation-key-app", (_req: Request, res: Response) => {
-    res.type("html").send(renderAutomationKeyMiniAppPage());
+    res.type("html").send(renderAutomationKeyMiniAppPage(externalCatalogUrls));
   });
+
+  // ---- Автосправочник гейтированных методов (docs/
+  // TZ_automation_key_method_catalog.md раздел 2) ----
+  // БЕЗ авторизации (список ИМЁН методов не секрет — тот же принцип, что и
+  // сам `tools/list` по факту доступен любому, кто прошёл MCP-авторизацию;
+  // здесь даже без неё, т.к. имена методов не являются чувствительными
+  // данными). Собственный каталог ЭТОГО сервера (gmail) — фетчится своим же
+  // мини-аппом БЕЗ сети (same-origin), четыре соседних сервиса (calendar/
+  // drive/sheets/docs) фетчат свой такой же роут по `externalCatalogUrls`.
+  app.get("/automation-key-catalog", async (_req: Request, res: Response) => {
+    try {
+      const tools = await buildGatedToolsCatalog();
+      res.json({ service: consentServerConfig.server, tools });
+    } catch (err) {
+      console.error("automation-key-catalog error:", err);
+      res.status(500).json({ error: "internal" });
+    }
+  });
+
+  /**
+   * Разбирает и валидирует `scopeTokens` из тела POST (docs/
+   * TZ_automation_key_method_catalog.md раздел "Мини-апп" п.4): непустой
+   * массив строк вида `<service>` или `<service>:<tool>`, каждая ≤ разумного
+   * потолка count. Backend НЕ проверяет, что токен реально существует в
+   * каком-то каталоге (сознательно вне рамок — ТЗ раздел "Явно НЕ входит"),
+   * только формат — защита от мусора/DoS. Пишет 400 и возвращает `null` при
+   * первом же провале валидации; вызывающий роут просто `return`-ится.
+   */
+  function parseScopeTokens(req: Request, res: Response): string[] | null {
+    const raw = Array.isArray(req.body?.scopeTokens) ? (req.body.scopeTokens as unknown[]) : [];
+    const tokens = raw.filter((t): t is string => typeof t === "string" && t.length > 0);
+    if (tokens.length === 0) {
+      res.status(400).json({ error: "empty_selection" });
+      return null;
+    }
+    if (tokens.length > MAX_SCOPE_TOKENS) {
+      res.status(400).json({ error: "too_many_tokens" });
+      return null;
+    }
+    if (!tokens.every((t) => SCOPE_TOKEN_RE.test(t))) {
+      res.status(400).json({ error: "invalid_scope_token" });
+      return null;
+    }
+    return tokens;
+  }
 
   app.post("/automation-key-app/generate", async (req: Request, res: Response) => {
     const initData = typeof req.body?.initData === "string" ? req.body.initData : "";
@@ -438,8 +495,8 @@ export async function startHttpServer(config: Config): Promise<void> {
       return;
     }
 
-    const services = Array.isArray(req.body?.services) ? (req.body.services as unknown[]).filter((s) => typeof s === "string") : [];
-    const mask = servicesToMask(services as string[]);
+    const tokens = parseScopeTokens(req, res);
+    if (!tokens) return; // 400 уже отправлен parseScopeTokens
 
     // durationMs: null (бессрочно) — валиден как есть; иначе обязано пройти
     // isValidDurationMs (положительное, конечное, разумных размеров) — любая
@@ -459,14 +516,14 @@ export async function startHttpServer(config: Config): Promise<void> {
     const trimmedLabel = typeof rawLabel === "string" ? rawLabel.trim() : "";
     const label: string | null = trimmedLabel === "" ? null : trimmedLabel.slice(0, 200);
 
-    let result: Awaited<ReturnType<typeof generateAndDeliverKey>>;
+    let result: Awaited<ReturnType<typeof generateAndDeliverKeyForScope>>;
     try {
-      result = await generateAndDeliverKey(
+      result = await generateAndDeliverKeyForScope(
         tgApprovalConfig,
         automationKeyConfig,
         automationWindowStoreAdapter,
         tgApprovalConfig.ownerChatId,
-        mask,
+        normalizeScopeTokens(tokens),
         durationMs,
         label,
       );
@@ -482,11 +539,11 @@ export async function startHttpServer(config: Config): Promise<void> {
     // `noteLink` — ссылка на self-destruct-заметку с зашифрованным ключом
     // (docs/TZ_automation_key_note_delivery_and_buttons.md раздел 1); `null`
     // только если сам сервис self-destroyed-notes оказался недоступен
-    // (generateAndDeliverKey уже сообщила об этом отдельным сообщением в
-    // чат). Страница показывает её напрямую (см. automation_key_miniapp.ts)
-    // — ключ ТАКЖЕ продублирован сообщением в чат (та же generateAndDeliverKey,
-    // осознанное решение — см. финальный отчёт задачи, ТЗ раздел "Где
-    // показывается" явно разрешает дублирование).
+    // (generateAndDeliverKeyForScope уже сообщила об этом отдельным
+    // сообщением в чат). Страница показывает её напрямую (см.
+    // automation_key_miniapp.ts) — ключ ТАКЖЕ продублирован сообщением в чат
+    // (та же функция, осознанное решение — см. финальный отчёт задачи, ТЗ
+    // раздел "Где показывается" явно разрешает дублирование).
     res.json({ ok: true, noteLink: result.noteLink });
   });
 
@@ -586,12 +643,13 @@ export async function startHttpServer(config: Config): Promise<void> {
   });
 
   // Смена scope уже выпущенного окна (возможность 3 задачи «менеджер
-  // ключей») — тот же чекбокс-компонент, что и экран генерации, шлёт то же
-  // тело `{services: [...]}`, backend строит `scope` тем же
-  // `servicesToMask`/`maskToScope`, что и /generate (одна валидация на оба
-  // роута, не два расходящихся формата). Пустой выбор отклоняется тем же
-  // fail-closed принципом, что и генерация — нельзя случайно обнулить scope
-  // окна до "ничего не покрывает".
+  // ключей») — ТОТ ЖЕ переиспользуемый компонент-дерево «сервис → методы»,
+  // что и экран генерации (docs/TZ_automation_key_method_catalog.md), шлёт
+  // то же тело `{scopeTokens: [...]}`, backend строит `scope` тем же
+  // `parseScopeTokens`/`normalizeScopeTokens`, что и /generate (одна
+  // валидация на оба роута, не два расходящихся формата). Пустой выбор
+  // отклоняется тем же fail-closed принципом, что и генерация — нельзя
+  // случайно обнулить scope окна до "ничего не покрывает".
   app.post("/automation-key-app/update-scope", async (req: Request, res: Response) => {
     if (!requireOwnerInitData(req, res)) return;
     const windowId = typeof req.body?.windowId === "string" ? req.body.windowId : "";
@@ -599,13 +657,9 @@ export async function startHttpServer(config: Config): Promise<void> {
       res.status(400).json({ error: "missing_window_id" });
       return;
     }
-    const services = Array.isArray(req.body?.services) ? (req.body.services as unknown[]).filter((s) => typeof s === "string") : [];
-    const mask = servicesToMask(services as string[]);
-    if (mask === 0) {
-      res.status(400).json({ error: "empty_selection" });
-      return;
-    }
-    const scope = maskToScope(mask);
+    const tokens = parseScopeTokens(req, res);
+    if (!tokens) return; // 400 уже отправлен parseScopeTokens
+    const scope = normalizeScopeTokens(tokens);
     try {
       const updated = await automationWindowStoreAdapter.updateScope(windowId, scope);
       if (!updated) {

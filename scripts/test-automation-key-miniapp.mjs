@@ -29,6 +29,7 @@
 import { createHmac } from "node:crypto";
 import { verifyTelegramInitData, renderAutomationKeyMiniAppPage } from "../dist/automation_key_miniapp.js";
 import { isValidDurationMs } from "../dist/automation_key.js";
+import { loadExternalCatalogUrls } from "../dist/config.js";
 
 let failures = 0;
 const check = (label, cond, extra = "") => {
@@ -201,7 +202,10 @@ console.log("\n[8] GET /automation-key-app — без авторизации, 20
   check("страница содержит все 6 чекбоксов сервисов", ["gmail", "calendar", "drive", "sheets", "docs", "ticktick"].every((s) => html.includes(`value="${s}"`)), "missing checkbox");
   check("страница содержит чекбокс «Все сразу»", html.includes('id="all"'));
   check("страница содержит кнопку «Получить ключ»", html.includes("Получить ключ"));
-  check("статичный рендер (renderAutomationKeyMiniAppPage) и HTTP-ответ совпадают", html === renderAutomationKeyMiniAppPage());
+  check(
+    "статичный рендер (renderAutomationKeyMiniAppPage) и HTTP-ответ совпадают",
+    html === renderAutomationKeyMiniAppPage(loadExternalCatalogUrls()),
+  );
 }
 
 async function postGenerate(body) {
@@ -219,7 +223,7 @@ console.log("\n[1] POST с поддельным hash → 403, ничего не 
   const authDateSec = Math.floor(nowMs / 1000);
   const forged = buildInitData(Number(OWNER_CHAT_ID), authDateSec).replace(/hash=[0-9a-f]+/, "hash=" + "0".repeat(64));
   const before = tgCalls.length;
-  const { status, json } = await postGenerate({ initData: forged, services: ["gmail"] });
+  const { status, json } = await postGenerate({ initData: forged, scopeTokens: ["gmail"] });
   check("403", status === 403, status);
   check("error: invalid_init_data", json.error === "invalid_init_data", json);
   check("ни одного нового вызова Telegram API (sendMessage/setWebhook)", tgCalls.length === before, tgCalls.length - before);
@@ -230,7 +234,7 @@ console.log("\n[2] POST с валидным initData, но чужим user.id �
   const authDateSec = Math.floor(Date.now() / 1000); // реальное текущее время — проверка идёт по Date.now() внутри роута
   const intruderInitData = buildInitData(999, authDateSec);
   const before = tgCalls.length;
-  const { status, json } = await postGenerate({ initData: intruderInitData, services: ["gmail"] });
+  const { status, json } = await postGenerate({ initData: intruderInitData, scopeTokens: ["gmail"] });
   check("403", status === 403, status);
   check("error: forbidden", json.error === "forbidden", json);
   check("ничего не отправлено интрудеру", tgCalls.length === before, tgCalls.length - before);
@@ -241,7 +245,7 @@ console.log("\n[3] POST с протухшим auth_date (владелец, но 
   const staleAuthDate = Math.floor(Date.now() / 1000) - 10 * 60; // 10 минут назад
   const stale = buildInitData(Number(OWNER_CHAT_ID), staleAuthDate);
   const before = tgCalls.length;
-  const { status, json } = await postGenerate({ initData: stale, services: ["gmail"] });
+  const { status, json } = await postGenerate({ initData: stale, scopeTokens: ["gmail"] });
   check("403", status === 403, status);
   check("error: invalid_init_data", json.error === "invalid_init_data", json);
   check("ничего не отправлено", tgCalls.length === before, tgCalls.length - before);
@@ -253,15 +257,15 @@ console.log('\n[6] POST от владельца с ПУСТЫМ выбором �
   const valid = buildInitData(Number(OWNER_CHAT_ID), authDateSec);
   const before = tgCalls.length;
   // durationMs валиден (3ч) — проверяем именно empty_selection, не путаем с валидацией срока.
-  const { status, json } = await postGenerate({ initData: valid, services: [], durationMs: 3 * 60 * 60 * 1000 });
+  const { status, json } = await postGenerate({ initData: valid, scopeTokens: [], durationMs: 3 * 60 * 60 * 1000 });
   check("400", status === 400, status);
   check("error: empty_selection", json.error === "empty_selection", json);
   check("ничего не отправлено", tgCalls.length === before, tgCalls.length - before);
 
-  // Тот же случай, но поле services вообще отсутствует в теле — тоже fail-closed.
+  // Тот же случай, но поле scopeTokens вообще отсутствует в теле — тоже fail-closed.
   const before2 = tgCalls.length;
   const { status: status2 } = await postGenerate({ initData: valid, durationMs: 3 * 60 * 60 * 1000 });
-  check("services отсутствует в теле → тоже 400", status2 === 400, status2);
+  check("scopeTokens отсутствует в теле → тоже 400", status2 === 400, status2);
   check("ничего не отправлено (2)", tgCalls.length === before2, tgCalls.length - before2);
 }
 
@@ -282,22 +286,22 @@ console.log("\n[7] POST с некорректным durationMs (0/отрицат
     ["строка", "3h"],
   ]) {
     const before = tgCalls.length;
-    const { status, json } = await postGenerate({ initData: valid, services: ["gmail"], durationMs: rawDuration });
+    const { status, json } = await postGenerate({ initData: valid, scopeTokens: ["gmail"], durationMs: rawDuration });
     check(`[план — валидация durationMs] durationMs=${label} → 400 invalid_duration`, status === 400 && json.error === "invalid_duration", { status, json });
     check(`ничего не отправлено (durationMs=${label})`, tgCalls.length === before, tgCalls.length - before);
   }
 
   // Поле durationMs вообще отсутствует в теле — тоже отклоняется, не тихий дефолт.
   const beforeMissing = tgCalls.length;
-  const { status: statusMissing, json: jsonMissing } = await postGenerate({ initData: valid, services: ["gmail"] });
+  const { status: statusMissing, json: jsonMissing } = await postGenerate({ initData: valid, scopeTokens: ["gmail"] });
   check("durationMs отсутствует в теле → 400 invalid_duration (backend НЕ подставляет тихий дефолт)", statusMissing === 400 && jsonMissing.error === "invalid_duration", { statusMissing, jsonMissing });
   check("ничего не отправлено (durationMs отсутствует)", tgCalls.length === beforeMissing, tgCalls.length - beforeMissing);
 
-  // durationMs=null (бессрочно) — валиден САМ ПО СЕБЕ: с пустым services запрос
+  // durationMs=null (бессрочно) — валиден САМ ПО СЕБЕ: с пустым scopeTokens запрос
   // доходит до empty_selection, а НЕ invalid_duration — доказывает, что null
   // прошёл валидацию длительности.
   const beforeNull = tgCalls.length;
-  const { status: statusNull, json: jsonNull } = await postGenerate({ initData: valid, services: [], durationMs: null });
+  const { status: statusNull, json: jsonNull } = await postGenerate({ initData: valid, scopeTokens: [], durationMs: null });
   check("[план 1] durationMs=null проходит валидацию (падает на empty_selection, не invalid_duration)", statusNull === 400 && jsonNull.error === "empty_selection", { statusNull, jsonNull });
   check("ничего не отправлено (durationMs=null, пустой выбор)", tgCalls.length === beforeNull, tgCalls.length - beforeNull);
 }
@@ -324,7 +328,7 @@ console.log("\n[4]/[5]/[7] валидный запрос владельца → 
         const valid = buildInitData(Number(OWNER_CHAT_ID), authDateSec);
         const sendMessageBefore = tgCalls.filter((c) => c.method === "sendMessage").length;
         const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
-        const { status, json } = await postGenerate({ initData: valid, services: ["ticktick"], durationMs: SEVEN_DAYS_MS });
+        const { status, json } = await postGenerate({ initData: valid, scopeTokens: ["ticktick"], durationMs: SEVEN_DAYS_MS });
         check("[план 4] 200 ok", status === 200 && json.ok === true, JSON.stringify({ status, json }));
         check(
           "[план 7] ровно один новый tgCall (sendMessage)",
@@ -358,7 +362,7 @@ console.log("\n[4]/[5]/[7] валидный запрос владельца → 
         const valid = buildInitData(Number(OWNER_CHAT_ID), authDateSec);
         const { status, json } = await postGenerate({
           initData: valid,
-          services: ["gmail", "calendar", "drive", "sheets", "docs", "ticktick"],
+          scopeTokens: ["gmail", "calendar", "drive", "sheets", "docs", "ticktick"],
           durationMs: null,
         });
         check("[план 5] 200 ok", status === 200 && json.ok === true, JSON.stringify({ status, json }));
@@ -373,21 +377,21 @@ console.log("\n[4]/[5]/[7] валидный запрос владельца → 
         const valid = buildInitData(Number(OWNER_CHAT_ID), authDateSec);
 
         // Пустая строка (и строка из одних пробелов) → NULL.
-        await postGenerate({ initData: valid, services: ["gmail"], durationMs: 3_600_000, label: "" });
+        await postGenerate({ initData: valid, scopeTokens: ["gmail"], durationMs: 3_600_000, label: "" });
         const emptyLabelRow = await pool.query(`SELECT label FROM tg_automation_windows ORDER BY created_at DESC LIMIT 1`);
         check("[план 4] пустая строка label → NULL в БД", emptyLabelRow.rows[0]?.label === null, emptyLabelRow.rows[0]);
 
-        await postGenerate({ initData: valid, services: ["gmail"], durationMs: 3_600_000, label: "   " });
+        await postGenerate({ initData: valid, scopeTokens: ["gmail"], durationMs: 3_600_000, label: "   " });
         const blankLabelRow = await pool.query(`SELECT label FROM tg_automation_windows ORDER BY created_at DESC LIMIT 1`);
         check("[план 4] label из одних пробелов → NULL в БД (trim)", blankLabelRow.rows[0]?.label === null, blankLabelRow.rows[0]);
 
         // label отсутствует в теле вовсе → тоже NULL (как раньше, поле необязательное).
-        await postGenerate({ initData: valid, services: ["gmail"], durationMs: 3_600_000 });
+        await postGenerate({ initData: valid, scopeTokens: ["gmail"], durationMs: 3_600_000 });
         const missingLabelRow = await pool.query(`SELECT label FROM tg_automation_windows ORDER BY created_at DESC LIMIT 1`);
         check("[план 4] label отсутствует в теле → NULL в БД", missingLabelRow.rows[0]?.label === null, missingLabelRow.rows[0]);
 
         // Заполненная строка — сохраняется как есть (после trim).
-        await postGenerate({ initData: valid, services: ["gmail"], durationMs: 3_600_000, label: "  рабочий ноутбук  " });
+        await postGenerate({ initData: valid, scopeTokens: ["gmail"], durationMs: 3_600_000, label: "  рабочий ноутбук  " });
         const filledLabelRow = await pool.query(`SELECT label FROM tg_automation_windows ORDER BY created_at DESC LIMIT 1`);
         check("[план 4] заполненный label сохраняется (обрезанный по краям)", filledLabelRow.rows[0]?.label === "рабочий ноутбук", filledLabelRow.rows[0]);
       }
