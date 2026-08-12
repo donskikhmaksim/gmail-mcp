@@ -176,8 +176,12 @@ export const automationWindowStoreAdapter: AutomationWindowStore = {
  * below re-checks `storeReady()` at call time instead, same discipline as
  * `consentStore: storeReady() ? … : null` right next to it.
  */
-export function makeCheckAutomationKey(): ((key: string) => Promise<{ ok: boolean; channel?: string }>) | undefined {
-  return storeReady() ? (key: string) => checkAutomationKeyFor("gmail", automationWindowStoreAdapter, key) : undefined;
+export function makeCheckAutomationKey():
+  | ((key: string, tool: string) => Promise<{ ok: boolean; channel?: string }>)
+  | undefined {
+  return storeReady()
+    ? (key: string, tool: string) => checkAutomationKeyFor("gmail", automationWindowStoreAdapter, key, tool)
+    : undefined;
 }
 
 export function buildMcpServer(user: User): McpServer {

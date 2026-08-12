@@ -136,8 +136,8 @@ async function post(path, body) {
   return { status: res.status, json };
 }
 
-async function generateWindow(services, durationMs = 3_600_000, label = null) {
-  const { status, json } = await post("/automation-key-app/generate", { initData: ownerInitData(), services, durationMs, label });
+async function generateWindow(scopeTokens, durationMs = 3_600_000, label = null) {
+  const { status, json } = await post("/automation-key-app/generate", { initData: ownerInitData(), scopeTokens, durationMs, label });
   if (status !== 200 || !json.ok) throw new Error(`generate failed: ${status} ${JSON.stringify(json)}`);
   const row = await pool.query(`SELECT window_id FROM tg_automation_windows ORDER BY created_at DESC LIMIT 1`);
   return { windowId: row.rows[0].window_id, noteLink: json.noteLink };
@@ -152,7 +152,7 @@ console.log("\n[1] auth: поддельная подпись/чужой user.id 
     ["/automation-key-app/list", {}],
     ["/automation-key-app/revoke", { windowId }],
     ["/automation-key-app/reissue-note", { windowId }],
-    ["/automation-key-app/update-scope", { windowId, services: ["gmail"] }],
+    ["/automation-key-app/update-scope", { windowId, scopeTokens: ["gmail"] }],
   ]) {
     const forged = await post(path, { initData: forgedInitData(), ...extraBody });
     check(`${path}: поддельная подпись → 403 invalid_init_data`, forged.status === 403 && forged.json.error === "invalid_init_data", forged);
@@ -213,19 +213,19 @@ console.log("\n[4] /automation-key-app/update-scope — scope=gmail → calendar
   const { windowId, noteLink } = await generateWindow(["gmail"], 3_600_000);
   const rawTokenMatch = noteLink; // сам ключ не выковыриваем тут — covered by test-automation-key-storage.mjs; здесь смотрим на scope в БД.
 
-  const { status, json } = await post("/automation-key-app/update-scope", { initData: ownerInitData(), windowId, services: ["calendar"] });
+  const { status, json } = await post("/automation-key-app/update-scope", { initData: ownerInitData(), windowId, scopeTokens: ["calendar"] });
   check("[план 1] 200 ok, scope='calendar'", status === 200 && json.ok === true && json.scope === "calendar", { status, json });
 
   const row = await pool.query(`SELECT scope FROM tg_automation_windows WHERE window_id = $1`, [windowId]);
   check("[план 1] scope в БД реально сменился", row.rows[0].scope === "calendar", row.rows[0]);
 
   // Пустой выбор — fail-closed, как и /generate.
-  const empty = await post("/automation-key-app/update-scope", { initData: ownerInitData(), windowId, services: [] });
-  check("пустой services → 400 empty_selection, scope не тронут", empty.status === 400 && empty.json.error === "empty_selection", empty);
+  const empty = await post("/automation-key-app/update-scope", { initData: ownerInitData(), windowId, scopeTokens: [] });
+  check("пустой scopeTokens → 400 empty_selection, scope не тронут", empty.status === 400 && empty.json.error === "empty_selection", empty);
   const rowAfterEmpty = await pool.query(`SELECT scope FROM tg_automation_windows WHERE window_id = $1`, [windowId]);
   check("scope не изменился после отклонённой пустой попытки", rowAfterEmpty.rows[0].scope === "calendar", rowAfterEmpty.rows[0]);
 
-  const missing = await post("/automation-key-app/update-scope", { initData: ownerInitData(), windowId: "no-such-window-abc", services: ["gmail"] });
+  const missing = await post("/automation-key-app/update-scope", { initData: ownerInitData(), windowId: "no-such-window-abc", scopeTokens: ["gmail"] });
   check("несуществующий windowId → 404 window_not_found", missing.status === 404 && missing.json.error === "window_not_found", missing);
 
   void rawTokenMatch;

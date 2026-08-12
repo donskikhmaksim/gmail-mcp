@@ -97,7 +97,7 @@ async function post(path, body) {
 
 console.log("\n[регресс] AUTOMATION_KEY_MASTER_SECRET не задана — фича молча выключена, всё остальное работает как раньше");
 {
-  const gen = await post("/automation-key-app/generate", { initData: ownerInitData(), services: ["gmail"], durationMs: 3_600_000 });
+  const gen = await post("/automation-key-app/generate", { initData: ownerInitData(), scopeTokens: ["gmail"], durationMs: 3_600_000 });
   check("генерация окна работает как раньше (200 ok, noteLink выдан)", gen.status === 200 && gen.json.ok === true && typeof gen.json.noteLink === "string", gen);
 
   const row = await pool.query(`SELECT window_id, token_encrypted FROM tg_automation_windows ORDER BY created_at DESC LIMIT 1`);
@@ -116,7 +116,7 @@ console.log("\n[регресс] AUTOMATION_KEY_MASTER_SECRET не задана �
     reissue,
   );
 
-  const scopeChange = await post("/automation-key-app/update-scope", { initData: ownerInitData(), windowId, services: ["calendar"] });
+  const scopeChange = await post("/automation-key-app/update-scope", { initData: ownerInitData(), windowId, scopeTokens: ["calendar"] });
   check("смена scope работает как раньше (не зависит от мастер-секрета)", scopeChange.status === 200 && scopeChange.json.ok === true, scopeChange);
 
   const revoke = await post("/automation-key-app/revoke", { initData: ownerInitData(), windowId });

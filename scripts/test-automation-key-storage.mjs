@@ -279,16 +279,16 @@ console.log("\n[C] store.updateScope меняет scope на месте; checkAu
   const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
   await store.createWindow({ windowId: "scope-test", tokenHash, scope: "gmail", createdAt: now0, expiresAt: now0 + 100_000, createdByChat: OWNER_CHAT_ID, tokenEncrypted: null });
 
-  const beforeGmail = await checkAutomationKeyFor("gmail", store, rawToken, nowFixed);
-  const beforeCalendar = await checkAutomationKeyFor("calendar", store, rawToken, nowFixed);
+  const beforeGmail = await checkAutomationKeyFor("gmail", store, rawToken, "gmail_send", nowFixed);
+  const beforeCalendar = await checkAutomationKeyFor("calendar", store, rawToken, "calendar_event_create", nowFixed);
   check("[план 1] ДО смены scope: покрывает gmail", beforeGmail.ok === true, beforeGmail);
   check("[план 1] ДО смены scope: НЕ покрывает calendar", beforeCalendar.ok === false, beforeCalendar);
 
   const updated = await store.updateScope("scope-test", "calendar");
   check("updateScope вернул true (строка найдена)", updated === true);
 
-  const afterGmail = await checkAutomationKeyFor("gmail", store, rawToken, nowFixed);
-  const afterCalendar = await checkAutomationKeyFor("calendar", store, rawToken, nowFixed);
+  const afterGmail = await checkAutomationKeyFor("gmail", store, rawToken, "gmail_send", nowFixed);
+  const afterCalendar = await checkAutomationKeyFor("calendar", store, rawToken, "calendar_event_create", nowFixed);
   check("[план 1] ПОСЛЕ смены scope: gmail больше НЕ покрыт (старый scope не работает)", afterGmail.ok === false, afterGmail);
   check("[план 1] ПОСЛЕ смены scope: calendar теперь покрыт (новый scope работает)", afterCalendar.ok === true, afterCalendar);
 

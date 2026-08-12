@@ -1836,7 +1836,7 @@ export interface GmailSnoozeContext {
    * before this field existed (same invariant as `tg` above). Production
    * passes `makeCheckAutomationKey()` from server.ts.
    */
-  checkAutomationKey?: (key: string) => Promise<{ ok: boolean; channel?: string }>;
+  checkAutomationKey?: (key: string, tool: string) => Promise<{ ok: boolean; channel?: string }>;
   /**
    * Подменяемый транспорт для исходящих запросов к Google (`safeGoogleFetch`).
    * ПРОД НИКОГДА ЭТО НЕ ПЕРЕДАЁТ — поле существует только чтобы офлайн-тесты

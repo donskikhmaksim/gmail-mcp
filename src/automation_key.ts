@@ -188,11 +188,11 @@ async function createSecretNoteLink(plaintext: string): Promise<string> {
  * гигиена: заметка не должна выглядеть как попытка выдать себя за системное
  * сообщение).
  */
-function buildNoteInstructions(rawToken: string, mask: number, untilLine: string): string {
+function buildNoteInstructions(rawToken: string, humanList: string, untilLine: string): string {
   return (
     `Это automation_key — ключ автоматизации для MCP-сервисов Максима (gmail-mcp и связанные).\n\n` +
     `Ключ: ${rawToken}\n\n` +
-    `Действует для сервисов: ${maskToHumanList(mask)}.\n` +
+    `Действует для: ${humanList}.\n` +
     `${untilLine}\n\n` +
     `Как использовать: при вызове гейтированного write-инструмента этих сервисов ` +
     `(то есть инструмента, который обычно спрашивает подтверждение у владельца перед выполнением — ` +
@@ -290,10 +290,55 @@ export function maskToScope(mask: number): string {
   return AUTOMATION_SERVICES.filter((_, i) => (mask & (1 << i)) !== 0).join(",");
 }
 
-/** Человеческий список отмеченных сервисов для текста сообщения с ключом. */
-function maskToHumanList(mask: number): string {
-  if (mask === ALL_MASK) return "все сервисы";
-  return AUTOMATION_SERVICES.filter((_, i) => (mask & (1 << i)) !== 0).join(", ");
+/**
+ * Формат ОДНОГО scope-токена, присланного мини-аппом (docs/
+ * TZ_automation_key_method_catalog.md раздел "Мини-апп" п.4): `<service>`
+ * или `<service>:<tool>`, обе части — строчные латинские буквы/цифры/`_`.
+ * Backend НЕ проверяет, что токен реально существует в каком-то каталоге
+ * (сознательно вне рамок этого захода, см. ТЗ раздел "Явно НЕ входит") —
+ * только формат, как защиту от мусора/DoS.
+ */
+export const SCOPE_TOKEN_RE = /^[a-z_]+(:[a-z0-9_]+)?$/;
+
+/** Разумный потолок числа токенов в одном запросе (защита от DoS мусорным
+ * телом — не полноценная валидация, см. `SCOPE_TOKEN_RE` doc-comment). */
+export const MAX_SCOPE_TOKENS = 200;
+
+/**
+ * Строит canonical `scope` из списка ГОТОВЫХ scope-токенов, присланных
+ * мини-аппом (уже прошедших формат-валидацию `SCOPE_TOKEN_RE` на вызывающей
+ * стороне, `http.ts`). Дедуплицирует; если среди токенов присутствуют ВСЕ 6
+ * bare-service токенов (`gmail`, `calendar`, …) — схлопывает в литерал
+ * `"all"`, тем же принципом компактности, что уже даёт `maskToScope` для
+ * старого бот-флоу (а не оставляет `"gmail,calendar,drive,sheets,docs,
+ * ticktick"` — эквивалентно, но длиннее и не соответствует уже существующему
+ * соглашению "all" в БД/`scopeCovers`/`humanScope`).
+ */
+export function normalizeScopeTokens(tokens: readonly string[]): string {
+  const uniq = Array.from(new Set(tokens.map((t) => t.trim()).filter(Boolean)));
+  const bareServices = new Set(uniq.filter((t) => !t.includes(":")));
+  if (AUTOMATION_SERVICES.every((s) => bareServices.has(s))) return "all";
+  return uniq.join(",");
+}
+
+/**
+ * Человекочитаемый список ЛЮБОГО canonical scope (docs/
+ * TZ_automation_key_method_catalog.md) — "all" | csv из bare-service и/или
+ * `service:tool` токенов. В отличие от `maskToHumanList` выше (работает
+ * ТОЛЬКО с битовой маской из 6 сервисов — старый бот-путь), эта функция
+ * понимает и токены отдельных методов, поэтому используется ВЕЗДЕ, где текст
+ * строится из уже готовой строки `scope`, а не из маски (генерация из
+ * мини-аппа с деревом методов, перевыпуск заметки для уже созданного окна).
+ * Токены сервисов и `service:tool` уже сами по себе читаемы — просто
+ * склеиваются через ", ".
+ */
+export function humanScopeList(scope: string): string {
+  if (scope === "all") return "все сервисы";
+  return scope
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .join(", ");
 }
 
 // ───────────────────── Настраиваемый срок жизни ключа ───────────────────────
@@ -369,6 +414,15 @@ function buildSelectionKeyboard(mask: number, publicBaseUrl?: string): { inline_
   rows.push([{ text: "Получить ключ", callback_data: `ak:dur:${mask}` }]);
   if (publicBaseUrl) {
     rows.push([{ text: "Открыть как мини-апп", web_app: { url: `${publicBaseUrl}/automation-key-app` } }]);
+    // ДОПОЛНИТЕЛЬНАЯ кнопка (docs/TZ_automation_key_method_catalog.md раздел
+    // "Бот — НЕ пытаться впихнуть методы в inline-кнопки"): Telegram режет
+    // `callback_data` в 64 байта — битовую маску на десятки методов туда не
+    // закодировать, поэтому точный выбор по методам живёт ТОЛЬКО в
+    // мини-аппе. Открывает ТОТ ЖЕ мини-апп, что и кнопка выше — сознательно
+    // НЕ заменяет её (кнопочный флоу бота остаётся байт-в-байт как раньше,
+    // ТЗ раздел "Обратная совместимость бота"), просто явно подсказывает,
+    // где искать точный выбор.
+    rows.push([{ text: "🎯 Точнее — по методам", web_app: { url: `${publicBaseUrl}/automation-key-app` } }]);
   }
   return { inline_keyboard: rows };
 }
@@ -481,8 +535,35 @@ export async function generateAndDeliverKey(
   now: () => number = Date.now,
 ): Promise<{ windowId: string; scope: string; noteLink: string | null } | null> {
   if (mask === 0) return null;
+  return generateAndDeliverKeyForScope(cfg, akCfg, store, chatId, maskToScope(mask), durationMs, label, now);
+}
 
-  const scope = maskToScope(mask);
+/**
+ * Тот же путь, что `generateAndDeliverKey` выше, но принимает уже готовый
+ * canonical `scope` напрямую вместо битовой маски (docs/
+ * TZ_automation_key_method_catalog.md раздел "Мини-апп — дерево «сервис →
+ * методы»", п.4: `POST /automation-key-app/generate` теперь шлёт готовый
+ * список scope-токенов, а не маску). `generateAndDeliverKey` — тонкая
+ * обёртка поверх этой функции (`maskToScope(mask)` → сюда), так что
+ * кнопочный бот-флоу (раздел "Бот — НЕ пытаться впихнуть методы в
+ * inline-кнопки") продолжает работать байт-в-байт как раньше, только его
+ * вызов теперь идёт через один дополнительный внутренний прыжок.
+ *
+ * `scope` пустая строка — ничего не создаёт, возвращает `null` (тот же
+ * fail-closed принцип на пустой выбор, что и у mask-версии/`mask === 0`).
+ */
+export async function generateAndDeliverKeyForScope(
+  cfg: TgApprovalConfig,
+  akCfg: AutomationKeyConfig,
+  store: AutomationWindowStore,
+  chatId: string,
+  scope: string,
+  durationMs: number | null,
+  label: string | null = null,
+  now: () => number = Date.now,
+): Promise<{ windowId: string; scope: string; noteLink: string | null } | null> {
+  if (!scope) return null;
+
   const rawToken = generateRawToken();
   const windowId = generateWindowId();
   const nowMs = now();
@@ -515,7 +596,7 @@ export async function generateAndDeliverKey(
 
   let noteLink: string | null = null;
   try {
-    noteLink = await createSecretNoteLink(buildNoteInstructions(rawToken, mask, untilLine));
+    noteLink = await createSecretNoteLink(buildNoteInstructions(rawToken, humanScopeList(scope), untilLine));
   } catch (err) {
     console.error(`automation_key: не удалось создать self-destruct-заметку для окна #${windowId}:`, err);
   }
@@ -524,7 +605,7 @@ export async function generateAndDeliverKey(
   const text = noteLink
     ? `🔑 Ключ (одноразовая ссылка, действует час до первого клика):\n${noteLink}\n\n` +
       labelLine +
-      `Действует на: ${maskToHumanList(mask)}\n` +
+      `Действует на: ${humanScopeList(scope)}\n` +
       `${untilLine}\n\n` +
       `Сообщение самоудалится через 10 секунд.`
     : `⚠️ Окно #${windowId} создано, но не удалось выдать ключ — сервис self-destroyed-notes сейчас ` +
@@ -583,15 +664,15 @@ export async function reissueNoteForWindow(
     return { ok: false, reason: "decrypt_failed" };
   }
 
-  // `mask` нужен только чтобы собрать ТОТ ЖЕ человекочитаемый список сервисов
-  // в тексте заметки (`buildNoteInstructions`), что и при первой выдаче —
-  // `w.scope` уже канонический ("all" или csv из AUTOMATION_SERVICES), так что
-  // просто разбираем его обратно в маску тем же кодом, что принимает мини-апп.
-  const mask = w.scope === "all" ? ALL_MASK : servicesToMask(w.scope.split(","));
+  // `w.scope` уже канонический ("all" | csv из bare-service и/или
+  // `service:tool` токенов, docs/TZ_automation_key_method_catalog.md) —
+  // `humanScopeList` собирает ТОТ ЖЕ человекочитаемый текст, что и при первой
+  // выдаче, БЕЗ обратного разбора в битовую маску (маска физически не может
+  // представить метод-токены — только 6 бит на целые сервисы).
   const untilLine = w.expiresAt === null ? "До: бессрочно" : `До: ${formatLaTime(w.expiresAt)}`;
 
   try {
-    const noteLink = await createSecretNoteLink(buildNoteInstructions(rawToken, mask, untilLine));
+    const noteLink = await createSecretNoteLink(buildNoteInstructions(rawToken, humanScopeList(w.scope), untilLine));
     return { ok: true, noteLink };
   } catch (err) {
     console.error(`automation_key: не удалось создать self-destruct-заметку при перевыпуске (окно #${windowId}):`, err);
@@ -608,14 +689,28 @@ export async function reissueNoteForWindow(
 // существующие `AutomationWindowStore.listActiveWindows` (та же функция, что
 // использует `/automation_key list`) — не заводит нового SQL/подключения.
 
-/** true, если `scope` окна покрывает конкретный сервис ("all" — все сразу,
- * иначе csv из `AUTOMATION_SERVICES`, тот же формат, что пишет `maskToScope`). */
-export function scopeCoversService(scope: string, service: AutomationService): boolean {
+/**
+ * true, если `scope` окна покрывает конкретный МЕТОД `tool` сервиса `service`
+ * (docs/TZ_automation_key_method_catalog.md раздел "Расширение формата
+ * scope"). Токены CSV теперь трёх видов:
+ *  - `all` — всё (проверяется отдельно, до split, — покрывает любой сервис
+ *    и любой метод);
+ *  - `<service>` — ВЕСЬ сервис целиком, любой его метод (обратная
+ *    совместимость — уже выпущенные окна со старым bare-service scope
+ *    продолжают работать РОВНО как раньше, ничего не мигрируется в БД);
+ *  - `<service>:<tool>` — НОВОЕ, конкретный один метод.
+ *
+ * Сравнение токенов — ТОЧНОЕ (`===`), НЕ подстрока и НЕ `startsWith`: та же
+ * дисциплина, что уже проверена тестом «`google-sheets` не матчит `sheets`» —
+ * теперь дополнительно `gmail:gmail_send` НЕ матчит `gmail:gmail_send_extra`.
+ */
+export function scopeCovers(scope: string, service: AutomationService, tool: string): boolean {
   if (scope === "all") return true;
-  return scope
+  const tokens = scope
     .split(",")
     .map((s) => s.trim())
-    .includes(service);
+    .filter(Boolean);
+  return tokens.some((t) => t === service || t === `${service}:${tool}`);
 }
 
 /** Константное по времени сравнение двух sha256-hex-строк ОДИНАКОВОЙ длины
@@ -630,21 +725,24 @@ function hashesEqual(a: string, b: string): boolean {
  * присланный сырой ключ с хэшем каждого АКТИВНОГО окна (`revoked_at IS NULL
  * AND (expires_at IS NULL OR expires_at > now)` — уже гарантировано
  * `listActiveWindows`), константным временем, и проверяет, что scope окна
- * покрывает `service`. Первое совпадение — канал `"window"`. Ни одно — не
- * ошибка, просто `{ ok: false }` (вызывающий `requireConsent` тихо падает на
- * обычный человеческий путь).
+ * покрывает КОНКРЕТНЫЙ `tool` (docs/TZ_automation_key_method_catalog.md
+ * раздел "checkAutomationKey — прокинуть tool") — через `scopeCovers`.
+ * Первое совпадение — канал `"window"`. Ни одно — не ошибка, просто
+ * `{ ok: false }` (вызывающий `requireConsent` тихо падает на обычный
+ * человеческий путь).
  */
 export async function checkAutomationKeyFor(
   service: AutomationService,
   store: AutomationWindowStore,
   key: string,
+  tool: string,
   now: () => number = Date.now,
 ): Promise<{ ok: boolean; channel?: string }> {
   if (!key) return { ok: false };
   const keyHash = sha256Hex(key);
   const windows = await store.listActiveWindows(now());
   for (const w of windows) {
-    if (hashesEqual(w.tokenHash, keyHash) && scopeCoversService(w.scope, service)) {
+    if (hashesEqual(w.tokenHash, keyHash) && scopeCovers(w.scope, service, tool)) {
       return { ok: true, channel: "window" };
     }
   }

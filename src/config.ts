@@ -547,6 +547,37 @@ export function loadAutomationKeyConfig(): AutomationKeyConfig {
   };
 }
 
+/**
+ * Базовые публичные URL-ы четырёх СОСЕДНИХ MCP-серверов (docs/
+ * TZ_automation_key_method_catalog.md раздел "Мини-апп — дерево «сервис →
+ * методы»» п.1): мини-апп этого сервера ходит на `<url>/automation-key-catalog`
+ * каждого из них, чтобы построить дерево методов. `ticktick` сюда сознательно
+ * НЕ входит — у него нет этого роута (ТЗ раздел "Явно НЕ входит"), мини-апп
+ * держит его как bare-service чекбокс без методов.
+ *
+ * Дефолт — конвенция именования Railway-сервисов этой экосистемы
+ * (`<service>-mcp-production.up.railway.app`, тот же паттерн уже виден в
+ * `oauthProvider.ts`'s doc-comment для `baseUrl`). Переопределяется явным env
+ * (`CALENDAR_MCP_URL` и т.д.), если реальный домен отличается — НЕ хардкод
+ * без возможности переопределить.
+ */
+export interface ExternalCatalogUrls {
+  calendar: string;
+  drive: string;
+  sheets: string;
+  docs: string;
+}
+
+export function loadExternalCatalogUrls(): ExternalCatalogUrls {
+  const defaultFor = (service: string) => `https://${service}-mcp-production.up.railway.app`;
+  return {
+    calendar: process.env.CALENDAR_MCP_URL?.trim() || defaultFor("calendar"),
+    drive: process.env.DRIVE_MCP_URL?.trim() || defaultFor("drive"),
+    sheets: process.env.SHEETS_MCP_URL?.trim() || defaultFor("sheets"),
+    docs: process.env.DOCS_MCP_URL?.trim() || defaultFor("docs"),
+  };
+}
+
 export function loadConfig(): Config {
   const transport =
     (process.env.MCP_TRANSPORT as "http" | "stdio" | undefined) ??

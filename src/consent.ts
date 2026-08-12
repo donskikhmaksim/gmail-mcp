@@ -268,7 +268,17 @@ export interface RequireConsentParams<T = unknown> {
    * `automation_key.ts`/`store.ts` каждого сервера — этот модуль её не
    * импортирует (та же DI-дисциплина, что у `ConsentStore`/`TgApprovalGate`).
    */
-  checkAutomationKey?: (key: string) => Promise<{ ok: boolean; channel?: string }>;
+  /**
+   * `tool` — второй аргумент (docs/TZ_automation_key_method_catalog.md
+   * раздел "checkAutomationKey — прокинуть tool"): позволяет реализации DI
+   * проверить, что scope окна покрывает не только сервис целиком, но и
+   * КОНКРЕТНЫЙ метод (`scopeCovers(scope, service, tool)` в
+   * `automation_key.ts`). Вызывается ниже как
+   * `p.checkAutomationKey(p.automationKey, tool)` — `tool` берётся из уже
+   * существующего параметра `tool` этой же функции (имя текущего
+   * инструмента), ничего нового вызывающему коду передавать не нужно.
+   */
+  checkAutomationKey?: (key: string, tool: string) => Promise<{ ok: boolean; channel?: string }>;
 }
 
 /** Размеченный union исхода. Отказы — здесь, НЕ через throw. */
@@ -583,7 +593,7 @@ export async function requireConsent<T = unknown>(
   // `checkAutomationKey` не задан (сервер его не подключил) ⇒ ветка целиком
   // не существует, поведение ниже побайтово как до этой правки.
   if (p.automationKey && p.checkAutomationKey) {
-    const keyCheck = await p.checkAutomationKey(p.automationKey);
+    const keyCheck = await p.checkAutomationKey(p.automationKey, tool);
     if (keyCheck.ok) {
       const channel = keyCheck.channel ?? "unknown";
       const built = await plan();
