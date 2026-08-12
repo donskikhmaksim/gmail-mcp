@@ -378,7 +378,7 @@ console.log("\n[16] sync-wait: syncWaitMs не задан (undefined) → тож
   check("kind=planned", dec.kind === "planned");
 }
 
-console.log("\n[16.2] sync-wait: подтверждено «человеком» в середине окна → confirmed с первого вызова, БЕЗ превью");
+console.log("\n[16.2] sync-wait: подтверждено «человеком» в середине окна → готовый положительный ответ с первого вызова, БЕЗ повторного исполнения");
 {
   clock.t = 1_700_000_000_000;
   const store = makeStore();
@@ -387,19 +387,23 @@ console.log("\n[16.2] sync-wait: подтверждено «человеком»
   const realGetManifest = store.getManifest.bind(store);
   store.getManifest = async (id, server) => {
     polls++;
-    // На 2-й итерации опроса симулируем внешнее подтверждение (веб-хаб
-    // decide-confirm, вызванный НЕЗАВИСИМО, — здесь напрямую consumeManifest,
-    // как это в проде делает decideOwnConfirm/tryAutoExecute).
+    // На 2-й итерации опроса симулируем внешнее подтверждение И исполнение
+    // (веб-хаб decide-confirm вызвал tryAutoExecute — реальная мутация уже
+    // произошла ТАМ, здесь симулируется атомарным consumeManifest).
     if (polls === 2) {
       await store.consumeManifest(id, server, "[веб-хаб: подтверждено]");
     }
     return realGetManifest(id, server);
   };
   const dec = await requireConsent({ tool: "gmail_send", accountLabel: "work", plan, rehash, store, cfg: syncCfg });
-  check("kind=confirmed", dec.kind === "confirmed", JSON.stringify(dec).slice(0, 100));
-  check("payload из манифеста", dec.kind === "confirmed" && canonicalJson(dec.payload) === canonicalJson(PAYLOAD));
-  check("мутация реально произошла (манифест DONE)", [...store.manifests.values()][0].status === "DONE");
-  check("аудит confirmed записан", store.audits.some((a) => a.outcome === "confirmed" && a.checks.sync === "confirmed_externally"));
+  // ИСПРАВЛЕНО (был баг двойного исполнения): наблюдение чужого DONE не
+  // может вернуть kind=confirmed — тул тогда исполнил бы мутацию ВТОРОЙ раз
+  // поверх уже исполненной веб-хабом. Безопасный контракт — та же форма,
+  // что у обычного отказа, с позитивным текстом внутри (см. consent.ts,
+  // комментарий "ИСПРАВЛЕНО" рядом с обработкой row.status === "DONE").
+  check("kind=refused (безопасная форма — тул не исполнит payload повторно)", dec.kind === "refused", JSON.stringify(dec).slice(0, 100));
+  check("текст сообщает про подтверждено и исполнено", dec.result.includes("одтвержд") && dec.result.includes("исполнен"), dec.result.slice(0, 100));
+  check("манифест реально DONE (исполнил веб-хаб, не requireConsent)", [...store.manifests.values()][0].status === "DONE");
   check("опрошено больше одного раза (не сразу таймаут)", polls >= 2, polls);
 }
 

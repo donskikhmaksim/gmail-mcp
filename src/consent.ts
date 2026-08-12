@@ -740,31 +740,31 @@ export async function requireConsent<T = unknown>(
       if (row && row.status === "DONE") {
         // Решено ВНЕ этого вызова (веб-хаб/Telegram) — binding обязателен и
         // здесь (ТЗ тест 5): план мог устареть даже за секунды ожидания.
+        //
+        // ИСПРАВЛЕНО (был баг двойного исполнения): раньше отсюда
+        // возвращался `{kind:"confirmed"}`, что заставило бы вызывающий тул
+        // (30+ мест в tools/gmail.ts) исполнить payload ЕЩЁ РАЗ — веб-хаб
+        // (`/pending-consents/decide`) уже реально исполнил мутацию
+        // синхронно, внутри своего HTTP-запроса, через `tryAutoExecute`, ДО
+        // того, как эта ветка вообще увидела строку DONE. Эта ветка ТОЛЬКО
+        // ЧИТАЕТ и никогда не даёт тулу сигнал исполнять — положительный
+        // исход оборачивается в ТУ ЖЕ форму, что и обычный отказ
+        // ({kind:"refused"}): у всех call site'ов уже есть безусловное `if
+        // (kind==="refused") return ok(result)` — тул просто ретранслирует
+        // текст модели, без повторного исполнения. Аудит за это исполнение
+        // уже записал тот, кто реально исполнил — здесь новую запись не
+        // пишем, чтобы не задваивать аудит-лог.
         const currentHash = await rehash(row.payload);
-        if (currentHash !== row.objectHash) {
-          return refuse(
-            "Состояние изменилось после планирования",
-            "Объекты, к которым относился план, изменились (получатель/содержимое " +
-              "«уехали»). Ради безопасности исполнение отклонено — построй план заново.",
-            { sync: "binding_mismatch" },
-            { manifestId: id, objectHash: row.objectHash },
-          );
-        }
-        const auditId = randomUUID();
-        await store.appendConsentAudit({
-          id: auditId,
-          ts: now(),
-          server: cfg.server,
-          tool,
-          accountLabel,
-          manifestId: id,
-          objectHash: row.objectHash,
-          userReply: row.userReply ?? "",
-          checks: { sync: "confirmed_externally", binding: "ok" },
-          outcome: "confirmed",
-          actor: "human",
-        });
-        return { kind: "confirmed", manifestId: id, payload: row.payload as T, auditId };
+        const bindingOk = currentHash === row.objectHash;
+        const header = bindingOk ? "✅ Подтверждено и исполнено" : "⚠️ Подтверждено, но состояние изменилось";
+        const body = bindingOk
+          ? `${previewBody}\n\nРешение по этому плану уже принято и исполнено через другой канал ` +
+            "(например, веб-подтверждение), пока шло ожидание ответа. Повторно вызывать этот инструмент " +
+            "с этим планом не нужно."
+          : `${previewBody}\n\nДействие было подтверждено и исполнено через другой канал, но состояние ` +
+            "окружения с момента построения плана уже успело измениться — фактический результат мог не " +
+            "совпасть с тем, что показано в плане выше. Проверьте результат отдельно.";
+        return { kind: "refused", result: renderConsentBlock(header, body) };
       }
 
       if (row && row.status === "INVALIDATED") {
