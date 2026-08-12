@@ -175,7 +175,11 @@ export function renderConsentHubPage(): string {
   --svc-gmail: #3a5a8c; --svc-calendar: #3f7a63; --svc-drive: #96562f; --svc-sheets: #4a7a3d; --svc-docs: #6b4f8c;
 }
 * { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; background: var(--paper); color: var(--ink); font-family: var(--sans); }
+/* overflow-wrap:anywhere + overflow-x:hidden — без этого длинные неразрывные
+   токены (ISO-даты, hex-id календаря, "key=..." из превью) раздували ширину
+   страницы на мобильном и утаскивали за собой весь макет вбок, включая ряд
+   кнопок подтверждения (реальный баг, замечен владельцем на iPhone). */
+html, body { margin: 0; padding: 0; background: var(--paper); color: var(--ink); font-family: var(--sans); overflow-wrap: anywhere; overflow-x: hidden; }
 body { padding: 0 0 3rem; }
 button { font-family: inherit; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
