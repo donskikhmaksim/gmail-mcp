@@ -1110,6 +1110,42 @@ export async function consumeManifest(
   return rowToManifest(res.rows[0]);
 }
 
+/**
+ * Package part 2 (docs/TZ_consent_web_hub.md): every still-live manifest for
+ * `server`, newest first — feeds `GET /pending-consents` and the hub's
+ * aggregator. Deliberately does NOT touch `status`/consume anything — purely
+ * a read, same discipline as `getManifest`.
+ */
+export interface PendingConsentRow {
+  id: string;
+  tool: string;
+  accountLabel: string;
+  payload: unknown;
+  objectHash: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+export async function listPendingConsents(server: string, nowMs: number): Promise<PendingConsentRow[]> {
+  const p = getPool();
+  const res = await p.query(
+    `SELECT id, tool, account_label, payload, object_hash, created_at, expires_at
+       FROM consent_manifests
+      WHERE server = $1 AND status = 'AWAITING_CONSENT' AND expires_at > $2
+      ORDER BY created_at ASC`,
+    [server, nowMs],
+  );
+  return res.rows.map((row) => ({
+    id: row.id,
+    tool: row.tool,
+    accountLabel: row.account_label,
+    payload: row.payload,
+    objectHash: row.object_hash,
+    createdAt: Number(row.created_at),
+    expiresAt: Number(row.expires_at),
+  }));
+}
+
 /** Marks a manifest INVALIDATED (explicit user negation). No-op if it's not
  * currently AWAITING_CONSENT for this server (already consumed/expired/invalidated). */
 export async function invalidateManifest(id: string, server: string, userReply: string): Promise<void> {

@@ -44,6 +44,9 @@ const MIN_INLINE_SECRET_LEN = 8;
 /** Сегмент сразу после /dashboard/ или /dl/ — это и есть пропуск. */
 const DASHBOARD_PATH_RE = /(\/dashboard\/)([^/?\s"'`]+)/g;
 const LINK_PATH_RE = /(\/dl\/)([^/?\s"'`]+)/g;
+/** Сегмент сразу после /consent-hub/ — секрет хаба подтверждений (docs/
+ * TZ_consent_web_hub.md часть 2), тот же приём, что у /dashboard/. */
+const CONSENT_HUB_PATH_RE = /(\/consent-hub\/)([^/?\s"'`]+)/g;
 
 /** Экранирование для построения RegExp из произвольного значения секрета. */
 function escapeForRegExp(value: string): string {
@@ -65,6 +68,7 @@ export function redactPathSecrets(text: string, secret?: string): string {
     }
   }
   out = out.replace(DASHBOARD_PATH_RE, (_m, prefix: string) => prefix + DASHBOARD_SECRET_PLACEHOLDER);
+  out = out.replace(CONSENT_HUB_PATH_RE, (_m, prefix: string) => prefix + DASHBOARD_SECRET_PLACEHOLDER);
   out = out.replace(LINK_PATH_RE, (_m, prefix: string) => prefix + LINK_TOKEN_PLACEHOLDER);
   return out;
 }
@@ -78,4 +82,10 @@ export function redactPathSecrets(text: string, secret?: string): string {
  */
 export function logDashboardLocation(baseUrl: string, dashboardPath: string, secret?: string): void {
   console.error(redactPathSecrets(`Account dashboard at ${baseUrl}${dashboardPath}`, secret));
+}
+
+/** Тот же приём (#119), что у `logDashboardLocation` — для хаба подтверждений
+ * (docs/TZ_consent_web_hub.md часть 2, `/consent-hub/<secret>`). */
+export function logConsentHubLocation(baseUrl: string, hubPath: string, secret?: string): void {
+  console.error(redactPathSecrets(`Consent hub at ${baseUrl}${hubPath}`, secret));
 }

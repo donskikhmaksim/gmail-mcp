@@ -546,7 +546,14 @@ export async function registerBotUiEntryPoints(cfg: TgApprovalConfig): Promise<v
 
   try {
     const res = await tgCall(cfg, "setMyCommands", {
-      commands: [{ command: "automation_key", description: "Ключ для автоматики (временный/постоянный)" }],
+      commands: [
+        { command: "automation_key", description: "Ключ для автоматики (временный/постоянный)" },
+        // Веб-хаб подтверждений (docs/TZ_consent_web_hub.md часть 2) — РЯДОМ
+        // с automation_key, не заменяет её. Обработчик — http.ts's `/tg/webhook`
+        // (`isConsentHubMessage`); best-effort, ничего не бросает, если
+        // CONSENT_HUB_SECRET не задан (обработчик тогда просто молчит).
+        { command: "consent_hub", description: "Веб-хаб подтверждений (список + галочки)" },
+      ],
     });
     if (!res.ok) {
       console.error(`TG approval: setMyCommands FAILED (${res.description ?? "unknown error"})`);

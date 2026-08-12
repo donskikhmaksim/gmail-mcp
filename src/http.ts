@@ -14,11 +14,13 @@ import {
   renameAccount,
   listApprovedUnexecuted,
   getApprovedUnexecuted,
+  listPendingConsents,
   storeReady,
   type AutoExecuteCandidateRow,
 } from "./store.js";
 import { renderDashboard } from "./dashboard.js";
-import { logDashboardLocation } from "./logRedaction.js";
+import { renderConsentHubPage, summarizePendingManifest, type PendingConsentItem } from "./consent_hub.js";
+import { logDashboardLocation, logConsentHubLocation } from "./logRedaction.js";
 import { initDownloads, resolveDownloadLink } from "./downloads.js";
 import { buildUserClients } from "./accounts.js";
 import {
@@ -37,6 +39,7 @@ import {
   runApprovalSweep,
   reportAutoExecutionResult,
   secretTokenMatches,
+  tgCall,
 } from "./tg_approval.js";
 import {
   handleAutomationKeyMessage,
@@ -55,7 +58,8 @@ import { renderAutomationKeyMiniAppPage, verifyTelegramInitData } from "./automa
 import { tryAutoExecute } from "./consent.js";
 import { getAutoExecutor, type AutoExecutorCtx } from "./autoExecute.js";
 import { buildGatedToolsCatalog } from "./gated_tools_catalog.js";
-import { loadExternalCatalogUrls } from "./config.js";
+import { loadExternalCatalogUrls, loadConsentHubSecret } from "./config.js";
+import { fetch as undiciFetch } from "undici";
 
 const JSONRPC_UNAUTHORIZED = {
   jsonrpc: "2.0" as const,
@@ -299,6 +303,134 @@ async function executeApprovedNow(config: Config, manifestId: string): Promise<v
  * в server.ts (чистое чтение env, без побочных эффектов/бросков). */
 const externalCatalogUrls = loadExternalCatalogUrls();
 
+// ═══════════════════════ Веб-хаб подтверждений (docs/TZ_consent_web_hub.md, часть 2) ═══════════════════════
+
+/** Общий секрет хаба — ОДНА строка на всех 5 сервисах (env `CONSENT_HUB_SECRET`).
+ * `undefined` ⇒ обе локальные ручки (`/pending-consents`, `/pending-consents/decide`)
+ * и обе хабовые (`/consent-hub/:secret`, `/consent-hub-api/*`) отвечают 404 —
+ * fail-closed по умолчанию, та же дисциплина, что у `DASHBOARD_SECRET`. */
+const consentHubSecret = loadConsentHubSecret();
+
+/** Константный по времени guard для `X-Consent-Hub-Secret` — используется
+ * И локальными `/pending-consents*` (проверяют СВОЙ секрет), И хабовыми
+ * `/consent-hub-api/*` (проверяют, что браузер прислал ПРАВИЛЬНЫЙ секрет
+ * gmail-mcp, прежде чем сервер сам добавит его в запросы к соседям). Секрет
+ * не задан ⇒ 404 (не 401/403 — не подтверждаем существование роута, ТЗ тест 7/8). */
+function consentHubGuard(req: Request, res: Response): boolean {
+  if (!consentHubSecret) {
+    res.status(404).end();
+    return false;
+  }
+  const provided = req.header("x-consent-hub-secret") ?? "";
+  if (!provided || !secretMatches(provided, consentHubSecret)) {
+    res.status(404).end();
+    return false;
+  }
+  return true;
+}
+
+type DecideOutcome =
+  | { status: 200; body: { ok: true; outcome: "confirmed" | "refused"; result?: string } }
+  | { status: number; body: { ok: false; error: string } };
+
+/** `decide confirm` для СВОИХ манифестов — РОВНО тот же путь, что нажатие
+ * кнопки в Telegram (`executeApprovedCandidate`/`executeApprovedNow` выше):
+ * `tryAutoExecute` (binding + атомарный consume) + зарегистрированный
+ * `executor.execute()` (autoExecute.ts) — без дублирования логики. */
+async function decideOwnConfirm(config: Config, manifestId: string): Promise<DecideOutcome> {
+  const row = await consentStoreAdapter.getManifest(manifestId, consentServerConfig.server);
+  if (!row) return { status: 404, body: { ok: false, error: "not_found" } };
+  if (row.status !== "AWAITING_CONSENT") return { status: 409, body: { ok: false, error: "already_decided" } };
+  if (Date.now() > row.expiresAt) return { status: 410, body: { ok: false, error: "expired" } };
+  const executor = getAutoExecutor(row.tool);
+  if (!executor) return { status: 422, body: { ok: false, error: "not_supported" } };
+  const ctx = await buildAutoExecuteCtx(config);
+  if (!ctx) return { status: 503, body: { ok: false, error: "no_account" } };
+  // Binding — ПЕРЕД consume, чтобы отдать отдельный, машиночитаемый
+  // `binding_mismatch` (ТЗ), а не слить его в общий `already_decided`.
+  const currentHash = await executor.rehash(row.payload, ctx);
+  if (currentHash !== row.objectHash) return { status: 409, body: { ok: false, error: "binding_mismatch" } };
+  const result = await tryAutoExecute(
+    { manifestId, tool: row.tool, accountLabel: row.accountLabel },
+    executor.rehash,
+    consentStoreAdapter,
+    consentServerConfig,
+    ctx,
+  );
+  if (!result) return { status: 409, body: { ok: false, error: "already_decided" } }; // проиграл гонку атомарного consume
+  const reportText = await executor.execute(result.payload, result.auditId, ctx);
+  return { status: 200, body: { ok: true, outcome: "confirmed", result: reportText } };
+}
+
+/** `decide reject` для СВОИХ манифестов — тот же путь отказа, что и обычная
+ * человеческая негация в `requireConsent` (invalidate + аудит), `comment`
+ * (если есть) записывается как `userReply`, дословно. */
+async function decideOwnReject(manifestId: string, comment: string): Promise<DecideOutcome> {
+  const row = await consentStoreAdapter.getManifest(manifestId, consentServerConfig.server);
+  if (!row) return { status: 404, body: { ok: false, error: "not_found" } };
+  if (row.status !== "AWAITING_CONSENT") return { status: 409, body: { ok: false, error: "already_decided" } };
+  if (Date.now() > row.expiresAt) return { status: 410, body: { ok: false, error: "expired" } };
+  await consentStoreAdapter.invalidateManifest(manifestId, consentServerConfig.server, comment);
+  await consentStoreAdapter.appendConsentAudit({
+    id: randomUUID(),
+    ts: Date.now(),
+    server: consentServerConfig.server,
+    tool: row.tool,
+    accountLabel: row.accountLabel,
+    manifestId,
+    objectHash: row.objectHash,
+    userReply: comment,
+    checks: { source: "web_hub" },
+    outcome: "invalidated",
+    refusalReason: "web_hub_reject",
+    actor: "human",
+  });
+  return { status: 200, body: { ok: true, outcome: "refused" } };
+}
+
+/** Фетчит `/pending-consents` соседнего сервиса. Никогда не бросает — сбой
+ * (сеть/таймаут/не-200/не-JSON) возвращается как `null`, чтобы агрегатор мог
+ * деградировать (ТЗ: недоступность одного сервиса не роняет остальные). */
+async function fetchNeighborPending(
+  service: string,
+  baseUrl: string,
+  secret: string,
+): Promise<{ service: string; items: PendingConsentItem[] } | null> {
+  try {
+    const res = await undiciFetch(`${baseUrl.replace(/\/+$/, "")}/pending-consents`, {
+      headers: { "X-Consent-Hub-Secret": secret },
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) return null;
+    const json = (await res.json()) as { service?: string; items?: PendingConsentItem[] };
+    if (!Array.isArray(json.items)) return null;
+    return { service: json.service ?? service, items: json.items };
+  } catch {
+    return null;
+  }
+}
+
+/** Проксирует `decide` соседнему сервису, добавляя `X-Consent-Hub-Secret`
+ * заголовком — браузер секрета соседей не видит вообще (ТЗ). */
+async function proxyNeighborDecide(
+  baseUrl: string,
+  secret: string,
+  body: { manifestId: string; decision: "confirm" | "reject"; comment?: string },
+): Promise<{ status: number; json: unknown }> {
+  try {
+    const res = await undiciFetch(`${baseUrl.replace(/\/+$/, "")}/pending-consents/decide`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-Consent-Hub-Secret": secret },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const json = await res.json().catch(() => ({}));
+    return { status: res.status, json };
+  } catch (err) {
+    return { status: 502, json: { ok: false, error: "unreachable", detail: (err as Error).message } };
+  }
+}
+
 export async function startHttpServer(config: Config): Promise<void> {
   const app = express();
   // Railway (and most PaaS) terminate TLS behind a reverse proxy; trust its
@@ -376,10 +508,26 @@ export async function startHttpServer(config: Config): Promise<void> {
       const msg = req.body?.message;
       const text = typeof msg?.text === "string" ? msg.text : "";
       const isAutomationKeyMessage = !!msg && /^\/automation_key\b/.test(text.trim());
+      // Пункт открытия веб-хаба подтверждений (docs/TZ_consent_web_hub.md
+      // часть 2, "добавь пункт рядом с уже сделанной для automation_key — не
+      // ломай её") — РЯДОМ с automation_key-веткой, СВОЯ команда, ничего в
+      // существующей ветке не меняет.
+      const isConsentHubMessage = !!msg && /^\/consent_hub\b/.test(text.trim());
       const cqData = req.body?.callback_query?.data;
       const isAutomationKeyCallback = typeof cqData === "string" && cqData.startsWith("ak:");
 
-      if (isAutomationKeyMessage) {
+      if (isConsentHubMessage) {
+        const fromId = String(msg.from?.id ?? "");
+        if (fromId && fromId === tgApprovalConfig.ownerChatId && consentHubSecret) {
+          const hubBaseUrl = config.onboarding.publicBaseUrl || tgApprovalConfig.publicBaseUrl || "";
+          const url = `${hubBaseUrl.replace(/\/+$/, "")}/consent-hub/${consentHubSecret}`;
+          await tgCall(tgApprovalConfig, "sendMessage", {
+            chat_id: msg.chat?.id,
+            text: "Подтверждения — веб-хаб",
+            reply_markup: { inline_keyboard: [[{ text: "Открыть хаб", web_app: { url } }]] },
+          }).catch((err) => console.error("consent_hub message: sendMessage failed:", err));
+        }
+      } else if (isAutomationKeyMessage) {
         await handleAutomationKeyMessage(tgApprovalConfig, automationWindowStoreAdapter, {
           chatId: msg.chat?.id,
           fromId: msg.from?.id,
@@ -727,6 +875,123 @@ export async function startHttpServer(config: Config): Promise<void> {
       }
     }
   });
+
+  // ---- Веб-хаб подтверждений, часть 2 backend (docs/TZ_consent_web_hub.md) ----
+  // Смонтировано БЕЗУСЛОВНО (не гейтуется onboarding/DATABASE_URL на уровне
+  // роутинга) — `consentHubGuard` сам отвечает 404, когда CONSENT_HUB_SECRET
+  // не задан (ТЗ тест 8: "остальной сервис работает").
+
+  // 1. GET /pending-consents — свои AWAITING_CONSENT манифесты.
+  app.get("/pending-consents", async (req: Request, res: Response) => {
+    if (!consentHubGuard(req, res)) return;
+    if (!storeReady()) {
+      res.json({ service: consentServerConfig.server, items: [] });
+      return;
+    }
+    const rows = await listPendingConsents(consentServerConfig.server, Date.now());
+    res.json({ service: consentServerConfig.server, items: rows.map(summarizePendingManifest) });
+  });
+
+  // 2. POST /pending-consents/decide — confirm идёт РОВНО тем же путём, что
+  //    нажатие кнопки в Telegram (см. decideOwnConfirm выше); reject — тот же
+  //    путь отказа, что и обычная человеческая негация.
+  app.post("/pending-consents/decide", async (req: Request, res: Response) => {
+    if (!consentHubGuard(req, res)) return;
+    const manifestId = String(req.body?.manifestId ?? "");
+    const decision = req.body?.decision;
+    if (!manifestId || (decision !== "confirm" && decision !== "reject")) {
+      res.status(400).json({ ok: false, error: "bad_request" });
+      return;
+    }
+    if (!storeReady()) {
+      res.status(503).json({ ok: false, error: "store_unavailable" });
+      return;
+    }
+    const outcome =
+      decision === "confirm"
+        ? await decideOwnConfirm(config, manifestId)
+        : await decideOwnReject(manifestId, String(req.body?.comment ?? ""));
+    res.status(outcome.status).json(outcome.body);
+  });
+
+  // 3. GET /consent-hub-api/pending — агрегатор: свои + 4 соседа параллельно,
+  //    недоступность одного НЕ роняет остальных (та же деградация, что у
+  //    каталога методов мини-аппа).
+  app.get("/consent-hub-api/pending", async (req: Request, res: Response) => {
+    if (!consentHubGuard(req, res)) return;
+    if (!consentHubSecret) return; // недостижимо (guard уже проверил), для TS
+    const ownItems = storeReady()
+      ? (await listPendingConsents(consentServerConfig.server, Date.now())).map(summarizePendingManifest)
+      : [];
+    const neighbors = Object.entries(externalCatalogUrls) as [string, string][];
+    const results = await Promise.all(
+      neighbors.map(([service, url]) => fetchNeighborPending(service, url, consentHubSecret!)),
+    );
+    const items: (PendingConsentItem & { service: string })[] = ownItems.map((it) => ({
+      ...it,
+      service: consentServerConfig.server,
+    }));
+    const unavailable: string[] = [];
+    neighbors.forEach(([service], i) => {
+      const r = results[i];
+      if (r) items.push(...r.items.map((it) => ({ ...it, service: r.service })));
+      else unavailable.push(service);
+    });
+    res.json({ items, unavailable });
+  });
+
+  // 4. POST /consent-hub-api/decide — прокси на нужный сервис по `service`
+  //    (или само исполняет, если service === свой), добавляя секрет заголовком.
+  app.post("/consent-hub-api/decide", async (req: Request, res: Response) => {
+    if (!consentHubGuard(req, res)) return;
+    const service = String(req.body?.service ?? "");
+    const manifestId = String(req.body?.manifestId ?? "");
+    const decision = req.body?.decision;
+    if (!manifestId || (decision !== "confirm" && decision !== "reject")) {
+      res.status(400).json({ ok: false, error: "bad_request" });
+      return;
+    }
+    if (service === consentServerConfig.server) {
+      if (!storeReady()) {
+        res.status(503).json({ ok: false, error: "store_unavailable" });
+        return;
+      }
+      const outcome =
+        decision === "confirm"
+          ? await decideOwnConfirm(config, manifestId)
+          : await decideOwnReject(manifestId, String(req.body?.comment ?? ""));
+      res.status(outcome.status).json(outcome.body);
+      return;
+    }
+    const neighborUrl = (externalCatalogUrls as unknown as Record<string, string>)[service];
+    if (!neighborUrl) {
+      res.status(400).json({ ok: false, error: "unknown_service" });
+      return;
+    }
+    const { status, json } = await proxyNeighborDecide(neighborUrl, consentHubSecret!, {
+      manifestId,
+      decision,
+      comment: typeof req.body?.comment === "string" ? req.body.comment : undefined,
+    });
+    res.status(status).json(json);
+  });
+
+  // 5. GET /consent-hub/:secret — сама страница (только gmail-mcp, ТЗ). Тот
+  //    же приём, что у /dashboard/:secret — секрет в пути, 403 на несовпадение
+  //    (существование дашборд-роута и так очевидно из самого пути, в отличие
+  //    от /pending-consents выше, которые обязаны отвечать 404).
+  if (consentHubSecret) {
+    app.get("/consent-hub/:secret", (req: Request, res: Response) => {
+      if (!secretMatches(String(req.params.secret ?? ""), consentHubSecret)) {
+        res.status(403).send("Forbidden");
+        return;
+      }
+      res.type("html").send(renderConsentHubPage());
+    });
+    const hubBaseUrl = config.onboarding.publicBaseUrl || tgApprovalConfig.publicBaseUrl || "";
+    // #119: секрет НЕ печатаем — тот же приём, что у logDashboardLocation.
+    logConsentHubLocation(hubBaseUrl, `/consent-hub/${consentHubSecret}`, consentHubSecret);
+  }
 
   let provider: GoogleFederatedProvider | null = null;
 
