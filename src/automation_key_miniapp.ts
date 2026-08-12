@@ -144,7 +144,7 @@ const NO_CATALOG_SERVICES: readonly string[] = ["ticktick"];
  * (`http.ts`) из env (`loadExternalCatalogUrls`) — сама функция рендера
  * остаётся чистой (без чтения `process.env` внутри), как и раньше.
  */
-export function renderAutomationKeyMiniAppPage(catalogUrls: ExternalCatalogUrls): string {
+export function renderAutomationKeyMiniAppPage(catalogUrls: ExternalCatalogUrls, hasConsentHub: boolean): string {
   const checkboxes = AUTOMATION_SERVICES.map(
     (svc) =>
       `<div class="svc-block">\n` +
@@ -319,7 +319,9 @@ export function renderAutomationKeyMiniAppPage(catalogUrls: ExternalCatalogUrls)
   <div class="tabs">
     <button class="tab-btn active" id="tabBtnGenerate">Выпустить</button>
     <button class="tab-btn" id="tabBtnManage">Мои ключи</button>
+    ${hasConsentHub ? '<button class="tab-btn" id="tabBtnHub">Подтверждения</button>' : ""}
   </div>
+  <div id="hubStatus" class="field-label" style="display:none;margin:-8px 0 12px"></div>
 
   <div id="tabGenerate">
   <div id="services">
@@ -737,6 +739,46 @@ export function renderAutomationKeyMiniAppPage(catalogUrls: ExternalCatalogUrls)
   }
   tabBtnGenerate.addEventListener("click", function () { showTab("generate"); });
   tabBtnManage.addEventListener("click", function () { showTab("manage"); });
+
+  // ─────────────────── Вкладка «Подтверждения» (переход в хаб) ──────────────
+  // Не переключает локальные панели, как две другие вкладки — уводит на
+  // отдельную страницу /consent-hub/<secret> (docs/TZ_consent_web_hub.md
+  // часть 2). Секрет НИКОГДА не попадает в статичный HTML этой страницы
+  // (она отдаётся без авторизации, ТЗ раздел 1) — ссылку с секретом отдаёт
+  // отдельный POST-роут, защищённый тем же initData-owner-чеком, что и
+  // «Выпустить»/«Отозвать» ниже.
+  var tabBtnHub = document.getElementById("tabBtnHub");
+  var hubStatusEl = document.getElementById("hubStatus");
+  if (tabBtnHub) {
+    tabBtnHub.addEventListener("click", function () {
+      tabBtnHub.disabled = true;
+      var prevLabel = tabBtnHub.textContent;
+      tabBtnHub.textContent = "Открываю…";
+      hubStatusEl.style.display = "none";
+      fetch("/automation-key-app/consent-hub-url", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ initData: initData() }),
+      })
+        .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
+        .then(function (res) {
+          if (res.ok && res.body && res.body.url) {
+            location.href = res.body.url;
+            return;
+          }
+          tabBtnHub.disabled = false;
+          tabBtnHub.textContent = prevLabel;
+          hubStatusEl.textContent = "Не получилось открыть хаб — попробуйте ещё раз.";
+          hubStatusEl.style.display = "";
+        })
+        .catch(function () {
+          tabBtnHub.disabled = false;
+          tabBtnHub.textContent = prevLabel;
+          hubStatusEl.textContent = "Нет соединения — попробуйте ещё раз.";
+          hubStatusEl.style.display = "";
+        });
+    });
+  }
 
   var STATUS_BADGE = {
     active: "✅ активен",

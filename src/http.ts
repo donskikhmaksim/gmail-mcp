@@ -587,7 +587,31 @@ export async function startHttpServer(config: Config): Promise<void> {
   // только сообщением в чат с 10с-самоудалением, никогда в этом HTTP-ответе
   // (ТЗ раздел 5).
   app.get("/automation-key-app", (_req: Request, res: Response) => {
-    res.type("html").send(renderAutomationKeyMiniAppPage(externalCatalogUrls));
+    res.type("html").send(renderAutomationKeyMiniAppPage(externalCatalogUrls, !!consentHubSecret));
+  });
+
+  // Владелец попросил "сделай их в одном месте" (2026-08-12) — третья
+  // вкладка «Подтверждения» в мини-аппе automation_key ведёт в хаб
+  // подтверждений (docs/TZ_consent_web_hub.md часть 2), БЕЗ дублирования
+  // разметки/логики хаба здесь. Секрет хаба НЕ встраивается в статичный HTML
+  // (тот отдаётся без авторизации) — отдаётся только отсюда, за тем же
+  // initData-owner-чеком, что и остальные экшены этого мини-аппа.
+  app.post("/automation-key-app/consent-hub-url", (req: Request, res: Response) => {
+    const initData = typeof req.body?.initData === "string" ? req.body.initData : "";
+    const verified = verifyTelegramInitData(tgApprovalConfig.botToken, initData);
+    if (!verified.ok) {
+      res.status(403).json({ error: "invalid_init_data" });
+      return;
+    }
+    if (verified.userId !== tgApprovalConfig.ownerChatId) {
+      res.status(403).json({ error: "forbidden" });
+      return;
+    }
+    if (!consentHubSecret) {
+      res.status(404).json({ error: "not_configured" });
+      return;
+    }
+    res.json({ ok: true, url: `/consent-hub/${consentHubSecret}` });
   });
 
   // ---- Автосправочник гейтированных методов (docs/
