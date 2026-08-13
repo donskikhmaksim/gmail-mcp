@@ -34,6 +34,22 @@
 
 import { createHash, randomUUID } from "node:crypto";
 
+const GATE_DISABLED_ENV = "GMAIL_MCP_GATE_DISABLED";
+
+/**
+ * Аварийный общий выключатель гейта подтверждения — 2026-08-12, по прямой
+ * просьбе Максима (тот же паттерн, что и `TICKTICK_MCP_GATE_DISABLED` в
+ * ticktick-mcp). Точка отката ОДНА — переменная окружения, не правка кода:
+ * вернуть гейт можно, просто убрав переменную в Railway, без нового деплоя.
+ *
+ * Дефолт — гейт ВКЛЮЧЁН (переменная не задана = поведение не меняется).
+ * Когда выключен — КАЖДАЯ мутация проходит без manifest_id/user_reply.
+ */
+function isGateDisabled(): boolean {
+  const v = (process.env[GATE_DISABLED_ENV] ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
 // ───────────────────────── Типы контракта ──────────────────────────────────
 
 /** Строка манифеста, как её хранит и отдаёт store. Времена — epoch-миллисекунды. */
@@ -606,6 +622,30 @@ export async function requireConsent<T = unknown>(
     });
     return { kind: "refused", result: renderRefusal(header, body) };
   };
+
+  // ───── Аварийный общий выключатель гейта (GMAIL_MCP_GATE_DISABLED) ─────
+  if (isGateDisabled()) {
+    console.warn(
+      `🔓 ГЕЙТ ВЫКЛЮЧЕН переключателем ${GATE_DISABLED_ENV}: действие ` +
+        `'${tool}' выполнено БЕЗ подтверждения пользователя.`,
+    );
+    const built = await plan();
+    const auditId = randomUUID();
+    await store.appendConsentAudit({
+      id: auditId,
+      ts: now(),
+      server: cfg.server,
+      tool,
+      accountLabel,
+      manifestId: null,
+      objectHash: built.objectHash,
+      userReply: "",
+      checks: { gateDisabledSwitch: "on" },
+      outcome: "confirmed",
+      actor: "gate_disabled_switch",
+    });
+    return { kind: "confirmed", manifestId: "", payload: built.payload as T, auditId };
+  }
 
   // ───── AUTOMATION_KEY-ветка (headless-автоматика) ─────
   // ДО проверки hasId!==hasReply (ниже) — этот путь не участвует в
