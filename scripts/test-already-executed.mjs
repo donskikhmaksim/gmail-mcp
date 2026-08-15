@@ -192,6 +192,31 @@ console.log("\n[2] исполнение упало на стороне внеш�
   check("kind=already_executed", dec.kind === "already_executed", dec.kind);
   check("ошибка исполнения попала в отчёт", dec.report.includes("SMTP 550"), dec.report.slice(-300));
   check("нет payload", !("payload" in dec));
+  // Security-review 2026-08-14 (проблема №1): DONE = «манифест захвачен», а
+  // не «операция удалась» — заголовок и разрешающая формулировка ОБЯЗАНЫ
+  // смотреть на audit.outcome/error, а не только на binding. Воспроизведено
+  // проверяющим на этом самом моке: раньше здесь всё равно рисовалось
+  // «### ✅ Подтверждено и исполнено».
+  check("заголовок НЕ рисует успех при провалившемся исполнении", !dec.report.includes("✅ Подтверждено и исполнено"), dec.report.slice(0, 60));
+  check("заголовок явно предупреждает (⚠️/🛑), не тихая галочка", /^### (⚠️|🛑)/.test(dec.report), dec.report.slice(0, 60));
+  check(
+    "текст требует проверить вручную, а НЕ безусловное «повторять не нужно»",
+    /проверь вручную/i.test(dec.report),
+    dec.report.slice(0, 600),
+  );
+}
+
+console.log("\n[2b] ошибка исполнения содержит URL с query (токен доступа) → в ответе модели query вырезан");
+{
+  clock.t = 1_700_000_000_000;
+  const store = makeStore();
+  hookExternalConfirm(store, {
+    error:
+      "fetch failed: https://storage.googleapis.com/bucket/report.pdf?X-Goog-Signature=SECRET123&X-Goog-Expires=900 responded 403",
+  });
+  const dec = await requireConsent({ tool: "gmail_send", accountLabel: "work", plan, rehash, store, cfg: syncCfg });
+  check("query-параметр (токен доступа) вырезан из ответа модели", !dec.report.includes("SECRET123"), dec.report.slice(-500));
+  check("host+path URL остались читаемыми (не вся ссылка стёрта)", dec.report.includes("storage.googleapis.com/bucket/report.pdf"), dec.report.slice(-500));
 }
 
 console.log("\n[3] пруфа в аудите нет → честное «перепроверить не удалось», а не молчание");
@@ -261,6 +286,40 @@ console.log("\n[6] статика: каждый call site отдаёт already_e
   check("call site'ы найдены", sites > 0, sites);
   check(`все ${sites} call site'ов обрабатывают already_executed`, handled === sites, `${handled}/${sites}`);
   check("ни один не помечен как \"refusal\"", mislabelled === 0, mislabelled);
+}
+
+console.log("\n[7] _meta already_executed идёт под тем же неймспейсом ru.donskikh.mcp/presentation, что и остальные ответы");
+{
+  // Security-review 2026-08-14 (проблема №2): в этом репо все 17 call site'ов
+  // уже отдают already_executed через okVerbatim(decision.report,
+  // "execution-report") — тот же общий хелпер util.ts, что и остальные
+  // ответы (проверено вручную: ни одного "сырого" `_meta:` мимо util.ts во
+  // всём src/). Этот тест закрепляет это структурно, чтобы регресс не
+  // проскочил незамеченным.
+  // dist/, не src/util.ts: util.ts делает относительный импорт "./consent.js"
+  // (требование NodeNext-резолва) — без `npm run build` .js рядом нет, и
+  // прямой импорт TS-исходника упал бы с ERR_MODULE_NOT_FOUND. `npm test`
+  // всегда гоняет `npm run build` первым шагом (см. package.json), так что
+  // dist/util.js к этому моменту уже свежий — тот же приём, что и в
+  // test-no-agent-directives.mjs.
+  const { okVerbatim, PRESENTATION_META_KEY } = await import("../dist/util.js");
+  const wrapped = okVerbatim("тестовый отчёт", "execution-report");
+  check("_meta содержит ключ PRESENTATION_META_KEY (ru.donskikh.mcp/presentation)", !!wrapped._meta?.[PRESENTATION_META_KEY], JSON.stringify(wrapped._meta));
+  check("kind=execution-report", wrapped._meta?.[PRESENTATION_META_KEY]?.kind === "execution-report", wrapped._meta?.[PRESENTATION_META_KEY]?.kind);
+  check("verbatim=true (не пересказывать)", wrapped._meta?.[PRESENTATION_META_KEY]?.verbatim === true);
+
+  const files = readdirSync(new URL("../src/", import.meta.url), { recursive: true })
+    .filter((f) => typeof f === "string" && f.endsWith(".ts"))
+    .map((f) => "src/" + f);
+  let rawMeta = 0;
+  for (const f of files) {
+    if (f === "src/util.ts") continue;
+    const src = readFileSync(new URL("../" + f, import.meta.url), "utf8");
+    // `_meta:` собранный вручную мимо okVerbatim/util.ts — потенциальный
+    // второй неймспейс, который тест [7] иначе не поймает.
+    if (/_meta\s*:/.test(src) && !/PRESENTATION_META_KEY/.test(src)) rawMeta++;
+  }
+  check("нигде в src/ нет ручной сборки _meta мимо PRESENTATION_META_KEY", rawMeta === 0, rawMeta);
 }
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);

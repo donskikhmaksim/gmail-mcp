@@ -403,7 +403,17 @@ console.log("\n[16.2] sync-wait: подтверждено «человеком»
   // исполнять нечего), но модель больше не получает «refusal» на успех.
   check("kind=already_executed (не confirmed — тул не исполнит payload повторно)", dec.kind === "already_executed", JSON.stringify(dec).slice(0, 100));
   check("в исходе НЕТ payload — повторить мутацию физически нечем", !("payload" in dec));
-  check("текст сообщает про подтверждено и исполнено", dec.report.includes("одтвержд") && dec.report.includes("СПОЛНЕН"), dec.report.slice(0, 120));
+  // Security-review 2026-08-14 (проблема №1): этот мок НЕ пишет аудит-строку
+  // исполнения (только `consumeManifest`, без `appendConsentAudit`/
+  // `getAuditByManifest`) — у сервера НЕТ данных о фактическом исходе.
+  // Раньше заголовок всё равно рисовал «✅ Подтверждено и исполнено» ТОЛЬКО
+  // по совпадению binding-хеша — ровно та дыра, которую починили: без пруфа
+  // отчёт ДОЛЖЕН честно сказать «не удалось перепроверить».
+  check(
+    "текст честно сообщает «подтверждено», но БЕЗ пруфа — не удалось перепроверить",
+    dec.report.includes("одтвержд") && dec.report.includes("не удалось перепроверить"),
+    dec.report.slice(0, 200),
+  );
   check("манифест реально DONE (исполнил веб-хаб, не requireConsent)", [...store.manifests.values()][0].status === "DONE");
   check("опрошено больше одного раза (не сразу таймаут)", polls >= 2, polls);
 }
