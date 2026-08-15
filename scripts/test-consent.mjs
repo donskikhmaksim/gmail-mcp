@@ -396,13 +396,14 @@ console.log("\n[16.2] sync-wait: подтверждено «человеком»
     return realGetManifest(id, server);
   };
   const dec = await requireConsent({ tool: "gmail_send", accountLabel: "work", plan, rehash, store, cfg: syncCfg });
-  // ИСПРАВЛЕНО (был баг двойного исполнения): наблюдение чужого DONE не
-  // может вернуть kind=confirmed — тул тогда исполнил бы мутацию ВТОРОЙ раз
-  // поверх уже исполненной веб-хабом. Безопасный контракт — та же форма,
-  // что у обычного отказа, с позитивным текстом внутри (см. consent.ts,
-  // комментарий "ИСПРАВЛЕНО" рядом с обработкой row.status === "DONE").
-  check("kind=refused (безопасная форма — тул не исполнит payload повторно)", dec.kind === "refused", JSON.stringify(dec).slice(0, 100));
-  check("текст сообщает про подтверждено и исполнено", dec.result.includes("одтвержд") && dec.result.includes("исполнен"), dec.result.slice(0, 100));
+  // Наблюдение чужого DONE не может вернуть kind=confirmed — тул тогда
+  // исполнил бы мутацию ВТОРОЙ раз поверх уже исполненной веб-хабом. С
+  // 2026-08-14 у этого исхода СВОЙ kind (`already_executed`) вместо позитивного
+  // текста под меткой «отказ»: защита та же (в исходе физически нет `payload`,
+  // исполнять нечего), но модель больше не получает «refusal» на успех.
+  check("kind=already_executed (не confirmed — тул не исполнит payload повторно)", dec.kind === "already_executed", JSON.stringify(dec).slice(0, 100));
+  check("в исходе НЕТ payload — повторить мутацию физически нечем", !("payload" in dec));
+  check("текст сообщает про подтверждено и исполнено", dec.report.includes("одтвержд") && dec.report.includes("СПОЛНЕН"), dec.report.slice(0, 120));
   check("манифест реально DONE (исполнил веб-хаб, не requireConsent)", [...store.manifests.values()][0].status === "DONE");
   check("опрошено больше одного раза (не сразу таймаут)", polls >= 2, polls);
 }
@@ -463,7 +464,10 @@ console.log("\n[16.5] sync-wait + binding: currentHash≠objectHash на sync-п
   };
   const changedRehash = () => sha256({ changed: true });
   const dec = await requireConsent({ tool: "gmail_send", accountLabel: "work", plan, rehash: changedRehash, store, cfg: syncCfg });
-  check("kind=refused (состояние изменилось)", dec.kind === "refused" && dec.result.includes("изменилось"), JSON.stringify(dec).slice(0, 100));
+  // Мутация всё равно УЖЕ исполнена другим каналом — это не отказ, а отчёт с
+  // честным предупреждением, что мир с момента плана уехал.
+  check("kind=already_executed + предупреждение об изменении", dec.kind === "already_executed" && dec.report.includes("изменил"), JSON.stringify(dec).slice(0, 120));
+  check("в исходе нет payload (повторного исполнения быть не может)", !("payload" in dec));
 }
 
 console.log("\n[16.6] automation_key + sync одновременно: валидный ключ исполняет СРАЗУ, ни одной итерации опроса");

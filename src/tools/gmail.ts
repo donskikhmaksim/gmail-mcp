@@ -3619,6 +3619,8 @@ export function registerGmailTools(
       });
 
       if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okVerbatim(decision.report, "execution-report");
       if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
@@ -3763,6 +3765,8 @@ export function registerGmailTools(
       });
 
       if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okVerbatim(decision.report, "execution-report");
       if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
@@ -3881,6 +3885,8 @@ export function registerGmailTools(
       });
 
       if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okVerbatim(decision.report, "execution-report");
       if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
@@ -3983,6 +3989,8 @@ export function registerGmailTools(
       });
 
       if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okVerbatim(decision.report, "execution-report");
       if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
@@ -4053,6 +4061,8 @@ export function registerGmailTools(
       });
 
       if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okVerbatim(decision.report, "execution-report");
       if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
@@ -4123,6 +4133,8 @@ export function registerGmailTools(
       });
 
       if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okVerbatim(decision.report, "execution-report");
       if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
@@ -4235,6 +4247,8 @@ export function registerGmailTools(
       });
 
       if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okVerbatim(decision.report, "execution-report");
       if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
@@ -4337,6 +4351,8 @@ export function registerGmailTools(
       });
 
       if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okVerbatim(decision.report, "execution-report");
       if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
@@ -4475,6 +4491,8 @@ export function registerGmailTools(
       });
 
       if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okVerbatim(decision.report, "execution-report");
       if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
@@ -4621,6 +4639,8 @@ export function registerGmailTools(
       });
 
       if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okVerbatim(decision.report, "execution-report");
       if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
@@ -4949,6 +4969,8 @@ export function registerGmailTools(
       });
 
       if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okVerbatim(decision.report, "execution-report");
       if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
@@ -5065,6 +5087,8 @@ export function registerGmailTools(
       });
 
       if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okVerbatim(decision.report, "execution-report");
       if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
@@ -5185,6 +5209,8 @@ export function registerGmailTools(
       });
 
       if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okVerbatim(decision.report, "execution-report");
       if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
@@ -5290,6 +5316,8 @@ export function registerGmailTools(
       });
 
       if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okVerbatim(decision.report, "execution-report");
       if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
@@ -5416,6 +5444,8 @@ export function registerGmailTools(
       });
 
       if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okVerbatim(decision.report, "execution-report");
       if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
@@ -5566,6 +5596,8 @@ export function registerGmailTools(
       });
 
       if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okVerbatim(decision.report, "execution-report");
       if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;
@@ -5669,6 +5701,8 @@ export function registerGmailTools(
       });
 
       if (decision.kind === "planned") return okVerbatim(decision.preview, "plan");
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okVerbatim(decision.report, "execution-report");
       if (decision.kind === "refused") return okVerbatim(decision.result, "refusal");
 
       const { payload, auditId } = decision;

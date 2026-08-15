@@ -1219,6 +1219,47 @@ export async function updateConsentAuditOutcome(
   );
 }
 
+/**
+ * Фактический исход мутации по её манифесту — read-путь для ветки
+ * `already_executed` в `consent.ts` (жалоба Максима 2026-08-14: подтверждение
+ * в веб-хабе исполнялось, но модель узнавала только «исполнено другим
+ * каналом», без единого факта — и звала инструмент по кругу).
+ *
+ * Строк на один манифест может быть больше одной (фаза согласия пишется
+ * отдельно от исхода лишь у разных каналов), поэтому сортировка сначала
+ * по «есть ли уже пруф post-verify», и только потом по свежести: нужна именно
+ * та строка, в которую инструмент дописал результат через
+ * `updateConsentAuditOutcome`. Фильтр по `server` обязателен — таблица общая
+ * на все MCP-серверы.
+ */
+export async function getConsentAuditByManifest(
+  manifestId: string,
+  server: string,
+): Promise<{
+  id: string;
+  outcome: string;
+  postVerifyResult: string | null;
+  error: string | null;
+} | null> {
+  const p = getPool();
+  const res = await p.query(
+    `SELECT id, outcome, post_verify_result, error
+       FROM consent_audit
+      WHERE server = $1 AND manifest_id = $2
+      ORDER BY (post_verify_result IS NOT NULL) DESC, ts DESC
+      LIMIT 1`,
+    [server, manifestId],
+  );
+  const row = res.rows[0];
+  if (!row) return null;
+  return {
+    id: row.id,
+    outcome: row.outcome,
+    postVerifyResult: row.post_verify_result ?? null,
+    error: row.error ?? null,
+  };
+}
+
 export interface ConsentAuditFilters {
   server: string;
   since?: number;
